@@ -56,26 +56,50 @@ function operationId() {
 export class ActionGate {
   constructor({ storage, storageKey = 'codex-mobile-operation-guards' } = {}) {
     this.attempts = new Map(); this.storage = storage; this.storageKey = storageKey;
+    this.restore();
+  }
+  stored() {
+    const result = new Map();
     try {
-      const records = JSON.parse(storage?.getItem(storageKey) || '[]');
+      const records = JSON.parse(this.storage?.getItem(this.storageKey) || '[]');
       if (Array.isArray(records)) for (const [key, value] of records) {
         if (typeof key !== 'string' || !value || !['pending', 'unknown', 'confirmed', 'submitted'].includes(value.status) || typeof value.operationId !== 'string') continue;
-        const status = value.status === 'pending' ? 'unknown' : value.status;
-        this.attempts.set(key, { operationId: value.operationId, status, message: status === 'unknown' ? '上次操作的结果未确认。请先核对原会话，本次操作不会自动重发。' : '上次操作已提交，等待原会话状态同步。' });
+        result.set(key, value);
       }
     } catch {}
+    return result;
   }
-  persist() {
+  restore() {
+    for (const [key, saved] of this.stored()) {
+      const local = this.attempts.get(key);
+      if (local?.status === 'unknown' || local?.operationId === saved.operationId && local.status === saved.status) continue;
+      const status = saved.status === 'pending' ? 'unknown' : saved.status;
+      this.attempts.set(key, { operationId: saved.operationId, status, message: status === 'unknown' ? '上次操作的结果未确认。请先核对原会话，本次操作不会自动重发。' : '上次操作已提交，等待原会话状态同步。' });
+    }
+  }
+  persist(removedKey = null) {
+    // Other tabs can add unresolved receipts. An unrelated local write must
+    // preserve them, and stale confirmed state must never erase an unknown.
+    for (const [key, saved] of this.stored()) {
+      const local = this.attempts.get(key);
+      if (key === removedKey && saved.status === 'confirmed') continue;
+      if (!local || saved.status === 'unknown' && local.status !== 'unknown' ||
+          saved.operationId !== local.operationId && ['pending', 'submitted'].includes(saved.status) && local.status !== 'unknown') {
+        this.attempts.set(key, { ...saved, status: saved.status === 'pending' ? 'unknown' : saved.status,
+          message: '上次操作的结果未确认，请先核对原会话，不会自动重发。' });
+      }
+    }
     try { this.storage?.setItem(this.storageKey, JSON.stringify([...this.attempts].filter(([, attempt]) => attempt.status !== 'rejected').map(([key, attempt]) => [key, { operationId: attempt.operationId, status: attempt.status }]))); } catch {}
   }
-  forgetConfirmed(key) { if (this.get(key)?.status === 'confirmed') { this.attempts.delete(key); this.persist(); } }
+  forgetConfirmed(key) { this.restore(); if (this.get(key)?.status === 'confirmed') { this.attempts.delete(key); this.persist(key); } }
   begin(key) {
+    this.restore();
     const prior = this.attempts.get(key);
     if (prior && prior.status !== 'rejected') return null;
     const attempt = { operationId: operationId(), status: 'pending', message: '正在提交…' };
     this.attempts.set(key, attempt);
     this.persist();
-    return attempt;
+    return this.attempts.get(key) === attempt && attempt.status === 'pending' ? attempt : null;
   }
   settle(key, response) {
     const attempt = this.attempts.get(key);
@@ -87,7 +111,7 @@ export class ActionGate {
   get(key) { return this.attempts.get(key); }
 }
 
-export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, EventSourceImpl = globalThis.EventSource } = {}) {
+export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, EventSourceImpl = globalThis.EventSource, actionTimeoutMs = 30000 } = {}) {
   const base = String(apiBase).replace(/\/$/, '');
   const path = (route, values) => base + route + (values ? '?' + new URLSearchParams(values) : '');
   async function json(url, options, acceptRejection = false) {
@@ -100,18 +124,29 @@ export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, Ev
   return {
     getHosts: () => json(path('/api/hosts')),
     getThreads: (host) => json(path('/api/threads', { host })),
-    getThread: (host, id) => json(path('/api/thread', { host, id })),
-    action: (body) => json(path('/api/action'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }, true),
-    subscribe(host, id, { onState, onStatus }) {
+    getThread: (host, id, { signal } = {}) => json(path('/api/thread', { host, id }), { signal }),
+    async action(body) {
+      const controller = new AbortController();
+      // A handover can leave an HTTP reply pending indefinitely. Stop waiting,
+      // retain an unknown receipt, and never replay the already-dispatched POST.
+      const timer = setTimeout(() => controller.abort(), actionTimeoutMs);
+      try { return await json(path('/api/action'), { method: 'POST', signal: controller.signal,
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }, true); }
+      finally { clearTimeout(timer); }
+    },
+    subscribe(host, id, { onState, onStatus, onHeartbeat = () => {} }) {
       if (!EventSourceImpl) { onStatus('disconnected'); return () => {}; }
       const stream = new EventSourceImpl(path('/api/events', { host, id }), { withCredentials: true });
-      stream.addEventListener('open', () => onStatus('connecting'));
+      let closed = false;
+      stream.addEventListener('open', () => { if (!closed) onStatus('connecting'); });
+      stream.addEventListener('ping', () => { if (!closed) onHeartbeat(); });
       stream.addEventListener('state', (event) => {
+        if (closed) return;
         try { onState(JSON.parse(event.data)); } catch { onStatus('disconnected'); }
       });
       // EventSource may reconnect GET requests. It never resends a write or clears a draft.
-      stream.addEventListener('error', () => onStatus('disconnected'));
-      return () => stream.close();
+      stream.addEventListener('error', () => { if (!closed) onStatus('disconnected'); });
+      return () => { closed = true; stream.close(); };
     },
   };
 }
@@ -157,14 +192,54 @@ function reconcile(parent, children) {
   children.forEach((child, index) => { if (parent.childNodes[index] !== child) parent.insertBefore(child, parent.childNodes[index] ?? null); });
 }
 
-export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 'mac', initialThreadId = '', storage } = {}) {
+export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 'mac', initialThreadId = '', storage,
+  timers = globalThis, readTimeoutMs = 20000, heartbeatTimeoutMs = 45000 } = {}) {
   if (!root?.ownerDocument || !api) throw new Error('需要根节点和手机控制 API。');
   const doc = root.ownerDocument, win = doc.defaultView ?? globalThis.window;
   let draftStorage = storage;
-  if (draftStorage === undefined) { try { draftStorage = win?.sessionStorage; } catch { draftStorage = null; } }
+  if (draftStorage === undefined) {
+    draftStorage = null;
+    for (const kind of ['localStorage', 'sessionStorage']) {
+      try {
+        const candidate = win?.[kind]; if (!candidate) continue;
+        const probe = 'codex-mobile-storage-check'; const previous = candidate.getItem(probe);
+        candidate.setItem(probe, '1'); if (previous == null) candidate.removeItem(probe); else candidate.setItem(probe, previous);
+        draftStorage = candidate;
+        if (kind === 'localStorage') {
+          let legacy; try { legacy = win?.sessionStorage; } catch {}
+          if (legacy && legacy !== candidate) draftStorage = {
+            getItem(key) {
+              const current = candidate.getItem(key);
+              if (!/^codex-mobile-(?:draft:|operation-guards$)/.test(key)) return current;
+              // Upgrade existing pages lazily. Copy and read back before removing
+              // the old session value; a known unknown receipt must survive it.
+              try {
+                const old = legacy.getItem(key); if (old == null) return current;
+                let value = current ?? old;
+                if (key === 'codex-mobile-operation-guards' && current != null) {
+                  const merged = new Map(JSON.parse(current));
+                  for (const [id, record] of JSON.parse(old)) if (!merged.has(id) || ['pending', 'unknown'].includes(record?.status)) merged.set(id, record);
+                  value = JSON.stringify([...merged]);
+                }
+                candidate.setItem(key, value); if (candidate.getItem(key) === value) legacy.removeItem(key);
+                return value;
+              } catch { return current ?? legacy.getItem(key); }
+            },
+            setItem: (key, value) => candidate.setItem(key, value),
+            removeItem: key => { candidate.removeItem(key); try { legacy.removeItem(key); } catch {} },
+          };
+        }
+        break;
+      } catch {}
+    }
+  }
   let state = null, hosts = [], threads = [], selectedHost = initialHost, selectedId = '', generation = 0;
   let hostGeneration = 0, listRequest = 0, hostsRequest = 0, listLoading = false, listError = '', hostError = '';
   let connected = false, destroyed = false, closeEvents = () => {}, loading = false, drawerOpen = false;
+  const later = (fn, ms) => timers.setTimeout(fn, ms), cancel = id => { if (id != null) timers.clearTimeout(id); };
+  const now = () => typeof timers.now === 'function' ? timers.now() : Date.now();
+  let attemptGeneration = 0, readAttempt = null, retryTimer = null, heartbeatTimer = null, recoveryTimer = null;
+  let failureSince = null, retryStep = 0, recoveryNotice = false, lastWakeAt = -Infinity, wakeTimer = null;
   let cardsSignature = '', messageScope = '', hostSignature = '', threadSignature = '', noticeText = '';
   const drafts = new Map(), answers = new Map(), gate = new ActionGate({ storage: draftStorage }), messageNodes = new Map();
   const node = (tag, cls, text) => element(doc, tag, cls, text);
@@ -208,7 +283,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   }
   function saveDraft(scope, text) { drafts.set(scope, text); try { if (text) draftStorage?.setItem(storageKey(scope), text); else draftStorage?.removeItem(storageKey(scope)); } catch {} }
   function currentScope() { return JSON.stringify([selectedHost, selectedId]); }
-  function showNotice(text) { noticeText = text; notice.textContent = text; notice.hidden = !text; }
+  function showNotice(text, fromRecovery = false) { noticeText = text; recoveryNotice = fromRecovery; notice.textContent = text; notice.hidden = !text; }
   function autoSize() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight || 44, 168) + 'px'; }
   function resize() { const metrics = viewportMetrics(win?.visualViewport, win?.innerHeight); app.style.setProperty('--app-height', metrics.height + 'px'); app.style.setProperty('--app-top', metrics.top + 'px'); autoSize(); }
   function setDrawer(open) { drawerOpen = open; drawer.hidden = !open; backdrop.hidden = !open; menu.setAttribute('aria-expanded', String(open)); main.setAttribute('aria-hidden', String(open)); composer.setAttribute('aria-hidden', String(open)); main.inert = open; composer.inert = open; if (open) search.focus(); else menu.focus(); }
@@ -241,7 +316,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function renderStatus() {
     title.textContent = state?.title || (selectedId ? '正在读取对话…' : 'Codex 随行');
     subtitle.textContent = state ? (hosts.find((host) => host.id === selectedHost)?.name || selectedHost) + (isHistoryOnly(state) ? ' · 只读历史' : ' · 原桌面会话') : '选择一个已有对话';
-    connectionLabel.textContent = isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
+    connectionLabel.textContent = !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
     connection.classList.toggle('disconnected', !!selectedId && !connected);
     const attempt = gate.get(sendKey(input.value.trim()));
     input.disabled = !selectedId;
@@ -347,8 +422,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (state?.connectionId === next.connectionId && typeof next.revision === 'number' && typeof state.revision === 'number' && next.revision < state.revision) return false;
     const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 100;
     // Disk history can display messages, but it can never establish a live owner or authorize writes.
-    state = next; connected = next.connected === true && !isHistoryOnly(next); loading = false;
-    if (connected && /^连接已中断|^正在重新连接/.test(noticeText)) showNotice('');
+    state = next; connected = next.connected === true && next.ownerConfirmed === true && !isHistoryOnly(next); loading = false;
     render({ navigation: navigated }); if (atBottom) main.scrollTop = main.scrollHeight; return true;
   }
   async function loadThreads() {
@@ -364,7 +438,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (destroyed || host === selectedHost && (selectedId || threads.length)) return;
     if (selectedId) saveDraft(currentScope(), input.value);
     generation++; hostGeneration++; const stamp = hostGeneration;
-    closeEvents(); closeEvents = () => {}; state = null; selectedHost = host; selectedId = ''; connected = false; loading = false;
+    stopReadAndStream(); clearRecovery(); state = null; selectedHost = host; selectedId = ''; connected = false; loading = false;
     threads = []; listLoading = false; listError = ''; hostError = ''; input.value = ''; showNotice(''); render({ navigation: true });
     onNavigate({ host, id: null });
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
@@ -373,19 +447,104 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   async function selectThread(id) {
     if (destroyed) return;
     if (selectedId) saveDraft(currentScope(), input.value);
-    generation++; const stamp = generation, host = selectedHost; closeEvents(); closeEvents = () => {};
+    generation++; const host = selectedHost; stopReadAndStream(); clearRecovery();
     state = null; selectedId = id; connected = false; loading = true; input.value = draft(currentScope()); cardsSignature = ''; showNotice(''); autoSize(); setDrawer(false); render({ navigation: true }); onNavigate({ host, id });
-    try {
-      const result = await api.getThread(host, id); if (destroyed || stamp !== generation) return;
-      if (!update(result)) throw new Error('返回的会话与当前电脑不匹配，请刷新后重试。');
-      if (api.subscribe) closeEvents = api.subscribe(host, id, {
-        onState: (next) => { if (stamp === generation && !destroyed) update(next); },
-        onStatus: (status) => { if (stamp !== generation || destroyed) return; connected = false; showNotice(status === 'connecting' ? '正在重新连接，等待原会话状态。草稿已保留。' : '连接已中断，草稿已保留。恢复连接后会自动读取状态，不会重发操作。'); render(); },
-      });
-    } catch (error) { if (stamp === generation && !destroyed) { loading = false; connected = false; showNotice(error.message || '对话读取失败，草稿已保留。'); render(); } }
+    return readCurrent();
+  }
+  function clearRecovery() {
+    cancel(retryTimer); cancel(recoveryTimer); retryTimer = recoveryTimer = null; failureSince = null; retryStep = 0;
+  }
+  function stopReadAndStream() {
+    // Navigation and each recovery retire the entire attempt, including callbacks
+    // for the same host/id. A late response may belong to an obsolete owner.
+    attemptGeneration++; cancel(wakeTimer); wakeTimer = null; cancel(retryTimer); retryTimer = null; cancel(heartbeatTimer); heartbeatTimer = null;
+    closeEvents(); closeEvents = () => {};
+    if (readAttempt) {
+      cancel(readAttempt.timeout); readAttempt.controller.abort(); readAttempt.reject?.(Error('读取已取消。')); readAttempt = null;
+    }
+  }
+  function markRecovering(error = '') {
+    connected = false; loading = false;
+    if (failureSince == null) {
+      failureSince = now();
+      recoveryTimer = later(() => { recoveryTimer = null; if (!destroyed && !connected && failureSince != null) { recoveryMessage(); renderStatus(); } }, 15000);
+    }
+    recoveryMessage(error); render();
+  }
+  function recoveryMessage(error = '') {
+    // Recovery must not replace an unknown/pending operation notice or its guard.
+    if (!noticeText || recoveryNotice) showNotice((error ? error + ' ' : '') +
+      (now() - failureSince >= 15000 ? '暂时无法连接，将继续自动恢复。' : '正在恢复连接。') + '草稿已保留，操作不会自动重发。', true);
+  }
+  function scheduleRead() {
+    if (destroyed || !selectedId || retryTimer != null) return;
+    const delay = [1000, 2000, 4000, 8000, 15000][Math.min(retryStep++, 4)];
+    retryTimer = later(() => { retryTimer = null; void readCurrent(); }, delay);
+  }
+  function recover({ immediate = false, error = '' } = {}) {
+    if (destroyed || !selectedId) return Promise.resolve();
+    // Repeated browser hints join the current GET rather than aborting it and
+    // opening more connections. POSTs never enter this scheduler.
+    if (readAttempt) return readAttempt.promise;
+    stopReadAndStream(); markRecovering(error);
+    if (immediate) return readCurrent();
+    scheduleRead(); return Promise.resolve();
+  }
+  function watchHeartbeat(current) {
+    cancel(heartbeatTimer);
+    heartbeatTimer = later(() => { heartbeatTimer = null; if (current()) void recover(); }, heartbeatTimeoutMs);
+  }
+  function readCurrent() {
+    if (destroyed || !selectedId || !api.getThread) return Promise.resolve();
+    if (readAttempt) return readAttempt.promise;
+    cancel(retryTimer); retryTimer = null;
+    const host = selectedHost, id = selectedId, navigation = generation, attemptId = ++attemptGeneration;
+    const current = () => !destroyed && navigation === generation && attemptId === attemptGeneration && selectedHost === host && selectedId === id;
+    const attempt = { controller: new AbortController(), timeout: null, promise: null, reject: null }; readAttempt = attempt;
+    attempt.promise = (async () => {
+      try {
+        const timeout = new Promise((_, reject) => { attempt.timeout = later(() => { attempt.controller.abort(); reject(Error('读取超时。')); }, readTimeoutMs); });
+        const cancelled = new Promise((_, reject) => { attempt.reject = reject; });
+        const result = await Promise.race([api.getThread(host, id, { signal: attempt.controller.signal }), timeout, cancelled]);
+        if (!current()) return;
+        if (!update(result)) throw Error('返回的会话与当前电脑不匹配，请重新读取。');
+        if (!connected) throw Error('原桌面会话尚未连接。');
+        // subscribe() may report an unavailable EventSource synchronously. The
+        // GET is complete, so that failure must start recovery rather than join it.
+        cancel(attempt.timeout); if (readAttempt === attempt) readAttempt = null;
+        if (recoveryNotice) showNotice(''); renderStatus();
+        if (api.subscribe) {
+          const owner = result.ownerId, connectionId = result.connectionId, streamStarted = now();
+          const alive = () => {
+            if (!current()) return;
+            // A successful GET followed by a failing SSE must keep its backoff.
+            // The initial cached state/open is not proof of a stable stream.
+            if (now() - streamStarted >= 15000) clearRecovery();
+            watchHeartbeat(current);
+          };
+          watchHeartbeat(current);
+          const close = api.subscribe(host, id, {
+            onHeartbeat: alive,
+            onState: next => {
+              if (!current()) return;
+              if (next?.host !== host || next?.id !== id || next?.ownerId !== owner || next?.connectionId !== connectionId) { void recover(); return; }
+              alive(); update(next);
+              if (!connected) void recover();
+            },
+            // open/ping never grant authority. This subscription was opened only
+            // after this attempt's fresh GET; errors retire it before retrying.
+            onStatus: status => { if (!current()) return; if (status === 'connecting') watchHeartbeat(current); else void recover(); },
+          });
+          if (current()) closeEvents = typeof close === 'function' ? close : () => {}; else close?.();
+        } else clearRecovery();
+      } catch (error) {
+        if (current()) { markRecovering(error.message); scheduleRead(); }
+      } finally { cancel(attempt.timeout); if (readAttempt === attempt) readAttempt = null; }
+    })();
+    return attempt.promise;
   }
   async function refreshCurrent() {
-    if (selectedId) return selectThread(selectedId);
+    if (selectedId) return recover({ immediate: true });
     return loadThreads();
   }
   async function dispatch(action, key) {
@@ -405,7 +564,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (destroyed || scope !== currentScope()) return;
     showNotice(gate.get(key).message); renderStatus(); renderRequests();
     // Refresh only the read path; never retry POST after a timeout or disconnect.
-    try { const next = await api.getThread(selectedHost, selectedId); if (scope === currentScope() && !destroyed) update(next); } catch {}
+    await recover({ immediate: true });
   }
   function sendMessage(event) { event.preventDefault(); const text = input.value.trim(); if (text) return dispatch({ action: 'send', text }, sendKey(text)); }
   function stopTurn() { if (state?.activeTurnId) return dispatch({ action: 'interrupt' }, JSON.stringify([currentScope(), 'interrupt', state.activeTurnId])); }
@@ -420,7 +579,21 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   search.addEventListener('input', renderThreads);
   main.addEventListener('scroll', () => { latest.hidden = main.scrollHeight - main.scrollTop - main.clientHeight < 160; });
   const escape = (event) => { if (event.key === 'Escape' && drawerOpen) setDrawer(false); };
-  doc.addEventListener('keydown', escape); win?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('scroll', resize);
+  const wake = () => {
+    if (destroyed || !selectedId || doc.visibilityState === 'hidden' || readAttempt) return;
+    const delay = 500 - (now() - lastWakeAt);
+    if (delay > 0) {
+      // Keep the final online hint after a rapid handover. Dropping it could
+      // leave a restored network waiting behind the full retry backoff.
+      if (!connected && wakeTimer == null) wakeTimer = later(() => { wakeTimer = null; wake(); }, delay);
+      return;
+    }
+    cancel(wakeTimer); wakeTimer = null; lastWakeAt = now(); void recover({ immediate: true });
+  };
+  const visibility = () => { if (doc.visibilityState !== 'hidden') wake(); };
+  const offline = () => { if (!destroyed && selectedId) { stopReadAndStream(); markRecovering(); scheduleRead(); } };
+  doc.addEventListener('keydown', escape); doc.addEventListener('visibilitychange', visibility); win?.addEventListener('online', wake); win?.addEventListener('offline', offline);
+  win?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('scroll', resize);
   resize(); render({ navigation: true });
   async function loadHosts({ background = !!selectedId, loadList = true } = {}) {
     const stamp = hostGeneration, host = selectedHost, request = ++hostsRequest;
@@ -443,7 +616,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
   } else if (api.getHosts) void loadHosts();
   return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts,
-    destroy() { destroyed = true; generation++; closeEvents(); doc.removeEventListener('keydown', escape); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
+    destroy() { destroyed = true; generation++; stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
   };
 }
 

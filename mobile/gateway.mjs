@@ -233,7 +233,7 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
         res.once('close', () => { stopped = true; clients.delete(listener); res.off('drain', listener.schedule); clearTimeout(timer); clearInterval(heartbeat);
           if (![...clients].some(c => c.id === id)) { watches.delete(id); client?.unfollow(id); }
         });
-        heartbeat = setInterval(() => { if (!stopped && !res.destroyed && !res.writableNeedDrain) res.write(': keepalive\n\n'); }, 15000);
+        heartbeat = setInterval(() => { if (!stopped && !res.destroyed && !res.writableNeedDrain) res.write('event: ping\ndata: {}\n\n'); }, 15000);
         await push();
         if (stopped && ![...clients].some(c => c.id === id)) client?.unfollow(id);
         return;

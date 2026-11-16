@@ -296,3 +296,24 @@ test('an upstream Readable error ends only that SSE response, not the gateway pr
   await within(stream.closed, 'Failed upstream SSE response did not close');
   assert.equal((await request(gateway, { route: '/health' })).status, 200); assert.equal(f.calls.discover, 0);
 });
+
+test('idle SSE sends a JavaScript-visible ping so the phone can detect a stalled stream', async (t) => {
+  const timers = new Map(); let next = 1;
+  t.mock.method(globalThis, 'setInterval', (run, delay) => { const id = next++; timers.set(id, { run, delay }); return { id, unref() {} }; });
+  t.mock.method(globalThis, 'clearInterval', (handle) => timers.delete(handle?.id));
+  t.mock.method(ThreadCatalog.prototype, 'list', async () => []);
+  t.mock.method(ThreadCatalog.prototype, 'read', async () => ({ messages: [] }));
+  const f = await rig(t), gateway = await f.start(), ready = deferred(), ping = deferred(), serverClosed = deferred();
+  gateway.server.on('request', (_req, res) => res.once('close', serverClosed.resolve));
+  let response, text = '';
+  const req = http.get({ host: '127.0.0.1', port: gateway.port, path: '/api/events?host=mac&id=' + threadId, headers: auth }, res => {
+    response = res; res.on('error', () => {});
+    res.on('data', bytes => { text += bytes; if (text.includes('event: state\n')) ready.resolve(); if (text.includes('event: ping\ndata: {}\n\n')) ping.resolve(); });
+  });
+  req.on('error', () => {}); t.after(() => { response?.destroy(); req.destroy(); });
+  await within(ready.promise, 'initial isolated state did not arrive');
+  const heartbeat = [...timers.values()].find(timer => timer.delay === 15000); assert.ok(heartbeat);
+  heartbeat.run(); await within(ping.promise, 'JavaScript-visible heartbeat did not arrive');
+  assert.equal(f.calls.discover, 1, 'heartbeat must not trigger another owner read');
+  response.destroy(); req.destroy(); await within(serverClosed.promise, 'SSE close did not settle'); await f.close(gateway); assert.equal(timers.size, 0);
+});
