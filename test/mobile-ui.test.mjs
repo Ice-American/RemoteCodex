@@ -77,6 +77,11 @@ function mount(t, api = {}, options = {}) {
   const dom = fixtureDOM(), view = mountMobileUI(dom.root, { ...options, api, storage: dom.storage }); t.after(() => view.destroy()); return { ...dom, view };
 }
 function type(root, text) { const input = one(root, 'message-input'); input.value = text; input.fire('input'); return input; }
+function chooseCreationProject(root, projectId) {
+  one(root, 'create-project').click();
+  const option = byClass(root, 'create-project-option').find(item => item.value === projectId);
+  assert.ok(option, 'official project option: ' + projectId); option.click();
+}
 
 test('all user text and the minimal Markdown subset stay inert DOM text', () => {
   const { root } = fixtureDOM();
@@ -598,7 +603,7 @@ test('creation capability is lazy, only official project IDs are posted, and con
   let reads = 0, writes = 0; const navigations = [], created = '22222222-2222-4222-8222-222222222222';
   const { root, view } = mount(t, { getCreation: async () => { reads++; return nativeCreation; }, createThread: async body => { writes++; assert.equal(body.projectId, 'official-red'); assert.equal(body.prompt, '还原新UI'); assert.equal(body.title, '验收'); assert.ok(body.operationId); assert.equal(Object.hasOwn(body, 'cwd'), false); return { status: 'confirmed', threadId: created }; }, getThread: async (host, id) => thread({ host, id, title: '新建结果' }) }, { onNavigate: value => navigations.push(value) });
   view.update(thread()); type(root, '原聊天草稿'); assert.equal(reads, 0); one(root, 'new-chat-button').click(); await tick(); assert.equal(reads, 1); assert.equal(writes, 0);
-  const project = one(root, 'create-project'); project.value = 'official-red'; project.fire('change');
+  chooseCreationProject(root, 'official-red');
   const prompt = one(root, 'create-prompt'); prompt.value = '还原新UI'; prompt.fire('input'); const title = one(root, 'create-title'); title.value = '验收'; title.fire('input');
   assert.equal(one(root, 'create-submit').disabled, false); one(root, 'create-form').fire('submit'); one(root, 'create-form').fire('submit'); await tick();
   assert.equal(writes, 1); assert.equal(navigations.at(-1).id, created); assert.equal(one(root, 'creation-dialog').hidden, true);
@@ -610,8 +615,8 @@ test('a history/worktree group cannot silently create in projectless or a differ
   const { root } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async () => ({ threads: [], projects: [{ id: 'worktree', name: 'red-app worktree', path: 'D:\\Project\\red-app-worktree', count: 0, totalCount: 5 }] }), getCreation: async () => nativeCreation, createThread: async () => { writes++; } }); await tick();
   const project = one(root, 'project-select'); project.value = 'worktree'; project.fire('change'); await tick(); one(root, 'drawer-new-chat').click(); await tick();
   const prompt = one(root, 'create-prompt'); prompt.value = '新任务'; prompt.fire('input');
-  assert.equal(one(root, 'create-project').value, '__unavailable__'); assert.equal(one(root, 'create-submit').disabled, true); one(root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 0);
-  const native = one(root, 'create-project'); native.value = ''; native.fire('change'); assert.equal(one(root, 'create-submit').disabled, false);
+  assert.ok(one(root, 'create-project').textContent.includes('当前分组不能新建')); assert.equal(one(root, 'create-submit').disabled, true); one(root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 0);
+  chooseCreationProject(root, ''); assert.equal(one(root, 'create-submit').disabled, false);
 });
 
 test('unknown creation survives closing/reload with draft and GET refresh never replays POST', async (t) => {
@@ -672,24 +677,60 @@ test('a hanging read-only status poll expires, removes stale running and is abor
   view.destroy(); assert.equal(timers.size, 0);
 });
 
-test('native select option loading cannot erase a saved project or unlock an unknown creation', async (t) => {
+test('project picker loading cannot erase a saved project or unlock an unknown creation', async (t) => {
   const dom = fixtureDOM(), bare = dom.doc.createElement('select'); bare.value = 'official-red'; assert.equal(bare.value, '', 'fixture must model native select without options');
   let writes = 0, capability = async () => nativeCreation;
   const api = { getCreation: () => capability(), createThread: async body => { writes++; assert.equal(body.projectId, 'official-red'); return { status: 'unknown' }; } };
   let view = mountMobileUI(dom.root, { api, storage: dom.storage }); t.after(() => view.destroy()); view.openCreation(); await tick();
-  const project = one(dom.root, 'create-project'); project.value = 'official-red'; project.fire('change'); const prompt = one(dom.root, 'create-prompt'); prompt.value = '保留原生项目的未知创建'; prompt.fire('input');
+  chooseCreationProject(dom.root, 'official-red'); const prompt = one(dom.root, 'create-prompt'); prompt.value = '保留原生项目的未知创建'; prompt.fire('input');
   one(dom.root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 1); view.destroy();
   const pending = deferred(); capability = () => pending.promise;
   view = mountMobileUI(dom.root, { api, storage: dom.storage }); view.openCreation();
-  assert.equal(one(dom.root, 'create-project').value, ''); // No native options exist yet.
+  assert.ok(one(dom.root, 'create-project').textContent.includes('正在读取'));
   one(dom.root, 'create-title').fire('input'); one(dom.root, 'create-close').click();
   assert.equal(JSON.parse(dom.storage.getItem('codex-mobile-create-draft:mac')).projectId, 'official-red');
   view.destroy(); pending.resolve(nativeCreation); await tick();
   capability = async () => ({ supported: true, projectless: true, projects: [] });
   view = mountMobileUI(dom.root, { api, storage: dom.storage }); view.openCreation(); await tick();
-  assert.equal(one(dom.root, 'create-project').value, '__unavailable__'); assert.ok(one(dom.root, 'create-project').textContent.includes('已保存项目暂不可用')); assert.equal(one(dom.root, 'create-submit').disabled, true);
+  assert.ok(one(dom.root, 'create-project').textContent.includes('已保存项目暂不可用')); assert.equal(one(dom.root, 'create-submit').disabled, true);
   assert.equal(JSON.parse(dom.storage.getItem('codex-mobile-create-draft:mac')).projectId, 'official-red'); view.destroy();
   capability = async () => nativeCreation; view = mountMobileUI(dom.root, { api, storage: dom.storage }); view.openCreation(); await tick();
   assert.equal(one(dom.root, 'create-project').value, 'official-red'); assert.equal(one(dom.root, 'create-prompt').value, '保留原生项目的未知创建'); assert.equal(one(dom.root, 'create-submit').disabled, true);
   one(dom.root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 1);
+});
+
+test('touch project picker exposes explicit button options and preserves the official ID in the payload', async (t) => {
+  const writes = [];
+  const { root, view, storage } = mount(t, { getCreation: async () => ({ ...nativeCreation, projects: [...nativeCreation.projects, { projectId: 'official-btc', name: 'btc-phone' }] }), createThread: async body => { writes.push(body); return { status: 'unknown' }; } });
+  view.openCreation(); await tick(); const trigger = one(root, 'create-project');
+  assert.equal(trigger.tagName, 'BUTTON'); assert.equal(trigger.type, 'button'); assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+  trigger.click(); assert.equal(one(root, 'create-project-options').hidden, false); assert.equal(trigger.getAttribute('aria-expanded'), 'true');
+  assert.ok(byClass(root, 'create-project-option').every(option => option.type === 'button' && option.getAttribute('role') === 'option'));
+  byClass(root, 'create-project-option').find(option => option.value === 'official-red').click();
+  assert.equal(trigger.textContent, 'red-app'); assert.equal(one(root, 'create-project-options').hidden, true); assert.equal(writes.length, 0);
+  chooseCreationProject(root, 'official-btc'); assert.equal(trigger.textContent, 'btc-phone');
+  assert.equal(JSON.parse(storage.getItem('codex-mobile-create-draft:mac')).projectId, 'official-btc');
+  const prompt = one(root, 'create-prompt'); prompt.value = '在所选项目执行'; prompt.fire('input'); one(root, 'create-form').fire('submit'); await tick();
+  assert.equal(writes.length, 1); assert.equal(writes[0].projectId, 'official-btc'); assert.equal(one(root, 'create-submit').disabled, true);
+  chooseCreationProject(root, 'official-red'); chooseCreationProject(root, 'official-btc'); assert.equal(one(root, 'create-submit').disabled, true);
+});
+
+test('unsupported creation explains the disabled capability and permits a GET-only refresh', async (t) => {
+  let reads = 0, writes = 0;
+  const { root, view } = mount(t, { getCreation: async () => { reads++; return { supported: false, projects: [], reason: 'Mac 官方新建接口拒绝当前工具的签名身份' }; }, createThread: async () => { writes++; } });
+  view.openCreation(); await tick(); const trigger = one(root, 'create-project');
+  assert.equal(trigger.disabled, false); trigger.click(); assert.equal(one(root, 'create-project-options').hidden, false);
+  assert.ok(one(root, 'create-project-options').textContent.includes('签名身份')); assert.ok(one(root, 'create-project-options').textContent.includes('Windows'));
+  assert.equal(byClass(root, 'create-project-option').length, 0); assert.equal(one(root, 'create-retry').hidden, false);
+  one(root, 'create-retry').click(); await tick(); assert.equal(reads, 2); assert.equal(writes, 0); assert.equal(one(root, 'create-submit').disabled, true);
+});
+
+test('creation read timeout exposes a fresh GET and never accepts its late project list', async (t) => {
+  const timers = fakeClock(), old = deferred(); let reads = 0, writes = 0, firstSignal;
+  const { root, view } = mount(t, { getCreation: (_host, { signal }) => { reads++; if (reads === 1) { firstSignal = signal; return new Promise((resolve, reject) => { old.promise.then(resolve); signal.addEventListener('abort', () => reject(Error('synthetic AbortError'))); }); } return Promise.resolve(nativeCreation); }, createThread: async () => { writes++; } }, { timers });
+  view.openCreation(); assert.equal(one(root, 'create-project').disabled, true); await timers.advance(20000);
+  assert.equal(firstSignal.aborted, true); assert.ok(one(root, 'creation-state').textContent.includes('超时')); assert.equal(one(root, 'create-retry').hidden, false);
+  one(root, 'create-retry').click(); await tick(); chooseCreationProject(root, 'official-red');
+  old.resolve({ supported: true, projectless: true, projects: [] }); await tick();
+  assert.equal(one(root, 'create-project').textContent, 'red-app'); assert.equal(reads, 2); assert.equal(writes, 0);
 });

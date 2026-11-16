@@ -110,6 +110,16 @@ pre { margin: 10px 0; padding: 13px; white-space: pre-wrap; word-break: break-wo
 .create-form { display: flex; flex-direction: column; gap: 14px; }
 .create-field { display: flex; flex-direction: column; gap: 7px; color: #45634d; font-size: 12px; }
 .create-field input, .create-field select, .create-field textarea { width: 100%; min-width: 0; min-height: 44px; border: 1px solid #dce5d8; border-radius: 10px; padding: 10px 12px; background: #fff; font-size: 16px; color: #28452e; }
+.create-project-picker { min-width: 0; }
+.create-project { display: block; width: 100%; min-height: 46px; border: 1px solid #dce5d8; border-radius: 10px; padding: 10px 36px 10px 12px; background: #fff; color: #28452e; font-size: 16px; text-align: left; overflow-wrap: anywhere; position: relative; }
+.create-project::after { content: '⌄'; position: absolute; right: 13px; top: 11px; color: #69776e; }
+.create-project[aria-expanded='true']::after { content: '⌃'; }
+.create-project-options { margin-top: 7px; padding: 4px; border: 1px solid #cbdccc; border-radius: 10px; background: #fff; max-height: 240px; overflow-y: auto; overscroll-behavior: contain; }
+.create-project-list { display: flex; flex-direction: column; gap: 3px; }
+.create-project-option { width: 100%; min-height: 46px; border: 0; border-radius: 7px; padding: 10px 12px; background: #fff; color: #28452e; font-size: 15px; text-align: left; overflow-wrap: anywhere; }
+.create-project-option[aria-selected='true'] { background: #e6f0e8; font-weight: 650; }
+.create-project-option:active { background: #d5e7d8; }
+.create-project-reason { margin: 6px 8px; color: #69776e; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
 .create-field textarea { resize: vertical; line-height: 1.6; min-height: 130px; }
 .create-submit { min-height: 46px; border: 0; border-radius: 11px; background: #345e4c; color: white; font-size: 15px; }
 @media (min-width: 700px) { .app-header { grid-template-columns: auto minmax(0, 1fr) auto auto; padding: 15px max(20px, calc((100% - 780px) / 2)); } .host-switch { grid-column: auto; min-width: 220px; } .composer { padding-left: max(20px, calc((100% - 760px) / 2)); padding-right: max(20px, calc((100% - 760px) / 2)); } .conversation { padding-top: 28px; } }

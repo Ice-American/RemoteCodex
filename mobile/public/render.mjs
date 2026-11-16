@@ -126,7 +126,7 @@ export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, Ev
     getThreads: (host, options = {}) => json(path('/api/threads', { host,
       ...Object.fromEntries(Object.entries(options).filter(([key, value]) => ['projectId', 'q', 'cursor', 'limit', 'range'].includes(key) && value != null && value !== '')) })),
     getThreadStatuses: (host, ids, { signal } = {}) => json(path('/api/statuses', { host, ids: ids.join(',') }), { signal }),
-    getCreation: (host) => json(path('/api/creation', { host })),
+    getCreation: (host, { signal } = {}) => json(path('/api/creation', { host }), { signal }),
     async createThread(body) {
       const controller = new AbortController(), timer = setTimeout(() => controller.abort(), actionTimeoutMs);
       // Creation is a write with its own durable operation guard. Never retry it.
@@ -249,6 +249,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   let searchTimer = null, statusTimer = null, statusGeneration = 0, statusPending = null;
   let creationOpen = false, creationReturnDrawer = false, creationGeneration = 0, creationBusy = false, creationLoading = false;
   let creation = null, creationError = '', creationResult = null, creationDesiredProject = null, creationSelectedProjectId = '';
+  let creationProjectsOpen = false, creationRead = null;
   const createDrafts = new Map(), threadRowViews = new Map();
   let connected = false, destroyed = false, closeEvents = () => {}, loading = false, drawerOpen = false;
   const later = (fn, ms) => timers.setTimeout(fn, ms), cancel = id => { if (id != null) timers.clearTimeout(id); };
@@ -302,15 +303,27 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const creationDialog = node('section', 'creation-dialog'); creationDialog.hidden = true; creationDialog.setAttribute('role', 'dialog'); creationDialog.setAttribute('aria-modal', 'true'); creationDialog.setAttribute('aria-label', '新建聊天');
   const creationHeading = node('div', 'creation-heading'); creationHeading.append(node('h2', '', '新建聊天'), button('关闭', 'create-close', () => closeCreation()));
   const creationState = node('p', 'creation-state'); creationState.setAttribute('role', 'status'); creationState.setAttribute('aria-live', 'polite');
-  const createForm = node('form', 'create-form'), createProject = node('select', 'create-project'), createTitle = node('input', 'create-title'), createPrompt = node('textarea', 'create-prompt');
+  const createForm = node('form', 'create-form'), createTitle = node('input', 'create-title'), createPrompt = node('textarea', 'create-prompt');
+  // Keep project selection in the page so Android users do not depend on a
+  // browser-native select dialog. Only an explicit option click changes intent.
+  const createProject = button('选择项目', 'create-project', () => {
+    if (creationError) { void loadCreation(); return; }
+    creationProjectsOpen = !creationProjectsOpen; renderCreation();
+  });
+  const createProjectPicker = node('div', 'create-project-picker'), createProjectOptions = node('div', 'create-project-options');
+  createProjectOptions.id = 'create-project-options'; createProjectOptions.hidden = true;
+  const createProjectList = node('div', 'create-project-list'), createProjectReason = node('p', 'create-project-reason');
+  createProjectList.setAttribute('role', 'listbox'); createProjectList.setAttribute('aria-label', '可用的官方项目');
+  createProject.setAttribute('aria-haspopup', 'listbox'); createProject.setAttribute('aria-controls', createProjectOptions.id);
+  createProjectOptions.append(createProjectReason, createProjectList); createProjectPicker.append(createProject, createProjectOptions);
   createProject.setAttribute('aria-label', '新聊天项目'); createTitle.setAttribute('aria-label', '新聊天标题'); createTitle.placeholder = '标题（可选）'; createTitle.maxLength = 160;
   createPrompt.setAttribute('aria-label', '第一条消息'); createPrompt.placeholder = '描述你希望 Codex 完成的工作'; createPrompt.rows = 5; createPrompt.maxLength = 24000;
-  const field = (name, control) => { const label = node('label', 'create-field'); label.append(node('span', '', name), control); return label; };
+  const field = (name, control) => { const label = node(control === createProjectPicker ? 'div' : 'label', 'create-field'); label.append(node('span', '', name), control); return label; };
   const createSubmit = node('button', 'create-submit', '创建并开始'); createSubmit.type = 'submit';
   const createRetry = button('重新读取创建能力', 'create-retry', () => loadCreation()); createRetry.hidden = true;
   const createdOpen = button('打开已创建的聊天', 'created-open', () => { const result = creationResult; if (result?.host === selectedHost && validCreatedId(result.threadId)) { closeCreation({ save: false, restore: false }); void selectThread(result.threadId); } }); createdOpen.hidden = true;
   const createBack = button('返回列表核对', 'create-back-list', () => { closeCreation({ restore: false }); setDrawer(true); void loadThreads(); }); createBack.hidden = true;
-  createForm.append(field('项目', createProject), field('标题（可选）', createTitle), field('第一条消息', createPrompt), createSubmit);
+  createForm.append(field('项目', createProjectPicker), field('标题（可选）', createTitle), field('第一条消息', createPrompt), createSubmit);
   creationDialog.append(creationHeading, creationState, createForm, createRetry, createdOpen, createBack);
   app.append(header, connection, notice, main, latest, composer, backdrop, drawer, creationBackdrop, creationDialog); root.replaceChildren(app);
 
@@ -351,41 +364,65 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   }
   function creationKey(host = selectedHost) { return JSON.stringify([host, 'create', fingerprint(JSON.stringify([creationSelectedProjectId, createTitle.value.trim(), createPrompt.value.trim()]))]); }
   function creationTargetValid() { return creation?.supported === true && (creationSelectedProjectId === '' ? creation.projectless === true : creation.projects?.some(project => project.projectId === creationSelectedProjectId)); }
+  function renderCreationProjects() {
+    const options = [];
+    const add = (projectId, name) => {
+      const option = button(name, 'create-project-option', () => {
+        if (creationLoading || creationBusy || !creation?.supported) return;
+        creationSelectedProjectId = projectId; creationDesiredProject = null; creationProjectsOpen = false;
+        saveCreateDraft(); creationResult = null; gate.forgetConfirmed(creationKey()); renderCreation(); createProject.focus();
+      });
+      option.value = projectId; option.dataset.projectId = projectId; option.setAttribute('role', 'option'); options.push(option);
+    };
+    if (creation?.supported) {
+      if (creation.projectless) add('', '独立聊天');
+      for (const project of creation.projects ?? []) add(project.projectId, project.name || project.path || project.projectId);
+    }
+    createProjectList.replaceChildren(...options);
+    createProjectReason.textContent = creationError || (creation?.supported ? (options.length ? '' : '这台电脑没有可用的官方项目。') : creation?.reason || '这台电脑暂不支持创建聊天。');
+    if (creation?.supported === false && selectedHost === 'mac') createProjectReason.textContent += ' 请关闭此窗口并切换到 Windows 后新建，或先在 Mac 电脑新建聊天。';
+    createProjectReason.hidden = !createProjectReason.textContent;
+  }
   function renderCreation() {
     const receipt = gate.get(creationKey());
     creationState.textContent = creationLoading ? '正在读取官方项目…' : creationError || receipt?.message || (creation?.supported ? '选择项目，填写第一条消息后创建。' : creation?.reason || '这台电脑暂不支持创建聊天。');
-    createProject.disabled = creationLoading || creationBusy || !creation?.supported;
+    const selected = creation?.projects?.find(project => project.projectId === creationSelectedProjectId);
+    createProject.textContent = creationLoading ? '正在读取官方项目…' : creationError ? '读取失败，点击重试' : !creation?.supported ? '查看无法新建的原因' : selected ? selected.name || selected.path || selected.projectId : creationSelectedProjectId === '' && creation.projectless ? '独立聊天' : creationSelectedProjectId === '__unavailable__' ? '当前分组不能新建，请选择官方项目' : creationSelectedProjectId ? '已保存项目暂不可用，请重新选择' : '请选择项目';
+    createProject.value = creationSelectedProjectId;
+    createProject.disabled = creationLoading || creationBusy;
+    createProject.setAttribute('aria-expanded', String(creationProjectsOpen)); createProjectOptions.hidden = !creationProjectsOpen;
+    for (const option of createProjectList.children) { option.disabled = creationLoading || creationBusy; option.setAttribute('aria-selected', String(option.value === creationSelectedProjectId)); }
     createTitle.disabled = createPrompt.disabled = creationBusy;
     createSubmit.disabled = creationLoading || creationBusy || !creationTargetValid() || !createPrompt.value.trim() || !!receipt && receipt.status !== 'rejected';
     createSubmit.textContent = creationBusy ? '正在创建…' : '创建并开始';
-    createRetry.hidden = creationLoading || !creationError;
+    createRetry.hidden = creationLoading || (!creationError && creation?.supported !== false);
     createBack.hidden = !receipt || receipt.status === 'rejected';
     createdOpen.hidden = creationResult?.host !== selectedHost || !validCreatedId(creationResult?.threadId);
   }
   function normalizedProjectPath(path) { const value = String(path || '').replace(/\\/g, '/').replace(/\/$/, ''); return /^[a-z]:\//i.test(value) ? value.toLowerCase() : value; }
   async function loadCreation() {
     if (!creationOpen || destroyed) return;
-    const host = selectedHost, stamp = ++creationGeneration; creationLoading = true; creationError = ''; renderCreation();
+    cancelCreationRead();
+    const host = selectedHost, stamp = ++creationGeneration, read = { controller: new AbortController(), timer: null, timedOut: false };
+    creationRead = read; creationLoading = true; creationError = ''; creationProjectsOpen = false; renderCreation();
     try {
       if (!api.getCreation) throw new Error('当前服务暂不支持创建聊天，请刷新页面后重试。');
-      const result = await api.getCreation(host); if (destroyed || !creationOpen || host !== selectedHost || stamp !== creationGeneration) return;
+      // This is a read-only retry boundary. Expire a stalled GET without replaying
+      // any create POST or allowing a late capability response to replace intent.
+      const timeout = new Promise((_, reject) => { read.timer = later(() => { read.timedOut = true; read.controller.abort(); reject(new Error('读取官方项目超时，请重新读取。')); }, 20000); });
+      const result = await Promise.race([api.getCreation(host, { signal: read.controller.signal }), timeout]); if (destroyed || !creationOpen || host !== selectedHost || stamp !== creationGeneration) return;
       creation = result; const desired = creationDesiredProject; creationDesiredProject = null;
-      // A real select erases a value until its option exists. Keep intent outside
-      // the DOM so a slow capability read/reload cannot change an unknown create
+      // Keep intent outside the picker so a slow capability read/reload cannot change an unknown create
       // into a different project or an unguarded projectless operation.
       let selected = creationSelectedProjectId;
       // Catalog groups include worktrees/history. Only an official project ID may be sent to create.
       if (desired) selected = result.projects?.find(project => normalizedProjectPath(project.path) === normalizedProjectPath(desired.path))?.projectId ?? '__unavailable__';
-      const options = [];
-      if (result.projectless) options.push(Object.assign(node('option', '', '独立聊天'), { value: '' }));
-      for (const project of result.projects ?? []) options.push(Object.assign(node('option', '', project.name || project.path || project.projectId), { value: project.projectId }));
-      if (!options.some(option => option.value === selected)) options.unshift(Object.assign(node('option', '', selected === '__unavailable__' ? '当前分组不能新建，请选择官方项目' : selected ? '已保存项目暂不可用，请重新选择' : '请选择项目'), { value: '__unavailable__', disabled: true }));
       creationSelectedProjectId = selected;
-      createProject.replaceChildren(...options); createProject.value = options.some(option => option.value === selected) ? selected : '__unavailable__';
-      saveCreateDraft();
-    } catch (error) { if (host === selectedHost && stamp === creationGeneration && creationOpen) { creation = null; creationError = error.message || '创建能力读取失败。'; } }
-    finally { if (!destroyed && host === selectedHost && stamp === creationGeneration && creationOpen) { creationLoading = false; renderCreation(); } }
+      saveCreateDraft(); renderCreationProjects();
+    } catch (error) { if (host === selectedHost && stamp === creationGeneration && creationOpen) { creation = null; creationError = read.timedOut ? '读取官方项目超时，请重新读取。' : error.message || '创建能力读取失败。'; renderCreationProjects(); } }
+    finally { cancel(read.timer); if (creationRead === read) creationRead = null; if (!destroyed && host === selectedHost && stamp === creationGeneration && creationOpen) { creationLoading = false; renderCreation(); } }
   }
+  function cancelCreationRead() { if (creationRead) { cancel(creationRead.timer); creationRead.controller.abort(); creationRead = null; } }
   function openCreation() {
     if (destroyed || creationOpen) return;
     creationReturnDrawer = drawerOpen; if (drawerOpen) setDrawer(false);
@@ -393,15 +430,17 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     // A catalog filter only suggests a target for an empty form. Existing draft
     // intent and unresolved receipts retain their original official project.
     creationDesiredProject = !saved.prompt.trim() && !saved.title.trim() && !saved.projectId && selectedProject ? projects.find(project => project.id === selectedProject) ?? null : null;
-    creation = null; creationError = ''; creationOpen = true; syncOverlays(); renderCreation(); void loadCreation(); createPrompt.focus();
+    creation = null; creationError = ''; creationProjectsOpen = false; creationOpen = true; syncOverlays(); renderCreationProjects(); renderCreation(); void loadCreation();
+    // Keep the project control visible on phones instead of opening the message keyboard immediately.
+    createProject.focus();
   }
   function closeCreation({ save = true, restore = true } = {}) {
     if (!creationOpen) return;
-    if (save) saveCreateDraft(); creationOpen = false; creationGeneration++; creationLoading = false; syncOverlays();
+    if (save) saveCreateDraft(); creationOpen = false; creationGeneration++; creationLoading = false; creationProjectsOpen = false; cancelCreationRead(); syncOverlays();
     if (restore && creationReturnDrawer) setDrawer(true); else newChat.focus();
   }
   async function submitCreation(event) {
-    event.preventDefault(); if (creationBusy || !creationTargetValid() || !createPrompt.value.trim() || !api.createThread) return;
+    event.preventDefault(); if (creationLoading || creationBusy || !creationTargetValid() || !createPrompt.value.trim() || !api.createThread) return;
     const host = selectedHost, key = creationKey(), saved = saveCreateDraft(), attempt = gate.begin(key); if (!attempt) { renderCreation(); return; }
     const intent = { host, operationId: attempt.operationId, projectId: creationSelectedProjectId || null, prompt: createPrompt.value.trim(), ...(createTitle.value.trim() ? { title: createTitle.value.trim() } : {}) };
     const openedGeneration = creationGeneration; creationBusy = true; creationResult = null; renderCreation();
@@ -773,8 +812,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   input.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && !event.isComposing) sendMessage(event); });
   composer.addEventListener('submit', sendMessage);
   createForm.addEventListener('submit', submitCreation);
-  for (const control of [createProject, createTitle, createPrompt]) control.addEventListener(control === createProject ? 'change' : 'input', () => {
-    if (control === createProject && createProject.value !== '__unavailable__') creationSelectedProjectId = createProject.value;
+  for (const control of [createTitle, createPrompt]) control.addEventListener('input', () => {
     saveCreateDraft(); creationResult = null; gate.forgetConfirmed(creationKey()); renderCreation();
   });
   search.addEventListener('input', () => {
@@ -784,7 +822,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   projectSelect.addEventListener('change', () => { selectedProject = projectSelect.value; changeCatalog(); });
   rangeSelect.addEventListener('change', () => { selectedRange = rangeSelect.value === 'all' ? 'all' : 'week'; changeCatalog(); });
   main.addEventListener('scroll', () => { latest.hidden = main.scrollHeight - main.scrollTop - main.clientHeight < 160; });
-  const escape = (event) => { if (event.key === 'Escape') { if (creationOpen) closeCreation(); else if (drawerOpen) setDrawer(false); } };
+  const escape = (event) => { if (event.key === 'Escape') { if (creationOpen && creationProjectsOpen) { creationProjectsOpen = false; renderCreation(); createProject.focus(); } else if (creationOpen) closeCreation(); else if (drawerOpen) setDrawer(false); } };
   const wake = () => {
     if (destroyed || !selectedId || doc.visibilityState === 'hidden' || readAttempt) return;
     const delay = 500 - (now() - lastWakeAt);
@@ -822,7 +860,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
   } else if (api.getHosts) void loadHosts();
   return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts, openCreation,
-    destroy() { destroyed = true; generation++; cancel(searchTimer); searchTimer = null; stopStatuses(); creationGeneration++; stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
+    destroy() { destroyed = true; generation++; cancel(searchTimer); searchTimer = null; stopStatuses(); creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
   };
 }
 
