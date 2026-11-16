@@ -41,8 +41,8 @@ function rig(options = {}) {
 
 test('Mac capability is explicit and never borrows a signed identity or connects', async () => {
   const f = rig({ native: { platform: 'darwin' } });
-  const cap = await f.native.capability(); assert.equal(cap.supported, false); assert.match(cap.reason, /签名身份/);
-  await assert.rejects(f.native.create({ projectId: null, prompt: 'synthetic' }, { beforeDispatch() { assert.fail('must not dispatch'); } }), /签名身份/);
+  const cap = await f.native.capability(); assert.equal(cap.supported, false); assert.match(cap.reason, /网页.*Mac/);
+  await assert.rejects(f.native.create({ projectId: null, prompt: 'synthetic' }, { beforeDispatch() { assert.fail('must not dispatch'); } }), /网页.*Mac/);
   assert.deepEqual(await f.native.statuses([context]), [{ id: context, status: 'unknown', statusConfirmed: false, observedAt: null }]);
   assert.deepEqual(f.events, []);
 });

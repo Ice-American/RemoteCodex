@@ -15,7 +15,7 @@ const officialImage = /\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$/i
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
 const toolPipe = value => /^(?:codex-browser-use-|codex-app-tools-)/.test(path.win32.basename(value ?? ''));
 const localProject = project => (project.projectKind ?? project.kind) === 'local' && (!project.hostId || project.hostId === 'local');
-const unsupported = 'Mac 官方新建接口拒绝当前工具的签名身份；请先在电脑新建聊天，手机可继续原聊天';
+const unsupported = '此网页暂不支持在 Mac 上新建聊天。Mac 已有聊天可以继续；新聊天请选择 Windows。';
 
 async function probePipes(paths) {
   const names = paths ?? fs.readdirSync('\\\\.\\pipe\\').filter(toolPipe).map(name => '\\\\.\\pipe\\' + name);

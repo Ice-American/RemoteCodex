@@ -720,9 +720,166 @@ test('unsupported creation explains the disabled capability and permits a GET-on
   const { root, view } = mount(t, { getCreation: async () => { reads++; return { supported: false, projects: [], reason: 'Mac 官方新建接口拒绝当前工具的签名身份' }; }, createThread: async () => { writes++; } });
   view.openCreation(); await tick(); const trigger = one(root, 'create-project');
   assert.equal(trigger.disabled, false); trigger.click(); assert.equal(one(root, 'create-project-options').hidden, false);
-  assert.ok(one(root, 'create-project-options').textContent.includes('签名身份')); assert.ok(one(root, 'create-project-options').textContent.includes('Windows'));
+  assert.ok(one(root, 'create-project-options').textContent.includes('签名身份'));
+  assert.ok(one(root, 'creation-state').textContent.includes('上方选择 Windows'));
+  assert.equal(byClass(root, 'create-host-button').find(choice => choice.dataset.host === 'windows').disabled, false);
   assert.equal(byClass(root, 'create-project-option').length, 0); assert.equal(one(root, 'create-retry').hidden, false);
   one(root, 'create-retry').click(); await tick(); assert.equal(reads, 2); assert.equal(writes, 0); assert.equal(one(root, 'create-submit').disabled, true);
+});
+
+test('creation can select Windows inside the dialog without moving the current Mac chat or submitting', async (t) => {
+  const reads = [], navigations = []; let writes = 0;
+  const { root, view } = mount(t, { getCreation: async host => {
+    reads.push(host); return host === 'mac' ? { supported: false, projects: [], reason: 'Mac 暂不支持新建' } : nativeCreation;
+  }, createThread: async () => { writes++; } }, { onNavigate: value => navigations.push(value) });
+  view.update(thread()); type(root, 'Mac原聊天草稿'); view.openCreation(); await tick();
+  assert.ok(one(root, 'creation-dialog').textContent.includes('执行电脑'));
+  const windows = byClass(root, 'create-host-button').find(item => item.dataset.host === 'windows');
+  assert.ok(windows, 'Windows must be selectable inside the creation dialog'); assert.equal(windows.type, 'button'); windows.click(); await tick();
+  assert.deepEqual(reads, ['mac', 'windows']); assert.equal(one(root, 'creation-dialog').hidden, false);
+  assert.equal(windows.getAttribute('aria-pressed'), 'true'); assert.equal(one(root, 'thread-title').textContent, '手机适配');
+  assert.equal(one(root, 'message-input').value, 'Mac原聊天草稿'); assert.deepEqual(navigations, []); assert.equal(writes, 0);
+  chooseCreationProject(root, 'official-red'); assert.equal(one(root, 'create-project').textContent, 'red-app');
+});
+
+test('a confirmed create from a closed dialog settles its guard without changing the new dialog or its host draft', async (t) => {
+  const pending = deferred(), navigations = [], writes = [];
+  const { root, view, storage } = mount(t, { getCreation: async () => nativeCreation, createThread: body => { writes.push(body); return pending.promise; } }, { onNavigate: value => navigations.push(value) });
+  view.update(thread()); view.openCreation(); await tick();
+  byClass(root, 'create-host-button').find(item => item.dataset.host === 'windows').click(); await tick();
+  chooseCreationProject(root, 'official-red'); const prompt = one(root, 'create-prompt'); prompt.value = 'Windows待确认草稿'; prompt.fire('input');
+  one(root, 'create-form').fire('submit'); one(root, 'create-close').click(); view.openCreation(); await tick();
+  prompt.value = '新的Mac草稿'; prompt.fire('input');
+  pending.resolve({ status: 'confirmed', threadId: '22222222-2222-4222-8222-222222222222' }); await tick();
+  assert.deepEqual(navigations, []); assert.equal(one(root, 'creation-dialog').hidden, false); assert.equal(prompt.value, '新的Mac草稿');
+  assert.equal(JSON.parse(storage.getItem('codex-mobile-create-draft:windows')).prompt, 'Windows待确认草稿');
+  byClass(root, 'create-host-button').find(item => item.dataset.host === 'windows').click(); await tick();
+  assert.equal(prompt.value, 'Windows待确认草稿'); assert.equal(one(root, 'create-submit').disabled, true);
+  one(root, 'create-form').fire('submit'); await tick(); assert.equal(writes.length, 1);
+});
+
+test('a late host list updates offline labels without changing the explicit creation target', async (t) => {
+  const hosts = deferred(), writes = [], reads = [];
+  const { root, view } = mount(t, { getHosts: () => hosts.promise, getCreation: async host => {
+    reads.push(host); return { supported: true, projectless: false, projects: [{ projectId: 'mac-project', name: 'Mac项目' }] };
+  }, createThread: async body => { writes.push(body); return { status: 'unknown' }; } });
+  view.openCreation(); await tick(); chooseCreationProject(root, 'mac-project');
+  const prompt = one(root, 'create-prompt'); prompt.value = '仍在Mac创建'; prompt.fire('input');
+  hosts.resolve({ hosts: [{ id: 'windows', name: 'Windows', online: false }] }); await tick();
+  const choices = byClass(root, 'create-host-button');
+  assert.equal(choices.find(item => item.dataset.host === 'mac').getAttribute('aria-pressed'), 'true');
+  assert.ok(choices.find(item => item.dataset.host === 'windows').textContent.includes('离线'));
+  assert.ok(one(root, 'create-submit').textContent.includes('Mac')); assert.deepEqual(reads, ['mac']);
+  one(root, 'create-form').fire('submit'); await tick(); assert.equal(writes.length, 1); assert.equal(writes[0].host, 'mac'); assert.equal(writes[0].projectId, 'mac-project');
+});
+
+test('creation target changes restore separate drafts and only post that computers official project ID', async (t) => {
+  const writes = [], catalogs = Object.fromEntries(['mac', 'windows'].map(host => [host, { supported: true, projectless: false, projects: [{ projectId: host + '-project', name: host + '项目' }] }]));
+  const { root, view } = mount(t, { getCreation: async host => catalogs[host], createThread: async body => { writes.push(body); return { status: 'unknown' }; } });
+  view.update(thread()); view.openCreation(); await tick(); chooseCreationProject(root, 'mac-project');
+  const prompt = one(root, 'create-prompt'), title = one(root, 'create-title'), target = host => byClass(root, 'create-host-button').find(item => item.dataset.host === host);
+  prompt.value = 'Mac任务'; prompt.fire('input'); title.value = 'Mac标题'; title.fire('input');
+  target('windows').click(); await tick();
+  assert.equal(prompt.value, ''); assert.equal(title.value, ''); assert.equal(one(root, 'create-project').value, ''); assert.equal(one(root, 'create-submit').disabled, true);
+  chooseCreationProject(root, 'windows-project'); prompt.value = 'Windows任务'; prompt.fire('input'); title.value = 'Windows标题'; title.fire('input');
+  target('mac').click(); await tick();
+  assert.equal(prompt.value, 'Mac任务'); assert.equal(title.value, 'Mac标题'); assert.equal(one(root, 'create-project').value, 'mac-project');
+  target('windows').click(); await tick();
+  assert.equal(prompt.value, 'Windows任务'); assert.equal(title.value, 'Windows标题'); assert.equal(one(root, 'create-project').value, 'windows-project');
+  one(root, 'create-form').fire('submit'); await tick(); assert.equal(writes.length, 1);
+  assert.deepEqual({ host: writes[0].host, projectId: writes[0].projectId, prompt: writes[0].prompt, title: writes[0].title }, { host: 'windows', projectId: 'windows-project', prompt: 'Windows任务', title: 'Windows标题' });
+  target('mac').click(); await tick(); assert.equal(one(root, 'create-submit').disabled, false);
+  target('windows').click(); await tick(); assert.equal(one(root, 'create-submit').disabled, true); one(root, 'create-form').fire('submit'); assert.equal(writes.length, 1);
+});
+
+test('an unknown Windows creation survives target changes and page reload without borrowing the Mac draft', async (t) => {
+  const dom = fixtureDOM(); let writes = 0;
+  const api = { getCreation: async () => nativeCreation, createThread: async () => { writes++; return { status: 'unknown' }; } };
+  let view = mountMobileUI(dom.root, { api, storage: dom.storage }); t.after(() => view.destroy());
+  view.openCreation(); await tick(); byClass(dom.root, 'create-host-button').find(item => item.dataset.host === 'windows').click(); await tick();
+  chooseCreationProject(dom.root, 'official-red'); let prompt = one(dom.root, 'create-prompt'); prompt.value = 'Windows结果待确认'; prompt.fire('input');
+  one(dom.root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 1); view.destroy();
+  view = mountMobileUI(dom.root, { api, storage: dom.storage }); view.openCreation(); await tick(); prompt = one(dom.root, 'create-prompt');
+  assert.equal(prompt.value, ''); assert.equal(byClass(dom.root, 'create-host-button').find(item => item.dataset.host === 'mac').getAttribute('aria-pressed'), 'true');
+  byClass(dom.root, 'create-host-button').find(item => item.dataset.host === 'windows').click(); await tick();
+  assert.equal(prompt.value, 'Windows结果待确认'); assert.equal(one(dom.root, 'create-project').value, 'official-red'); assert.equal(one(dom.root, 'create-submit').disabled, true);
+  one(dom.root, 'create-close').click(); view.openCreation(); await tick(); byClass(dom.root, 'create-host-button').find(item => item.dataset.host === 'windows').click(); await tick();
+  one(dom.root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 1); assert.equal(one(dom.root, 'create-submit').disabled, true);
+});
+
+test('late capability reads cannot replace the chosen target after rapid creation host changes', async (t) => {
+  const oldMac = deferred(), oldWindows = deferred(), reads = []; let macReads = 0, firstSignal;
+  const currentMac = { supported: true, projectless: false, projects: [{ projectId: 'current-mac-project', name: '当前Mac项目' }] };
+  const { root, view } = mount(t, { getCreation: (host, { signal }) => {
+    reads.push(host); if (host === 'windows') return oldWindows.promise;
+    if (++macReads === 1) { firstSignal = signal; return oldMac.promise; } return Promise.resolve(currentMac);
+  } });
+  view.openCreation(); byClass(root, 'create-host-button').find(item => item.dataset.host === 'windows').click();
+  byClass(root, 'create-host-button').find(item => item.dataset.host === 'mac').click(); await tick();
+  assert.equal(firstSignal.aborted, true); chooseCreationProject(root, 'current-mac-project');
+  oldWindows.resolve({ supported: false, reason: '迟到的Windows读取失败', projects: [] }); oldMac.resolve(nativeCreation); await tick();
+  assert.deepEqual(reads, ['mac', 'windows', 'mac']); assert.equal(one(root, 'create-project').value, 'current-mac-project'); assert.equal(one(root, 'create-project').textContent, '当前Mac项目');
+  assert.equal(one(root, 'create-submit').textContent, '在 Mac 创建并开始'); assert.equal(one(root, 'creation-state').textContent.includes('迟到'), false);
+});
+
+test('a pending creation locks its target and a confirmed Windows UUID opens before its slow directory', async (t) => {
+  const pending = deferred(), slowList = deferred(), navigations = [], reads = [], writes = [];
+  const created = '22222222-2222-4222-8222-222222222222';
+  const { root, view } = mount(t, { getCreation: async () => nativeCreation, createThread: body => { writes.push(body); return pending.promise; },
+    getThreads: host => host === 'windows' ? slowList.promise : Promise.resolve({ threads: [] }),
+    getThread: async (host, id) => { reads.push({ host, id }); return thread({ host, id, title: host === 'windows' ? 'Windows已创建' : 'Mac原会话' }); },
+  }, { onNavigate: value => navigations.push(value) });
+  view.update(thread()); type(root, '保留Mac原聊天草稿'); view.openCreation(); await tick();
+  byClass(root, 'create-host-button').find(item => item.dataset.host === 'windows').click(); await tick();
+  chooseCreationProject(root, 'official-red'); const prompt = one(root, 'create-prompt'); prompt.value = '明确在Windows创建'; prompt.fire('input');
+  one(root, 'create-form').fire('submit'); assert.ok(byClass(root, 'create-host-button').every(item => item.disabled));
+  byClass(root, 'create-host-button').find(item => item.dataset.host === 'mac').fire('click'); one(root, 'create-form').fire('submit');
+  assert.equal(writes.length, 1); assert.equal(writes[0].host, 'windows'); assert.equal(byClass(root, 'create-host-button').find(item => item.dataset.host === 'windows').getAttribute('aria-pressed'), 'true');
+  pending.resolve({ status: 'confirmed', threadId: created }); await tick();
+  assert.deepEqual(reads, [{ host: 'windows', id: created }]); assert.deepEqual(navigations.at(-1), { host: 'windows', id: created });
+  assert.equal(one(root, 'creation-dialog').hidden, true); assert.equal(one(root, 'thread-title').textContent, 'Windows已创建');
+  await view.selectHost('mac'); await view.selectThread(thread().id); slowList.resolve({ threads: [{ id: created, title: '迟到Windows目录' }] }); await tick();
+  assert.deepEqual(navigations.at(-1), { host: 'mac', id: thread().id }); assert.equal(one(root, 'thread-title').textContent, 'Mac原会话');
+  assert.equal(one(root, 'thread-drawer').hidden, true); assert.equal(one(root, 'message-input').value, '保留Mac原聊天草稿');
+});
+
+test('offline and unsupported Windows creation stay on Windows and only retry the read', async (t) => {
+  for (const kind of ['offline', 'unsupported']) {
+    const reads = []; let writes = 0;
+    const { root, view } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac', name: 'Mac', online: true }, { id: 'windows', name: 'Windows', online: false }] }),
+      getCreation: async host => { reads.push(host); if (host === 'windows' && kind === 'offline') throw Error('Windows 离线，暂时无法读取'); return { supported: false, projects: [], reason: host + ' 暂不支持创建聊天' }; },
+      createThread: async () => { writes++; },
+    }); await tick(); view.update(thread()); view.openCreation(); await tick();
+    assert.equal(one(root, 'creation-state').textContent.includes('关闭此窗口'), false);
+    const windows = byClass(root, 'create-host-button').find(item => item.dataset.host === 'windows'); windows.click(); await tick();
+    const prompt = one(root, 'create-prompt'); prompt.value = '不可自动回退'; prompt.fire('input'); one(root, 'create-form').fire('submit');
+    assert.equal(windows.getAttribute('aria-pressed'), 'true'); assert.ok(windows.textContent.includes('离线')); assert.equal(one(root, 'create-submit').disabled, true);
+    one(root, 'create-retry').click(); await tick(); assert.deepEqual(reads, ['mac', 'windows', 'windows']); assert.equal(writes, 0);
+    assert.equal(one(root, 'creation-dialog').hidden, false); assert.ok(one(root, 'creation-state').textContent.startsWith('执行电脑：Windows。'));
+  }
+});
+
+test('reopening the same host while creation is pending invalidates automatic confirmed navigation', async (t) => {
+  const pending = deferred(), navigations = [];
+  const { root, view, storage } = mount(t, { getCreation: async () => nativeCreation, createThread: () => pending.promise }, { initialHost: 'windows', onNavigate: value => navigations.push(value) });
+  view.update(thread({ host: 'windows' })); view.openCreation(); await tick();
+  const prompt = one(root, 'create-prompt'); prompt.value = '同电脑新窗口仍需保留'; prompt.fire('input'); one(root, 'create-form').fire('submit');
+  one(root, 'create-close').click(); view.openCreation(); await tick(); pending.resolve({ status: 'confirmed', threadId: '22222222-2222-4222-8222-222222222222' }); await tick();
+  assert.deepEqual(navigations, []); assert.equal(one(root, 'creation-dialog').hidden, false); assert.equal(prompt.value, '同电脑新窗口仍需保留');
+  assert.equal(JSON.parse(storage.getItem('codex-mobile-create-draft:windows')).prompt, '同电脑新窗口仍需保留');
+  assert.equal(one(root, 'created-open').hidden, true); assert.equal(one(root, 'create-submit').disabled, true);
+});
+
+test('checking an unknown creation opens the chosen computers list only after the explicit button', async (t) => {
+  const navigations = [], lists = [];
+  const { root, view } = mount(t, { getCreation: async () => nativeCreation, createThread: async () => ({ status: 'unknown' }),
+    getThreads: async host => { lists.push(host); return { threads: [] }; },
+  }, { onNavigate: value => navigations.push(value) });
+  view.update(thread()); view.openCreation(); await tick(); byClass(root, 'create-host-button').find(item => item.dataset.host === 'windows').click(); await tick();
+  const prompt = one(root, 'create-prompt'); prompt.value = '在Windows核对结果'; prompt.fire('input'); one(root, 'create-form').fire('submit'); await tick();
+  assert.deepEqual(navigations, []); assert.deepEqual(lists, []); one(root, 'create-back-list').click(); await tick();
+  assert.deepEqual(navigations, [{ host: 'windows', id: null }]); assert.deepEqual(lists, ['windows']);
+  assert.equal(one(root, 'creation-dialog').hidden, true); assert.equal(one(root, 'thread-drawer').hidden, false);
 });
 
 test('creation read timeout exposes a fresh GET and never accepts its late project list', async (t) => {
