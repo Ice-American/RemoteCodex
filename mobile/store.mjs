@@ -76,7 +76,7 @@ export class Journal {
   }
   save(record) {
     const clean = Object.fromEntries(['operationId', 'fingerprint', 'threadId', 'methodKey', 'owner',
-      'expectedTurnId', 'generation', 'status', 'turnId', 'intentFingerprint', 'semanticFence', 'apiFingerprint'].filter(k => record[k] !== undefined).map(k => [k, record[k]]));
+      'expectedTurnId', 'generation', 'status', 'turnId', 'clientThreadId', 'intentFingerprint', 'semanticFence', 'apiFingerprint'].filter(k => record[k] !== undefined).map(k => [k, record[k]]));
     const previous = this.records.get(clean.operationId);
     for (const key of ['semanticFence', 'apiFingerprint']) if (clean[key] == null && previous?.[key]) clean[key] = previous[key];
     const next = new Map(this.records); next.set(clean.operationId, clean);

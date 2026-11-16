@@ -33,6 +33,8 @@ async function rig(t, { peers = [], peerPaired = true } = {}) {
   const secrets = { async get(name) { calls.credentials.push(name); return keys.get(name) ?? null; } };
   async function start(extra = {}) {
     const gateway = await createGateway({ port: 0, hostId: 'mac', hostName: 'Mac fixture', dir, peers, secrets,
+      catalog: new ThreadCatalog(path.join(dir, 'isolated-codex-home')),
+      nativeTools: { capability: async () => ({ supported: false, reason: 'fixture' }), statuses: async () => [], create: async () => { throw Error('Native creation forbidden in isolated gateway tests'); } },
       discover: async () => { calls.discover++; throw Error('Test isolation: native desktop discovery is forbidden'); }, ...extra });
     open.add(gateway); return gateway;
   }
@@ -87,6 +89,48 @@ function rawPeerResponse(t, createResponse) {
   });
   return calls;
 }
+
+test('thread query defaults to seven days and forwards project/search/paging filters without a fixed 200 limit', async t => {
+  const calls = [], f = await rig(t);
+  const catalog = { query: async input => { calls.push(input); return { threads: [{ id: threadId }], projects: [], total: 345, nextCursor: 'next', complete: true }; } };
+  const gateway = await f.start({ catalog });
+  const first = await request(gateway, { route: '/api/threads', headers: auth });
+  assert.equal(first.data.total, 345); assert.deepEqual(calls[0], { projectId: undefined, q: '', range: 'week', cursor: undefined, limit: 50 });
+  await request(gateway, { route: '/api/threads?range=all&projectId=red-app&q=UI&cursor=next&limit=25', headers: auth });
+  assert.deepEqual(calls[1], { projectId: 'red-app', q: 'UI', range: 'all', cursor: 'next', limit: 25 });
+});
+
+test('new-chat capability/create are authenticated and same-origin, and creation receipts deduplicate', async t => {
+  let writes = 0;
+  const f = await rig(t), nativeTools = {
+    capability: async () => ({ supported: true, projectless: true, projects: [{ projectId: 'native-red', name: 'red-app' }] }),
+    create: async (_args, { beforeDispatch }) => { beforeDispatch(); writes++; return { threadId }; },
+  };
+  const gateway = await f.start({ nativeTools });
+  const input = { host: 'mac', operationId: 'fixture-create-operation', prompt: 'synthetic create', projectId: 'native-red' };
+  assert.equal((await request(gateway, { route: '/api/creation' })).status, 401);
+  assert.equal((await request(gateway, { route: '/api/create', method: 'POST', body: input })).status, 401);
+  assert.equal((await request(gateway, { route: '/api/create', method: 'POST', headers: { ...auth, Origin: 'https://untrusted.invalid' }, body: input })).status, 403);
+  assert.equal(writes, 0);
+  assert.equal((await request(gateway, { route: '/api/creation', headers: auth })).data.projects[0].name, 'red-app');
+  for (let i = 0; i < 2; i++) assert.equal((await request(gateway, { route: '/api/create', method: 'POST', headers: auth, body: input })).data.threadId, threadId);
+  assert.equal(writes, 1); assert.equal(f.calls.discover, 0);
+});
+
+test('sidebar status ignores old, unconfirmed and unrelated rows; invalid query never contacts native tools', async t => {
+  const other = '22222222-2222-4222-8222-222222222222', third = '33333333-3333-4333-8333-333333333333';
+  let calls = 0;
+  const f = await rig(t), gateway = await f.start({ nativeTools: { statuses: async () => { calls++; return { statuses: [
+    { id: threadId, status: 'running', statusConfirmed: true, observedAt: Date.now() },
+    { id: other, status: 'running', statusConfirmed: true, observedAt: Date.now() - 60000 },
+    { id: third, status: 'running', statusConfirmed: false, observedAt: Date.now() },
+  ] }; } } });
+  assert.equal((await request(gateway, { route: '/api/statuses?ids=bad', headers: auth })).status, 400); assert.equal(calls, 0);
+  const result = await request(gateway, { route: '/api/statuses?ids=' + [threadId, other, third].join(','), headers: auth });
+  assert.equal(result.data.statuses[0].status, 'running');
+  assert.deepEqual(result.data.statuses.slice(1).map(r => [r.status, r.statusConfirmed]), [['unknown', false], ['unknown', false]]);
+  assert.equal(f.calls.discover, 0);
+});
 
 test('raw peer receives the browser Accept-Encoding and negotiates gzip JSON the phone can decode', async (t) => {
   const payload = { title: '手机收到完整中文与符号 ✅', messages: Array(30).fill('原会话文字，不应变成乱码。') };

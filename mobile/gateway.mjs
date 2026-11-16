@@ -14,6 +14,8 @@ import { discoverNativeDesktop, codexHome } from './discovery.mjs';
 import { ThreadCatalog, visibleTurns, validThreadId } from './history.mjs';
 import { questionViews, approvalViews, buildQuestionReply, buildApprovalReply, requestFingerprint } from './requests.mjs';
 import { Secrets, Journal, secretEqual, dataDirectory, writePrivate } from './store.mjs';
+import { NativeTools } from './native-tools.mjs';
+import { CreationManager } from './creation.mjs';
 
 const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
 const mime = { '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -35,6 +37,7 @@ async function body(req) {
 export async function createGateway({ port = 43128, hostId = process.platform === 'win32' ? 'windows' : 'mac',
   hostName = hostId === 'mac' ? 'Mac' : 'Windows', peers = [], dir = dataDirectory(),
   discover = discoverNativeDesktop, secrets = new Secrets(dir), journal = new Journal(dir),
+  catalog = new ThreadCatalog(codexHome()), nativeTools = new NativeTools({ discover }),
 } = {}) {
   const key = await secrets.get('self', { create: true });
   const assets = new Map(await Promise.all((await fs.readdir(publicDir)).filter(name => mime[path.extname(name)]).map(async name => [name, await fs.readFile(path.join(publicDir, name))])));
@@ -51,7 +54,8 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   catch (e) { if (e.code !== 'ENOENT') throw Error('手机登录状态不可读，未重置现有数据'); }
   if (!Array.isArray(savedSessions)) throw Error('手机登录状态格式异常');
   const sessions = new Map(savedSessions.filter(([hash, expiry]) => /^[a-f0-9]{64}$/.test(hash) && expiry > Date.now()));
-  const watches = new Set(), catalog = new ThreadCatalog(codexHome()), operationContexts = new Map();
+  const watches = new Set(), operationContexts = new Map();
+  const creation = new CreationManager({ nativeTools, journal, hostId });
   const peerMap = new Map(peers.map(p => [p.id, p]));
   let client = null, connecting = null, identity = null, closed = false;
   const clients = new Set();
@@ -81,7 +85,7 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
     let live, error = null;
     try { const owner = await ensureClient(); live = refresh || !owner.snapshot(id) ? await owner.freshSnapshot(id) : owner.snapshot(id); }
     catch (e) { error = e.code ?? '暂时无法读取原会话'; }
-    const metadata = live?.state?.title ? null : (await catalog.list(1000)).find(t => t.id === id);
+    const metadata = live?.state?.title ? null : await catalog.get(id);
     const messages = live ? visibleTurns(live.state) : (await catalog.read(id)).messages;
     const status = live?.status?.type ?? 'unknown';
     return { host: hostId, id, title: live?.state?.title ?? metadata?.title ?? '原聊天', connected: !!live,
@@ -94,6 +98,22 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
         approve: !!live && ['commandApproval', 'fileApproval', 'permissions', 'mcpElicitation'].some(k => client.supports(id, k)),
         interrupt: !!live && status === 'running' && client.supports(id, 'interrupt') },
       source: live ? live.source : 'local-history-only', error };
+  }
+  async function statuses(ids) {
+    let rows = [], partial = false;
+    try { const result = await nativeTools.statuses(ids); rows = Array.isArray(result) ? result : result?.statuses ?? []; partial = result?.partial === true; }
+    catch { partial = true; }
+    const byId = new Map(rows.filter(row => ids.includes(row?.id)).map(row => [row.id, row]));
+    return { statuses: ids.map(id => {
+      // Reuse an already followed owner only. Sidebar polling must not steal
+      // a fresh-snapshot intent from a reply or open dozens of subscriptions.
+      const live = client?.connected ? client.snapshot(id) : null;
+      if (live?.status?.confirmed) return { id, status: live.status.type, statusConfirmed: true, observedAt: live.observedAt };
+      const row = byId.get(id);
+      if (row?.statusConfirmed === true && typeof row.observedAt === 'number' && Date.now() - row.observedAt < 15000 && row.observedAt <= Date.now())
+        return { id, status: row.status, statusConfirmed: true, observedAt: row.observedAt };
+      return { id, status: 'unknown', statusConfirmed: false, observedAt: null };
+    }), partial };
   }
   async function action(input) {
     const { threadId: id, operationId } = input;
@@ -208,7 +228,18 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
         { id: hostId, name: hostName, platform: process.platform, online: true },
         ...peers.map(p => ({ id: p.id, name: p.name, platform: p.id === 'windows' ? 'win32' : 'darwin', online: null })),
       ] });
-      if (url.pathname === '/api/threads' && req.method === 'GET') return sendJson(res, 200, { threads: await catalog.list() });
+      if (url.pathname === '/api/threads' && req.method === 'GET') return sendJson(res, 200, await catalog.query({
+        projectId: url.searchParams.get('projectId') || undefined, q: url.searchParams.get('q') || '',
+        range: url.searchParams.get('range') || 'week', cursor: url.searchParams.get('cursor') || undefined,
+        limit: Number(url.searchParams.get('limit') || 50),
+      }));
+      if (url.pathname === '/api/statuses' && req.method === 'GET') {
+        const ids = [...new Set((url.searchParams.get('ids') || '').split(',').filter(Boolean))];
+        if (ids.length > 100 || ids.some(id => !validThreadId(id))) throw Error('聊天状态查询范围无效');
+        return sendJson(res, 200, ids.length ? await statuses(ids) : { statuses: [], partial: false });
+      }
+      if (url.pathname === '/api/creation' && req.method === 'GET') return sendJson(res, 200, await creation.capability());
+      if (url.pathname === '/api/create' && req.method === 'POST') return sendJson(res, 200, await creation.create(input));
       if (url.pathname === '/api/thread' && req.method === 'GET') return sendJson(res, 200, await state(url.searchParams.get('id'), { refresh: true }));
       if (url.pathname === '/api/action' && req.method === 'POST') {
         try { return sendJson(res, 200, await action(input)); }
@@ -258,6 +289,6 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   }, 5000);
   recovery.unref();
   return { server, port: server.address().port, hostId, state, action, secrets,
-    async close() { closed = true; clearInterval(recovery); client?.close(); for (const listener of clients) listener.schedule = () => {};
+    async close() { closed = true; clearInterval(recovery); client?.close(); nativeTools.close?.(); for (const listener of clients) listener.schedule = () => {};
       server.closeAllConnections(); await new Promise(r => server.close(r)); } };
 }

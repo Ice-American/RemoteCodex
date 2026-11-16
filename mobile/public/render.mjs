@@ -123,7 +123,17 @@ export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, Ev
   }
   return {
     getHosts: () => json(path('/api/hosts')),
-    getThreads: (host) => json(path('/api/threads', { host })),
+    getThreads: (host, options = {}) => json(path('/api/threads', { host,
+      ...Object.fromEntries(Object.entries(options).filter(([key, value]) => ['projectId', 'q', 'cursor', 'limit', 'range'].includes(key) && value != null && value !== '')) })),
+    getThreadStatuses: (host, ids, { signal } = {}) => json(path('/api/statuses', { host, ids: ids.join(',') }), { signal }),
+    getCreation: (host) => json(path('/api/creation', { host })),
+    async createThread(body) {
+      const controller = new AbortController(), timer = setTimeout(() => controller.abort(), actionTimeoutMs);
+      // Creation is a write with its own durable operation guard. Never retry it.
+      try { return await json(path('/api/create'), { method: 'POST', signal: controller.signal,
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }, true); }
+      finally { clearTimeout(timer); }
+    },
     getThread: (host, id, { signal } = {}) => json(path('/api/thread', { host, id }), { signal }),
     async action(body) {
       const controller = new AbortController();
@@ -235,6 +245,11 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   }
   let state = null, hosts = [], threads = [], selectedHost = initialHost, selectedId = '', generation = 0;
   let hostGeneration = 0, listRequest = 0, hostsRequest = 0, listLoading = false, listError = '', hostError = '';
+  let projects = [], selectedProject = '', selectedRange = 'week', nextCursor = null, listTotal = null, catalogPartial = false, loadedQuery = '';
+  let searchTimer = null, statusTimer = null, statusGeneration = 0, statusPending = null;
+  let creationOpen = false, creationReturnDrawer = false, creationGeneration = 0, creationBusy = false, creationLoading = false;
+  let creation = null, creationError = '', creationResult = null, creationDesiredProject = null, creationSelectedProjectId = '';
+  const createDrafts = new Map(), threadRowViews = new Map();
   let connected = false, destroyed = false, closeEvents = () => {}, loading = false, drawerOpen = false;
   const later = (fn, ms) => timers.setTimeout(fn, ms), cancel = id => { if (id != null) timers.clearTimeout(id); };
   const now = () => typeof timers.now === 'function' ? timers.now() : Date.now();
@@ -248,9 +263,12 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const header = node('header', 'app-header');
   const menu = button('对话列表', 'icon-button menu-button', () => setDrawer(!drawerOpen)); menu.setAttribute('aria-expanded', 'false'); menu.setAttribute('aria-controls', 'thread-drawer');
   const heading = node('div', 'heading-group'), title = node('h1', 'thread-title', 'Codex 随行'), subtitle = node('p', 'thread-subtitle', '选择一个已有对话');
-  heading.append(title, subtitle);
+  const titleLine = node('div', 'title-line'), titleRunning = node('span', 'running-indicator title-running');
+  titleRunning.setAttribute('role', 'img'); titleRunning.setAttribute('aria-label', '进行中'); titleRunning.hidden = true;
+  titleLine.append(title, titleRunning); heading.append(titleLine, subtitle);
+  const newChat = button('＋ 新建', 'new-chat-button', () => openCreation()); newChat.setAttribute('aria-label', '新建聊天');
   const hostSwitch = node('div', 'host-switch'); hostSwitch.setAttribute('role', 'group'); hostSwitch.setAttribute('aria-label', '目标电脑');
-  header.append(menu, heading, hostSwitch);
+  header.append(menu, heading, newChat, hostSwitch);
   const connection = node('div', 'connection-bar'); connection.setAttribute('role', 'status');
   const connectionLabel = node('span', 'connection-label', '正在读取电脑状态…');
   const refresh = button('刷新', 'text-button', () => refreshCurrent()); connection.append(connectionLabel, refresh);
@@ -270,11 +288,31 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   interrupt.hidden = true; composeFoot.append(draftHint, interrupt); composer.append(composerHint, composeRow, composeFoot);
   const backdrop = button('关闭对话列表', 'drawer-backdrop', () => setDrawer(false)); backdrop.hidden = true; backdrop.tabIndex = -1;
   const drawer = node('aside', 'thread-drawer'); drawer.id = 'thread-drawer'; drawer.hidden = true; drawer.setAttribute('aria-label', '已有对话列表');
-  const drawerHeading = node('div', 'drawer-heading'); drawerHeading.append(node('h2', '', '已有对话'), button('关闭', 'text-button', () => setDrawer(false)));
+  const drawerHeading = node('div', 'drawer-heading'); drawerHeading.append(node('h2', '', '聊天'), button('新建', 'drawer-new-chat', () => openCreation()), button('刷新', 'text-button drawer-refresh', () => loadThreads()), button('关闭', 'text-button', () => setDrawer(false)));
   const search = node('input', 'thread-search'); search.type = 'search'; search.placeholder = '搜索对话'; search.setAttribute('aria-label', '搜索已有对话');
-  const threadList = node('nav', 'thread-list'); threadList.setAttribute('aria-label', '对话');
-  drawer.append(drawerHeading, search, threadList);
-  app.append(header, connection, notice, main, latest, composer, backdrop, drawer); root.replaceChildren(app);
+  const filters = node('div', 'catalog-filters'), projectSelect = node('select', 'project-select'), rangeSelect = node('select', 'history-range');
+  projectSelect.setAttribute('aria-label', '项目'); rangeSelect.setAttribute('aria-label', '历史范围');
+  for (const [value, text] of [['week', '最近7天'], ['all', '全部历史']]) { const o = node('option', '', text); o.value = value; rangeSelect.append(o); }
+  rangeSelect.value = selectedRange; filters.append(projectSelect, rangeSelect);
+  search.placeholder = '搜索标题、项目或目录';
+  const catalogHint = node('p', 'catalog-hint'), threadList = node('nav', 'thread-list'); threadList.setAttribute('aria-label', '对话');
+  const more = button('加载更多', 'load-more-button', () => loadThreads({ append: true })); more.hidden = true;
+  drawer.append(drawerHeading, filters, search, catalogHint, threadList, more);
+  const creationBackdrop = button('关闭新建聊天', 'creation-backdrop', () => closeCreation()); creationBackdrop.hidden = true; creationBackdrop.tabIndex = -1;
+  const creationDialog = node('section', 'creation-dialog'); creationDialog.hidden = true; creationDialog.setAttribute('role', 'dialog'); creationDialog.setAttribute('aria-modal', 'true'); creationDialog.setAttribute('aria-label', '新建聊天');
+  const creationHeading = node('div', 'creation-heading'); creationHeading.append(node('h2', '', '新建聊天'), button('关闭', 'create-close', () => closeCreation()));
+  const creationState = node('p', 'creation-state'); creationState.setAttribute('role', 'status'); creationState.setAttribute('aria-live', 'polite');
+  const createForm = node('form', 'create-form'), createProject = node('select', 'create-project'), createTitle = node('input', 'create-title'), createPrompt = node('textarea', 'create-prompt');
+  createProject.setAttribute('aria-label', '新聊天项目'); createTitle.setAttribute('aria-label', '新聊天标题'); createTitle.placeholder = '标题（可选）'; createTitle.maxLength = 160;
+  createPrompt.setAttribute('aria-label', '第一条消息'); createPrompt.placeholder = '描述你希望 Codex 完成的工作'; createPrompt.rows = 5; createPrompt.maxLength = 24000;
+  const field = (name, control) => { const label = node('label', 'create-field'); label.append(node('span', '', name), control); return label; };
+  const createSubmit = node('button', 'create-submit', '创建并开始'); createSubmit.type = 'submit';
+  const createRetry = button('重新读取创建能力', 'create-retry', () => loadCreation()); createRetry.hidden = true;
+  const createdOpen = button('打开已创建的聊天', 'created-open', () => { const result = creationResult; if (result?.host === selectedHost && validCreatedId(result.threadId)) { closeCreation({ save: false, restore: false }); void selectThread(result.threadId); } }); createdOpen.hidden = true;
+  const createBack = button('返回列表核对', 'create-back-list', () => { closeCreation({ restore: false }); setDrawer(true); void loadThreads(); }); createBack.hidden = true;
+  createForm.append(field('项目', createProject), field('标题（可选）', createTitle), field('第一条消息', createPrompt), createSubmit);
+  creationDialog.append(creationHeading, creationState, createForm, createRetry, createdOpen, createBack);
+  app.append(header, connection, notice, main, latest, composer, backdrop, drawer, creationBackdrop, creationDialog); root.replaceChildren(app);
 
   function storageKey(scope) { return 'codex-mobile-draft:' + scope; }
   function draft(scope) {
@@ -286,7 +324,138 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function showNotice(text, fromRecovery = false) { noticeText = text; recoveryNotice = fromRecovery; notice.textContent = text; notice.hidden = !text; }
   function autoSize() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight || 44, 168) + 'px'; }
   function resize() { const metrics = viewportMetrics(win?.visualViewport, win?.innerHeight); app.style.setProperty('--app-height', metrics.height + 'px'); app.style.setProperty('--app-top', metrics.top + 'px'); autoSize(); }
-  function setDrawer(open) { drawerOpen = open; drawer.hidden = !open; backdrop.hidden = !open; menu.setAttribute('aria-expanded', String(open)); main.setAttribute('aria-hidden', String(open)); composer.setAttribute('aria-hidden', String(open)); main.inert = open; composer.inert = open; if (open) search.focus(); else menu.focus(); }
+  function setDrawer(open) {
+    drawerOpen = open; drawer.hidden = !open; backdrop.hidden = !open; menu.setAttribute('aria-expanded', String(open)); syncOverlays();
+    stopStatuses();
+    if (open) { clearStatusConfirmations(); renderThreads(); search.focus(); void pollStatuses(); } else menu.focus();
+  }
+  function syncOverlays() {
+    const blocked = drawerOpen || creationOpen;
+    main.setAttribute('aria-hidden', String(blocked)); composer.setAttribute('aria-hidden', String(blocked)); main.inert = blocked; composer.inert = blocked;
+    header.inert = creationOpen; connection.inert = creationOpen; drawer.inert = creationOpen;
+    creationDialog.hidden = !creationOpen; creationBackdrop.hidden = !creationOpen;
+  }
+  const validCreatedId = id => typeof id === 'string' && /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i.test(id);
+  function createDraftKey(host) { return 'codex-mobile-create-draft:' + host; }
+  function readCreateDraft(host) {
+    if (!createDrafts.has(host)) {
+      let saved = {}; try { saved = JSON.parse(draftStorage?.getItem(createDraftKey(host)) || '{}'); } catch {}
+      createDrafts.set(host, { projectId: typeof saved.projectId === 'string' ? saved.projectId : '', title: typeof saved.title === 'string' ? saved.title : '', prompt: typeof saved.prompt === 'string' ? saved.prompt : '' });
+    }
+    return createDrafts.get(host);
+  }
+  function saveCreateDraft(host = selectedHost) {
+    const saved = { projectId: creationSelectedProjectId, title: createTitle.value, prompt: createPrompt.value };
+    createDrafts.set(host, saved); try { draftStorage?.setItem(createDraftKey(host), JSON.stringify(saved)); } catch {}
+    return saved;
+  }
+  function creationKey(host = selectedHost) { return JSON.stringify([host, 'create', fingerprint(JSON.stringify([creationSelectedProjectId, createTitle.value.trim(), createPrompt.value.trim()]))]); }
+  function creationTargetValid() { return creation?.supported === true && (creationSelectedProjectId === '' ? creation.projectless === true : creation.projects?.some(project => project.projectId === creationSelectedProjectId)); }
+  function renderCreation() {
+    const receipt = gate.get(creationKey());
+    creationState.textContent = creationLoading ? '正在读取官方项目…' : creationError || receipt?.message || (creation?.supported ? '选择项目，填写第一条消息后创建。' : creation?.reason || '这台电脑暂不支持创建聊天。');
+    createProject.disabled = creationLoading || creationBusy || !creation?.supported;
+    createTitle.disabled = createPrompt.disabled = creationBusy;
+    createSubmit.disabled = creationLoading || creationBusy || !creationTargetValid() || !createPrompt.value.trim() || !!receipt && receipt.status !== 'rejected';
+    createSubmit.textContent = creationBusy ? '正在创建…' : '创建并开始';
+    createRetry.hidden = creationLoading || !creationError;
+    createBack.hidden = !receipt || receipt.status === 'rejected';
+    createdOpen.hidden = creationResult?.host !== selectedHost || !validCreatedId(creationResult?.threadId);
+  }
+  function normalizedProjectPath(path) { const value = String(path || '').replace(/\\/g, '/').replace(/\/$/, ''); return /^[a-z]:\//i.test(value) ? value.toLowerCase() : value; }
+  async function loadCreation() {
+    if (!creationOpen || destroyed) return;
+    const host = selectedHost, stamp = ++creationGeneration; creationLoading = true; creationError = ''; renderCreation();
+    try {
+      if (!api.getCreation) throw new Error('当前服务暂不支持创建聊天，请刷新页面后重试。');
+      const result = await api.getCreation(host); if (destroyed || !creationOpen || host !== selectedHost || stamp !== creationGeneration) return;
+      creation = result; const desired = creationDesiredProject; creationDesiredProject = null;
+      // A real select erases a value until its option exists. Keep intent outside
+      // the DOM so a slow capability read/reload cannot change an unknown create
+      // into a different project or an unguarded projectless operation.
+      let selected = creationSelectedProjectId;
+      // Catalog groups include worktrees/history. Only an official project ID may be sent to create.
+      if (desired) selected = result.projects?.find(project => normalizedProjectPath(project.path) === normalizedProjectPath(desired.path))?.projectId ?? '__unavailable__';
+      const options = [];
+      if (result.projectless) options.push(Object.assign(node('option', '', '独立聊天'), { value: '' }));
+      for (const project of result.projects ?? []) options.push(Object.assign(node('option', '', project.name || project.path || project.projectId), { value: project.projectId }));
+      if (!options.some(option => option.value === selected)) options.unshift(Object.assign(node('option', '', selected === '__unavailable__' ? '当前分组不能新建，请选择官方项目' : selected ? '已保存项目暂不可用，请重新选择' : '请选择项目'), { value: '__unavailable__', disabled: true }));
+      creationSelectedProjectId = selected;
+      createProject.replaceChildren(...options); createProject.value = options.some(option => option.value === selected) ? selected : '__unavailable__';
+      saveCreateDraft();
+    } catch (error) { if (host === selectedHost && stamp === creationGeneration && creationOpen) { creation = null; creationError = error.message || '创建能力读取失败。'; } }
+    finally { if (!destroyed && host === selectedHost && stamp === creationGeneration && creationOpen) { creationLoading = false; renderCreation(); } }
+  }
+  function openCreation() {
+    if (destroyed || creationOpen) return;
+    creationReturnDrawer = drawerOpen; if (drawerOpen) setDrawer(false);
+    const saved = readCreateDraft(selectedHost); creationSelectedProjectId = saved.projectId; createProject.value = saved.projectId; createTitle.value = saved.title; createPrompt.value = saved.prompt;
+    // A catalog filter only suggests a target for an empty form. Existing draft
+    // intent and unresolved receipts retain their original official project.
+    creationDesiredProject = !saved.prompt.trim() && !saved.title.trim() && !saved.projectId && selectedProject ? projects.find(project => project.id === selectedProject) ?? null : null;
+    creation = null; creationError = ''; creationOpen = true; syncOverlays(); renderCreation(); void loadCreation(); createPrompt.focus();
+  }
+  function closeCreation({ save = true, restore = true } = {}) {
+    if (!creationOpen) return;
+    if (save) saveCreateDraft(); creationOpen = false; creationGeneration++; creationLoading = false; syncOverlays();
+    if (restore && creationReturnDrawer) setDrawer(true); else newChat.focus();
+  }
+  async function submitCreation(event) {
+    event.preventDefault(); if (creationBusy || !creationTargetValid() || !createPrompt.value.trim() || !api.createThread) return;
+    const host = selectedHost, key = creationKey(), saved = saveCreateDraft(), attempt = gate.begin(key); if (!attempt) { renderCreation(); return; }
+    const intent = { host, operationId: attempt.operationId, projectId: creationSelectedProjectId || null, prompt: createPrompt.value.trim(), ...(createTitle.value.trim() ? { title: createTitle.value.trim() } : {}) };
+    const openedGeneration = creationGeneration; creationBusy = true; creationResult = null; renderCreation();
+    let result;
+    try { result = await api.createThread(intent); if (result?.status === 'confirmed' && !validCreatedId(result.threadId)) result = { status: 'unknown', message: '创建结果缺少有效聊天 ID，请返回列表核对；不会自动重发。' }; gate.settle(key, result); }
+    catch { result = { status: 'unknown', message: '创建结果未确认，请返回列表核对；不会自动重发。' }; gate.settle(key, result); }
+    creationBusy = false;
+    if (destroyed) return;
+    if (result?.status === 'confirmed') {
+      creationResult = { host, threadId: result.threadId };
+      if (JSON.stringify(createDrafts.get(host)) === JSON.stringify(saved)) { createDrafts.set(host, { projectId: saved.projectId, title: '', prompt: '' }); try { draftStorage?.removeItem(createDraftKey(host)); } catch {} }
+      if (host === selectedHost && creationOpen && openedGeneration === creationGeneration) { closeCreation({ save: false, restore: false }); void loadThreads(); await selectThread(result.threadId); return; }
+    }
+    if (host === selectedHost) { renderCreation(); void loadThreads(); }
+  }
+  function catalogScope() { return JSON.stringify([hostGeneration, selectedHost, selectedProject, selectedRange, search.value.trim()]); }
+  function filteredThreads() {
+    const query = search.value.trim().toLocaleLowerCase();
+    // Local filtering is just a debounce preview. The server's search result is
+    // authoritative and may match multiple terms across title/project/path.
+    if (!query || loadedQuery === query) return threads;
+    const terms = query.split(/\s+/).filter(Boolean);
+    return threads.filter(item => { const text = [item.title, item.projectName, item.cwd, item.projectPath].map(value => String(value ?? '')).join(' ').toLocaleLowerCase(); return terms.every(term => text.includes(term)); });
+  }
+  function rowStatus(item) {
+    if (item.id === selectedId) return { status: statusType(state), confirmed: connected && state?.ownerConfirmed === true && !isHistoryOnly(state) };
+    return { status: typeof item.status === 'string' ? item.status : item.status?.type, confirmed: item.statusConfirmed === true };
+  }
+  function updateRowStatus(item, controls) {
+    const live = rowStatus(item); controls.spinner.hidden = !live.confirmed || !['running', 'working', 'inProgress'].includes(live.status);
+    const label = live.confirmed ? statusLabels[live.status] || '状态待同步' : '状态待同步';
+    if (controls.meta.textContent !== label) controls.meta.textContent = label;
+  }
+  function clearStatusConfirmations() { threads = threads.map(item => ({ ...item, statusConfirmed: false })); }
+  function stopStatuses() {
+    cancel(statusTimer); statusTimer = null; statusGeneration++;
+    if (statusPending) { cancel(statusPending.timeout); statusPending.controller.abort(); }
+    statusPending = null;
+  }
+  async function pollStatuses() {
+    if (destroyed || !drawerOpen || doc.visibilityState === 'hidden' || !api.getThreadStatuses || listLoading || statusPending) return;
+    const ids = [...new Set(filteredThreads().map(item => item.id))].slice(0, 100); if (!ids.length) return;
+    const host = selectedHost, scope = catalogScope(), stamp = statusGeneration, attempt = { controller: new AbortController(), timeout: null }; statusPending = attempt;
+    const current = () => !destroyed && drawerOpen && doc.visibilityState !== 'hidden' && host === selectedHost && scope === catalogScope() && stamp === statusGeneration && statusPending === attempt;
+    try {
+      const deadline = new Promise((_, reject) => { attempt.timeout = later(() => { attempt.controller.abort(); reject(Error('状态读取超时')); }, readTimeoutMs); });
+      const result = await Promise.race([api.getThreadStatuses(host, ids, { signal: attempt.controller.signal }), deadline]); if (!current()) return;
+      const found = new Map((result.statuses ?? []).filter(item => ids.includes(item.id)).map(item => [item.id, item]));
+      // A missing/failed observation is unknown. Never carry an old running flag forward.
+      threads = threads.map(item => { const fresh = found.get(item.id); return { ...item, status: fresh?.status ?? 'unknown', statusConfirmed: fresh?.statusConfirmed === true, observedAt: fresh?.observedAt }; });
+      renderThreads();
+    } catch { if (current()) { clearStatusConfirmations(); renderThreads(); } }
+    finally { cancel(attempt.timeout); if (current()) { statusPending = null; statusTimer = later(() => { statusTimer = null; void pollStatuses(); }, 10000); } }
+  }
   function renderHosts() {
     const signature = JSON.stringify([selectedHost, hosts]); if (signature === hostSignature) return; hostSignature = signature;
     const choices = hosts.length ? hosts : [{ id: 'mac', name: 'Mac' }, { id: 'windows', name: 'Windows' }];
@@ -298,18 +467,32 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     }));
   }
   function renderThreads() {
-    const query = search.value.trim().toLocaleLowerCase();
-    const filtered = threads.filter((thread) => String(thread.title || '未命名对话').toLocaleLowerCase().includes(query));
-    const signature = JSON.stringify([selectedHost, selectedId, query, filtered, listLoading, listError, hostError]); if (signature === threadSignature) return; threadSignature = signature;
-    threadList.replaceChildren(...filtered.map((thread) => {
-      const b = button('', 'thread-row', () => selectThread(thread.id)); b.classList.toggle('selected', thread.id === selectedId);
-      b.append(node('span', 'thread-row-title', thread.title || '未命名对话'));
-      const kind = typeof thread.status === 'string' ? thread.status : thread.status?.type;
-      b.append(node('span', 'thread-row-meta', statusLabels[kind] || '状态待同步'));
-      if (thread.id === selectedId) b.setAttribute('aria-current', 'page'); return b;
-    }));
+    const query = search.value.trim().toLocaleLowerCase(), filtered = filteredThreads();
+    const signature = JSON.stringify([selectedHost, selectedId, selectedProject, selectedRange, query, filtered, projects, nextCursor, listTotal, catalogPartial, listLoading, listError, hostError]); if (signature === threadSignature) return; threadSignature = signature;
+    const options = [Object.assign(node('option', '', '全部项目'), { value: '' })];
+    for (const project of projects) {
+      const counts = selectedRange === 'week' && project.count === 0 && project.totalCount > 0 ? '本周0 · 全部' + project.totalCount : String(project.count ?? project.totalCount ?? 0);
+      const option = node('option', '', (project.name || project.path || '未分组') + '（' + counts + '）'); option.value = project.id; options.push(option);
+    }
+    if (selectedProject && !projects.some(project => project.id === selectedProject)) options.push(Object.assign(node('option', '', '当前项目'), { value: selectedProject }));
+    projectSelect.replaceChildren(...options); projectSelect.value = selectedProject; rangeSelect.value = selectedRange;
+    catalogHint.textContent = [selectedRange === 'week' ? '最近7天' : '全部历史', listTotal == null ? '' : '共' + listTotal + '条', listLoading ? (query ? '正在搜索…' : '正在读取…') : '', catalogPartial ? '部分目录暂不可读' : ''].filter(Boolean).join(' · ');
+    threadRowViews.clear(); const children = [], groups = new Map();
+    for (const item of filtered) {
+      const row = button('', 'thread-row', () => selectThread(item.id)); row.classList.toggle('selected', item.id === selectedId);
+      const rowHeading = node('span', 'thread-row-heading'), spinner = node('span', 'running-indicator row-running'); spinner.setAttribute('role', 'img'); spinner.setAttribute('aria-label', '进行中');
+      rowHeading.append(node('span', 'thread-row-title', item.title || '未命名对话'), spinner); row.append(rowHeading);
+      const meta = node('span', 'thread-row-meta'); row.append(meta); threadRowViews.set(item.id, { spinner, meta, item }); updateRowStatus(item, { spinner, meta });
+      if (item.id === selectedId) row.setAttribute('aria-current', 'page');
+      if (!selectedProject && projects.length) {
+        const key = item.projectId ?? '', project = projects.find(p => p.id === key); let group = groups.get(key);
+        if (!group) { group = node('section', 'project-group'); group.append(node('h3', 'project-group-title', project?.name || item.projectName || '未分组')); groups.set(key, group); children.push(group); }
+        group.append(row);
+      } else children.push(row);
+    }
+    threadList.replaceChildren(...children); more.hidden = !nextCursor; more.disabled = listLoading; more.textContent = listLoading ? '正在读取…' : '加载更多';
     if (hostError || listError) threadList.append(node('p', 'list-empty', [hostError, listError].filter(Boolean).join('；')));
-    else if (!filtered.length) threadList.append(node('p', 'list-empty', listLoading ? '正在读取对话…' : query ? '没有找到匹配对话' : '这台电脑暂未返回已有对话'));
+    else if (!filtered.length) threadList.append(node('p', 'list-empty', listLoading ? '正在读取对话…' : query ? '当前范围没有匹配对话，可切换全部历史' : selectedRange === 'week' ? '最近7天没有对话，可切换全部历史' : '这台电脑暂未返回已有对话'));
   }
   function writeAllowed(action) { return canAct(state, action, connected); }
   function sendKey(text) { return JSON.stringify([currentScope(), 'send', fingerprint(text)]); }
@@ -318,6 +501,8 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     subtitle.textContent = state ? (hosts.find((host) => host.id === selectedHost)?.name || selectedHost) + (isHistoryOnly(state) ? ' · 只读历史' : ' · 原桌面会话') : '选择一个已有对话';
     connectionLabel.textContent = !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
     connection.classList.toggle('disconnected', !!selectedId && !connected);
+    titleRunning.hidden = !connected || state?.ownerConfirmed !== true || isHistoryOnly(state) || !isRunning(state);
+    const selectedRow = threadRowViews.get(selectedId); if (selectedRow) updateRowStatus(selectedRow.item, selectedRow);
     const attempt = gate.get(sendKey(input.value.trim()));
     input.disabled = !selectedId;
     send.disabled = !input.value.trim() || !writeAllowed('send') || !!attempt && attempt.status !== 'rejected';
@@ -425,21 +610,32 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     state = next; connected = next.connected === true && next.ownerConfirmed === true && !isHistoryOnly(next); loading = false;
     render({ navigation: navigated }); if (atBottom) main.scrollTop = main.scrollHeight; return true;
   }
-  async function loadThreads() {
-    if (!api.getThreads || destroyed) return;
-    const host = selectedHost, stamp = hostGeneration, request = ++listRequest;
-    const current = () => !destroyed && stamp === hostGeneration && host === selectedHost && request === listRequest;
-    listLoading = true; listError = ''; renderThreads();
-    try { const result = await api.getThreads(host); if (!current()) return; threads = result.threads ?? []; }
-    catch (error) { if (current()) { listError = error.message || '对话列表读取失败，原有草稿已保留。'; if (!selectedId) showNotice(listError); } }
-    finally { if (current()) { listLoading = false; renderThreads(); } }
+  async function loadThreads({ append = false } = {}) {
+    if (!api.getThreads || destroyed || append && (!nextCursor || listLoading)) return;
+    const host = selectedHost, stamp = hostGeneration, request = ++listRequest, scope = catalogScope(), cursor = append ? nextCursor : null;
+    const current = () => !destroyed && stamp === hostGeneration && host === selectedHost && scope === catalogScope() && request === listRequest;
+    stopStatuses(); listLoading = true; listError = ''; renderThreads();
+    try {
+      const result = await api.getThreads(host, { projectId: selectedProject || undefined, q: search.value.trim() || undefined, cursor, limit: 50, range: selectedRange }); if (!current()) return;
+      const rows = result.threads ?? [];
+      loadedQuery = search.value.trim().toLocaleLowerCase();
+      threads = append ? [...new Map([...threads, ...rows].map(item => [item.id, item])).values()] : rows;
+      if (Array.isArray(result.projects)) projects = result.projects;
+      nextCursor = result.nextCursor ?? null; listTotal = Number.isFinite(result.total) ? result.total : null; catalogPartial = result.catalog?.partial === true;
+    } catch (error) { if (current()) { listError = error.message || '对话列表读取失败，原有草稿已保留。'; if (!selectedId) showNotice(listError); } }
+    finally { if (current()) { listLoading = false; renderThreads(); void pollStatuses(); } }
+  }
+  function changeCatalog() {
+    cancel(searchTimer); searchTimer = null; listRequest++; stopStatuses(); nextCursor = null; threads = []; listTotal = null; listError = ''; renderThreads(); void loadThreads();
   }
   async function selectHost(host) {
     if (destroyed || host === selectedHost && (selectedId || threads.length)) return;
     if (selectedId) saveDraft(currentScope(), input.value);
+    if (creationOpen) closeCreation({ restore: false });
+    cancel(searchTimer); searchTimer = null; stopStatuses();
     generation++; hostGeneration++; const stamp = hostGeneration;
     stopReadAndStream(); clearRecovery(); state = null; selectedHost = host; selectedId = ''; connected = false; loading = false;
-    threads = []; listLoading = false; listError = ''; hostError = ''; input.value = ''; showNotice(''); render({ navigation: true });
+    threads = []; projects = []; selectedProject = ''; selectedRange = 'week'; rangeSelect.value = 'week'; search.value = ''; nextCursor = null; listTotal = null; listLoading = false; listError = ''; hostError = ''; input.value = ''; showNotice(''); render({ navigation: true });
     onNavigate({ host, id: null });
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
     await loadThreads(); if (!destroyed && stamp === hostGeneration && !selectedId) setDrawer(true);
@@ -576,9 +772,19 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   });
   input.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && !event.isComposing) sendMessage(event); });
   composer.addEventListener('submit', sendMessage);
-  search.addEventListener('input', renderThreads);
+  createForm.addEventListener('submit', submitCreation);
+  for (const control of [createProject, createTitle, createPrompt]) control.addEventListener(control === createProject ? 'change' : 'input', () => {
+    if (control === createProject && createProject.value !== '__unavailable__') creationSelectedProjectId = createProject.value;
+    saveCreateDraft(); creationResult = null; gate.forgetConfirmed(creationKey()); renderCreation();
+  });
+  search.addEventListener('input', () => {
+    cancel(searchTimer); listRequest++; stopStatuses(); nextCursor = null; renderThreads();
+    searchTimer = later(() => { searchTimer = null; void loadThreads(); }, 250);
+  });
+  projectSelect.addEventListener('change', () => { selectedProject = projectSelect.value; changeCatalog(); });
+  rangeSelect.addEventListener('change', () => { selectedRange = rangeSelect.value === 'all' ? 'all' : 'week'; changeCatalog(); });
   main.addEventListener('scroll', () => { latest.hidden = main.scrollHeight - main.scrollTop - main.clientHeight < 160; });
-  const escape = (event) => { if (event.key === 'Escape' && drawerOpen) setDrawer(false); };
+  const escape = (event) => { if (event.key === 'Escape') { if (creationOpen) closeCreation(); else if (drawerOpen) setDrawer(false); } };
   const wake = () => {
     if (destroyed || !selectedId || doc.visibilityState === 'hidden' || readAttempt) return;
     const delay = 500 - (now() - lastWakeAt);
@@ -590,7 +796,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     }
     cancel(wakeTimer); wakeTimer = null; lastWakeAt = now(); void recover({ immediate: true });
   };
-  const visibility = () => { if (doc.visibilityState !== 'hidden') wake(); };
+  const visibility = () => { if (doc.visibilityState !== 'hidden') { wake(); if (drawerOpen) { clearStatusConfirmations(); renderThreads(); void pollStatuses(); } } else stopStatuses(); };
   const offline = () => { if (!destroyed && selectedId) { stopReadAndStream(); markRecovering(); scheduleRead(); } };
   doc.addEventListener('keydown', escape); doc.addEventListener('visibilitychange', visibility); win?.addEventListener('online', wake); win?.addEventListener('offline', offline);
   win?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('scroll', resize);
@@ -615,8 +821,8 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     void loadThreads();
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
   } else if (api.getHosts) void loadHosts();
-  return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts,
-    destroy() { destroyed = true; generation++; stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
+  return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts, openCreation,
+    destroy() { destroyed = true; generation++; cancel(searchTimer); searchTimer = null; stopStatuses(); creationGeneration++; stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
   };
 }
 

@@ -6,6 +6,8 @@ import {
   mountMobileUI, renderSafeText, viewportMetrics,
 } from '../mobile/public/render.mjs';
 
+const nativeCreation = { supported: true, projectless: true, projects: [{ projectId: 'official-red', name: 'red-app', path: 'D:\\Project\\red-app' }] };
+
 // A deliberately small DOM fixture rejects HTML injection. Browser layout is checked separately.
 class FixtureNode {
   constructor(tag, doc) {
@@ -21,10 +23,14 @@ class FixtureNode {
     };
   }
   set innerHTML(_) { throw new Error('HTML injection is forbidden in the fixture'); }
+  // Native selects cannot hold a value before the matching option exists.
+  // Modeling this prevents a delayed project list from silently losing a draft ID.
+  set value(value) { const text = String(value ?? ''); this._value = this.tagName === 'SELECT' && !this.childNodes.some(option => option.value === text) ? '' : text; }
+  get value() { return this._value ?? ''; }
   set textContent(value) { this._text = String(value ?? ''); this.replaceChildren(); }
   get textContent() { return this._text + this.childNodes.map((node) => node.textContent).join(''); }
   get children() { return this.childNodes.filter((node) => node.tagName !== '#TEXT'); }
-  append(...nodes) { for (const node of nodes) { node.remove(); node.parentNode = this; this.childNodes.push(node); } }
+  append(...nodes) { for (const node of nodes) { node.remove(); node.parentNode = this; this.childNodes.push(node); } if (this.tagName === 'SELECT' && !this.childNodes.some(option => option.value === this._value)) this._value = this.childNodes[0]?.value ?? ''; }
   replaceChildren(...nodes) { for (const child of this.childNodes) child.parentNode = null; this.childNodes = []; this.append(...nodes); }
   insertBefore(node, sibling) { node.remove(); const index = sibling ? this.childNodes.indexOf(sibling) : this.childNodes.length; node.parentNode = this; this.childNodes.splice(index, 0, node); }
   remove() { if (!this.parentNode) return; const siblings = this.parentNode.childNodes; siblings.splice(siblings.indexOf(this), 1); this.parentNode = null; }
@@ -546,4 +552,144 @@ test('a rapid offline-online transition retains the trailing wake instead of wai
   await timers.advance(400); assert.equal(reads, 3); assert.equal(one(root, 'send-button').disabled, false);
   assert.equal(one(root, 'message-input').value, '快速切网草稿');
   view.destroy(); assert.equal(timers.size, 0);
+});
+
+test('catalog and creation API encode filters and POST once without retries', async () => {
+  const calls = [], api = createMobileAPI({ fetchImpl: async (url, options) => { calls.push({ url, options }); return { ok: true, json: async () => ({ status: 'submitted' }) }; } });
+  await api.getThreads('windows', { projectId: 'red/app', q: '新 UI', cursor: 'page/2', limit: 50, range: 'all', cwd: '/forbidden' });
+  const query = new URL('http://local' + calls[0].url).searchParams;
+  assert.equal(query.get('host'), 'windows'); assert.equal(query.get('projectId'), 'red/app'); assert.equal(query.get('q'), '新 UI'); assert.equal(query.get('range'), 'all'); assert.equal(query.has('cwd'), false);
+  await api.getCreation('mac'); await api.getThreadStatuses('mac', ['a', 'b']);
+  const body = { host: 'mac', operationId: 'durable', projectId: null, prompt: 'test' }; await api.createThread(body);
+  assert.equal(calls[1].url, '/api/creation?host=mac'); assert.equal(calls[2].url, '/api/statuses?host=mac&ids=a%2Cb');
+  assert.equal(calls[3].url, '/api/create'); assert.equal(calls[3].options.method, 'POST'); assert.deepEqual(JSON.parse(calls[3].options.body), body);
+  let count = 0; const failing = createMobileAPI({ fetchImpl: async () => { count++; throw Error('lost'); } });
+  await assert.rejects(failing.createThread(body), /lost/); assert.equal(count, 1);
+});
+
+test('week/all project groups, server search and pagination preserve the selected chat draft', async (t) => {
+  const calls = [], timers = fakeClock(), groups = [{ id: 'red', name: 'red-app', path: 'D:\\Project\\red-app', count: 0, totalCount: 331 }, { id: 'tools', name: 'Tools', count: 2, totalCount: 2 }];
+  const { root, view } = mount(t, {
+    getHosts: async () => ({ hosts: [{ id: 'mac' }] }),
+    getThreads: async (host, options) => { calls.push({ host, ...options }); return { projects: groups, total: options.q ? 1 : 332, nextCursor: !options.q && !options.cursor ? 'next' : null,
+      threads: [{ id: options.cursor ? 'older' : options.q ? 'normalized-match' : 'recent', title: options.q ? 'ＵＩ 还原' : options.cursor ? '更早的还原会话' : '最近任务', projectId: 'red', projectName: 'red-app' }] }; },
+  }, { timers }); await tick(); view.update(thread()); type(root, '当前聊天草稿');
+  assert.equal(calls[0].range, 'week'); assert.equal(calls[0].limit, 50); assert.equal(one(root, 'history-range').value, 'week');
+  assert.ok(one(root, 'project-select').textContent.includes('本周0 · 全部331')); assert.equal(byClass(root, 'project-group').length, 1);
+  const project = one(root, 'project-select'); project.value = 'red'; project.fire('change'); await tick();
+  assert.equal(calls.at(-1).projectId, 'red'); assert.equal(one(root, 'thread-title').textContent, '手机适配'); assert.equal(one(root, 'message-input').value, '当前聊天草稿');
+  project.value = ''; project.fire('change'); await tick(); assert.equal(one(root, 'project-select').value, '');
+  const range = one(root, 'history-range'); range.value = 'all'; range.fire('change'); await tick(); assert.equal(calls.at(-1).range, 'all');
+  one(root, 'load-more-button').click(); await tick(); assert.equal(calls.at(-1).cursor, 'next'); assert.equal(byClass(root, 'thread-row').length, 2);
+  const search = one(root, 'thread-search'); search.value = 'red UI'; search.fire('input'); await timers.advance(250);
+  assert.equal(calls.at(-1).q, 'red UI'); assert.equal(calls.at(-1).cursor, null); assert.equal(byClass(root, 'thread-row').length, 1); assert.ok(one(root, 'thread-list').textContent.includes('ＵＩ 还原'));
+  assert.equal(one(root, 'message-input').value, '当前聊天草稿'); assert.equal(one(root, 'thread-title').textContent, '手机适配');
+});
+
+test('late list results cannot overwrite a newer project/range/search selection', async (t) => {
+  const old = deferred(), calls = [], timers = fakeClock();
+  const { root } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async (host, options) => { calls.push(options); return calls.length === 1 ? old.promise : { threads: [{ id: 'new', title: '全部历史的新结果' }], projects: [] }; } }, { timers });
+  await tick(); const range = one(root, 'history-range'); range.value = 'all'; range.fire('change'); await tick();
+  old.resolve({ threads: [{ id: 'old', title: '过期最近一周' }] }); await tick();
+  assert.ok(one(root, 'thread-list').textContent.includes('全部历史的新结果')); assert.ok(!one(root, 'thread-list').textContent.includes('过期最近一周'));
+});
+
+test('creation capability is lazy, only official project IDs are posted, and confirmed UUID navigates', async (t) => {
+  let reads = 0, writes = 0; const navigations = [], created = '22222222-2222-4222-8222-222222222222';
+  const { root, view } = mount(t, { getCreation: async () => { reads++; return nativeCreation; }, createThread: async body => { writes++; assert.equal(body.projectId, 'official-red'); assert.equal(body.prompt, '还原新UI'); assert.equal(body.title, '验收'); assert.ok(body.operationId); assert.equal(Object.hasOwn(body, 'cwd'), false); return { status: 'confirmed', threadId: created }; }, getThread: async (host, id) => thread({ host, id, title: '新建结果' }) }, { onNavigate: value => navigations.push(value) });
+  view.update(thread()); type(root, '原聊天草稿'); assert.equal(reads, 0); one(root, 'new-chat-button').click(); await tick(); assert.equal(reads, 1); assert.equal(writes, 0);
+  const project = one(root, 'create-project'); project.value = 'official-red'; project.fire('change');
+  const prompt = one(root, 'create-prompt'); prompt.value = '还原新UI'; prompt.fire('input'); const title = one(root, 'create-title'); title.value = '验收'; title.fire('input');
+  assert.equal(one(root, 'create-submit').disabled, false); one(root, 'create-form').fire('submit'); one(root, 'create-form').fire('submit'); await tick();
+  assert.equal(writes, 1); assert.equal(navigations.at(-1).id, created); assert.equal(one(root, 'creation-dialog').hidden, true);
+  await view.selectThread(thread().id); assert.equal(one(root, 'message-input').value, '原聊天草稿');
+});
+
+test('a history/worktree group cannot silently create in projectless or a different official project', async (t) => {
+  let writes = 0;
+  const { root } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async () => ({ threads: [], projects: [{ id: 'worktree', name: 'red-app worktree', path: 'D:\\Project\\red-app-worktree', count: 0, totalCount: 5 }] }), getCreation: async () => nativeCreation, createThread: async () => { writes++; } }); await tick();
+  const project = one(root, 'project-select'); project.value = 'worktree'; project.fire('change'); await tick(); one(root, 'drawer-new-chat').click(); await tick();
+  const prompt = one(root, 'create-prompt'); prompt.value = '新任务'; prompt.fire('input');
+  assert.equal(one(root, 'create-project').value, '__unavailable__'); assert.equal(one(root, 'create-submit').disabled, true); one(root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 0);
+  const native = one(root, 'create-project'); native.value = ''; native.fire('change'); assert.equal(one(root, 'create-submit').disabled, false);
+});
+
+test('unknown creation survives closing/reload with draft and GET refresh never replays POST', async (t) => {
+  const dom = fixtureDOM(); let writes = 0; const api = { getCreation: async () => nativeCreation, createThread: async () => { writes++; throw Error('network lost after dispatch'); }, getThreads: async () => ({ threads: [] }) };
+  let view = mountMobileUI(dom.root, { api, storage: dom.storage }); t.after(() => view.destroy());
+  view.openCreation(); await tick(); const prompt = one(dom.root, 'create-prompt'); prompt.value = '可能已创建'; prompt.fire('input'); one(dom.root, 'create-form').fire('submit'); await tick();
+  assert.equal(writes, 1); assert.equal(one(dom.root, 'create-submit').disabled, true); assert.equal(one(dom.root, 'create-back-list').hidden, false);
+  one(dom.root, 'create-close').click(); view.openCreation(); await tick(); assert.equal(one(dom.root, 'create-prompt').value, '可能已创建'); assert.equal(one(dom.root, 'create-submit').disabled, true);
+  view.destroy(); view = mountMobileUI(dom.root, { api, storage: dom.storage }); view.openCreation(); await tick();
+  assert.equal(one(dom.root, 'create-prompt').value, '可能已创建'); assert.equal(one(dom.root, 'create-submit').disabled, true); one(dom.root, 'create-form').fire('submit'); one(dom.root, 'create-back-list').click(); await tick(); assert.equal(writes, 1);
+});
+
+test('submitted preparation and malformed confirmed receipts never navigate client IDs', async (t) => {
+  for (const result of [{ status: 'submitted', clientThreadId: 'client-preparing', message: '已提交，项目准备中' }, { status: 'confirmed', threadId: 'not-an-official-thread' }]) {
+    const dom = fixtureDOM(), navigations = [], view = mountMobileUI(dom.root, { storage: dom.storage, onNavigate: value => navigations.push(value), api: { getCreation: async () => nativeCreation, createThread: async () => result } }); t.after(() => view.destroy());
+    view.openCreation(); await tick(); const prompt = one(dom.root, 'create-prompt'); prompt.value = '新任务'; prompt.fire('input'); one(dom.root, 'create-form').fire('submit'); await tick();
+    assert.equal(navigations.length, 0); assert.equal(one(dom.root, 'create-submit').disabled, true); assert.equal(one(dom.root, 'created-open').hidden, true); assert.equal(one(dom.root, 'create-back-list').hidden, false);
+  }
+});
+
+test('a late confirmed create cannot steal the screen after dialog closure or a host switch', async (t) => {
+  const pending = deferred(), navigations = [], { root, view } = mount(t, { getCreation: async () => nativeCreation, createThread: () => pending.promise, getThreads: async () => ({ threads: [] }) }, { onNavigate: value => navigations.push(value) });
+  view.openCreation(); await tick(); const prompt = one(root, 'create-prompt'); prompt.value = '新任务'; prompt.fire('input'); one(root, 'create-form').fire('submit'); one(root, 'create-close').click(); await view.selectHost('windows');
+  pending.resolve({ status: 'confirmed', threadId: '22222222-2222-4222-8222-222222222222' }); await tick();
+  assert.deepEqual(navigations, [{ host: 'windows', id: null }]); assert.equal(one(root, 'creation-dialog').hidden, true);
+});
+
+test('only confirmed live status spins; drawer polling is visible-only and failures clear old running', async (t) => {
+  const timers = fakeClock(), current = thread().id, other = '22222222-2222-4222-8222-222222222222'; let calls = 0, fail = false;
+  const { root, doc, view } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async () => ({ threads: [{ id: current, title: '当前聊天', status: 'running', statusConfirmed: true }, { id: other, title: '其他聊天', status: 'running', statusConfirmed: false }] }),
+    getThreadStatuses: async (host, ids) => { calls++; assert.deepEqual(ids, [current, other]); if (fail) throw Error('owner unavailable'); return { statuses: [{ id: current, status: 'running', statusConfirmed: true }, { id: other, status: 'working', statusConfirmed: true }] }; } }, { timers }); await tick();
+  view.update(thread({ status: 'idle' })); assert.equal(one(root, 'title-running').hidden, true);
+  const rows = () => byClass(root, 'thread-row'); assert.equal(one(rows()[0], 'row-running').hidden, true); assert.equal(one(rows()[1], 'row-running').hidden, false);
+  view.update(thread({ status: 'running', revision: 2 })); assert.equal(one(root, 'title-running').hidden, false); assert.equal(one(rows()[0], 'row-running').hidden, false);
+  view.update(thread({ status: 'running', revision: 3, connected: false })); assert.equal(one(root, 'title-running').hidden, true); assert.equal(one(rows()[0], 'row-running').hidden, true);
+  fail = true; await timers.advance(10000); assert.equal(calls, 2); assert.equal(one(rows()[1], 'row-running').hidden, true);
+  doc.visibilityState = 'hidden'; doc.fire('visibilitychange'); await timers.advance(30000); assert.equal(calls, 2);
+  doc.visibilityState = 'visible'; doc.fire('visibilitychange'); await tick(); assert.equal(calls, 3);
+  one(root, 'menu-button').click(); await timers.advance(30000); assert.equal(calls, 3); view.destroy(); assert.equal(timers.size, 0);
+});
+
+test('status batches are capped and stale responses from a prior search cannot restore running', async (t) => {
+  const old = deferred(), timers = fakeClock(); let calls = 0;
+  const { root } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async (host, options) => ({ threads: options.q ? [{ id: 'new', title: '新搜索' }] : Array.from({ length: 130 }, (_, i) => ({ id: 'row-' + i, title: '旧' + i })) }),
+    getThreadStatuses: async (host, ids) => { calls++; if (calls === 1) { assert.equal(ids.length, 100); return old.promise; } return { statuses: [] }; } }, { timers }); await tick();
+  const search = one(root, 'thread-search'); search.value = '新'; search.fire('input'); await timers.advance(250);
+  old.resolve({ statuses: [{ id: 'new', status: 'running', statusConfirmed: true }] }); await tick();
+  assert.equal(byClass(root, 'thread-row').length, 1); assert.equal(one(root, 'row-running').hidden, true); assert.ok(one(root, 'thread-list').textContent.includes('新搜索'));
+});
+
+test('a hanging read-only status poll expires, removes stale running and is aborted on drawer close', async (t) => {
+  const timers = fakeClock(); let calls = 0, signal;
+  const { root, view } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async () => ({ threads: [{ id: 'background', title: '后台任务' }] }),
+    getThreadStatuses: async (_host, _ids, options) => { calls++; signal = options.signal; return calls === 1 ? { statuses: [{ id: 'background', status: 'running', statusConfirmed: true }] } : new Promise(() => {}); } }, { timers }); await tick();
+  assert.equal(one(root, 'row-running').hidden, false); await timers.advance(10000); assert.equal(calls, 2);
+  await timers.advance(20000); assert.equal(signal.aborted, true); assert.equal(one(root, 'row-running').hidden, true);
+  await timers.advance(10000); assert.equal(calls, 3); one(root, 'menu-button').click(); assert.equal(signal.aborted, true);
+  view.destroy(); assert.equal(timers.size, 0);
+});
+
+test('native select option loading cannot erase a saved project or unlock an unknown creation', async (t) => {
+  const dom = fixtureDOM(), bare = dom.doc.createElement('select'); bare.value = 'official-red'; assert.equal(bare.value, '', 'fixture must model native select without options');
+  let writes = 0, capability = async () => nativeCreation;
+  const api = { getCreation: () => capability(), createThread: async body => { writes++; assert.equal(body.projectId, 'official-red'); return { status: 'unknown' }; } };
+  let view = mountMobileUI(dom.root, { api, storage: dom.storage }); t.after(() => view.destroy()); view.openCreation(); await tick();
+  const project = one(dom.root, 'create-project'); project.value = 'official-red'; project.fire('change'); const prompt = one(dom.root, 'create-prompt'); prompt.value = '保留原生项目的未知创建'; prompt.fire('input');
+  one(dom.root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 1); view.destroy();
+  const pending = deferred(); capability = () => pending.promise;
+  view = mountMobileUI(dom.root, { api, storage: dom.storage }); view.openCreation();
+  assert.equal(one(dom.root, 'create-project').value, ''); // No native options exist yet.
+  one(dom.root, 'create-title').fire('input'); one(dom.root, 'create-close').click();
+  assert.equal(JSON.parse(dom.storage.getItem('codex-mobile-create-draft:mac')).projectId, 'official-red');
+  view.destroy(); pending.resolve(nativeCreation); await tick();
+  capability = async () => ({ supported: true, projectless: true, projects: [] });
+  view = mountMobileUI(dom.root, { api, storage: dom.storage }); view.openCreation(); await tick();
+  assert.equal(one(dom.root, 'create-project').value, '__unavailable__'); assert.ok(one(dom.root, 'create-project').textContent.includes('已保存项目暂不可用')); assert.equal(one(dom.root, 'create-submit').disabled, true);
+  assert.equal(JSON.parse(dom.storage.getItem('codex-mobile-create-draft:mac')).projectId, 'official-red'); view.destroy();
+  capability = async () => nativeCreation; view = mountMobileUI(dom.root, { api, storage: dom.storage }); view.openCreation(); await tick();
+  assert.equal(one(dom.root, 'create-project').value, 'official-red'); assert.equal(one(dom.root, 'create-prompt').value, '保留原生项目的未知创建'); assert.equal(one(dom.root, 'create-submit').disabled, true);
+  one(dom.root, 'create-form').fire('submit'); await tick(); assert.equal(writes, 1);
 });
