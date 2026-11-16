@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import https from 'node:https';
+import { Readable, Writable } from 'node:stream';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -45,9 +48,9 @@ function request(gateway, { route = '/api/hosts', method = 'GET', headers = {}, 
       headers: { ...(bytes ? { 'Content-Type': 'application/json', 'Content-Length': bytes.length } : {}), ...headers } }, (res) => {
       const parts = []; res.on('data', (part) => parts.push(part)); res.on('error', reject);
       res.on('end', () => {
-        const text = Buffer.concat(parts).toString('utf8'); let data;
+        const received = Buffer.concat(parts), text = received.toString('utf8'); let data;
         try { data = JSON.parse(text); } catch { data = null; }
-        resolve({ status: res.statusCode, headers: res.headers, text, data });
+        resolve({ status: res.statusCode, headers: res.headers, bytes: received, text, data });
       });
     });
     req.on('error', reject); req.end(bytes);
@@ -69,6 +72,75 @@ function openPeerStream(gateway) {
   req.on('error', () => { if (!response) ready.resolve({ status: 0 }); });
   return { ready: ready.promise, closed: closed.promise, cancel() { response?.destroy(); req.destroy(); } };
 }
+
+// Exercise the actual raw-peer adapter and gateway stream, while keeping TLS
+// transport synthetic. Assertions below inspect the phone-facing wire bytes.
+function rawPeerResponse(t, createResponse) {
+  const calls = [];
+  t.mock.method(https, 'request', (url, options, onResponse) => {
+    calls.push({ url: String(url), headers: new Headers(options.headers) });
+    return new Writable({ write(_bytes, _encoding, done) { done(); }, final(done) {
+      const { bytes, headers } = createResponse(calls.at(-1));
+      const upstream = Readable.from([bytes]); upstream.statusCode = 200; upstream.headers = headers;
+      queueMicrotask(() => onResponse(upstream)); done();
+    } });
+  });
+  return calls;
+}
+
+test('raw peer receives the browser Accept-Encoding and negotiates gzip JSON the phone can decode', async (t) => {
+  const payload = { title: '手机收到完整中文与符号 ✅', messages: Array(30).fill('原会话文字，不应变成乱码。') };
+  const plain = Buffer.from(JSON.stringify(payload));
+  const calls = rawPeerResponse(t, call => {
+    const gzip = /(?:^|,)\s*gzip(?:\s*[,;]|$)/.test(call.headers.get('accept-encoding') ?? '');
+    return { bytes: gzip ? gzipSync(plain) : plain, headers: { 'content-type': 'application/json; charset=utf-8', ...(gzip ? { 'content-encoding': 'gzip' } : {}) } };
+  });
+  const f = await rig(t, { peers: [{ id: 'windows', url: 'https://windows-fixture.tailfixture.ts.net', address: '100.64.23.45' }] }), gateway = await f.start();
+  const result = await request(gateway, { route: '/api/thread?host=windows&id=' + threadId, headers: { ...auth, 'Accept-Encoding': 'gzip, br;q=0.5' } });
+  assert.equal(result.status, 200); assert.equal(calls.length, 1);
+  assert.equal(calls[0].headers.get('accept-encoding'), 'gzip, br;q=0.5', 'the upstream must see the phone representation preference');
+  assert.equal(result.headers['content-encoding'], 'gzip', 'compressed bytes need their matching phone-facing encoding');
+  assert.deepEqual(JSON.parse(gunzipSync(result.bytes).toString('utf8')), payload);
+  assert.ok(result.bytes.length < plain.length, 'the phone receives the smaller representation on the wire');
+  assert.equal(f.calls.discover, 0);
+});
+
+test('an already-gzipped raw peer body retains its encoding instead of reaching the phone as unreadable JSON', async (t) => {
+  const payload = { title: '原始压缩响应：完整中文', answer: '确认' }, plain = Buffer.from(JSON.stringify(payload)), zipped = gzipSync(plain);
+  rawPeerResponse(t, () => ({ bytes: zipped, headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' } }));
+  const f = await rig(t, { peers: [{ id: 'windows', url: 'https://windows-fixture.tailfixture.ts.net', address: '100.64.23.45' }] }), gateway = await f.start();
+  const result = await request(gateway, { route: '/api/thread?host=windows&id=' + threadId, headers: { ...auth, 'Accept-Encoding': 'gzip' } });
+  assert.equal(result.status, 200);
+  // A phone decodes based on this header; gzip bytes without it are corrupt JSON.
+  assert.equal(result.headers['content-encoding'], 'gzip');
+  assert.deepEqual(result.bytes, zipped); assert.deepEqual(JSON.parse(gunzipSync(result.bytes).toString('utf8')), payload);
+});
+
+test('raw peer SSE without encoding stays byte-for-byte readable and is not labelled gzip', async (t) => {
+  const bytes = Buffer.from('event: state\ndata: {"title":"空闲中文会话"}\n\nevent: ping\ndata: {}\n\n');
+  rawPeerResponse(t, () => ({ bytes, headers: { 'content-type': 'text/event-stream' } }));
+  const f = await rig(t, { peers: [{ id: 'windows', url: 'https://windows-fixture.tailfixture.ts.net', address: '100.64.23.45' }] }), gateway = await f.start();
+  const result = await request(gateway, { route: '/api/events?host=windows&id=' + threadId, headers: { ...auth, 'Accept-Encoding': 'gzip' } });
+  assert.equal(result.status, 200); assert.equal(result.headers['content-encoding'], undefined);
+  assert.match(result.headers['content-type'], /^text\/event-stream/); assert.deepEqual(result.bytes, bytes);
+});
+
+test('native-fetch fallback forwards its decompressed JSON without the old upstream gzip label', async (t) => {
+  const payload = { title: '真实 fetch 自动解压兼容', messages: Array(20).fill('中文正文必须可直接解析') }, plain = Buffer.from(JSON.stringify(payload));
+  const upstream = http.createServer((_req, res) => { const zipped = gzipSync(plain); res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'Content-Length': zipped.length }); res.end(zipped); });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { upstream.closeAllConnections(); await new Promise(resolve => upstream.close(resolve)); });
+  const nativeFetch = globalThis.fetch; let upstreamEncoding;
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    const response = await nativeFetch('http://127.0.0.1:' + upstream.address().port + '/gzip-fixture', options);
+    upstreamEncoding = response.headers.get('content-encoding'); return response;
+  });
+  const f = await rig(t, { peers: [{ id: 'windows', url: 'https://windows-fixture.tailfixture.ts.net' }] }), gateway = await f.start();
+  const result = await request(gateway, { route: '/api/thread?host=windows&id=' + threadId, headers: { ...auth, 'Accept-Encoding': 'gzip' } });
+  assert.equal(upstreamEncoding, 'gzip', 'native fetch retains the origin header after decoding its response body');
+  assert.equal(result.status, 200); assert.equal(result.headers['content-encoding'], undefined, 'the phone must not try to decompress decoded bytes again');
+  assert.deepEqual(result.bytes, plain); assert.deepEqual(result.data, payload);
+});
 
 test('public shell and health are readable; every protected API requires a valid session or bearer', async (t) => {
   const f = await rig(t), gateway = await f.start();

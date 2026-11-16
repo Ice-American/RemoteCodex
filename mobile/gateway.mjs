@@ -147,9 +147,15 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
     res.once('close', abort);
     try {
       const upstream = await fetchPeer(new URL(url.pathname + url.search, peer.url), { method: req.method,
-        headers: { Authorization: 'Bearer ' + peerKey, 'X-Cmc-Forwarded': '1', ...(input ? { 'Content-Type': 'application/json' } : {}) },
+        headers: { Authorization: 'Bearer ' + peerKey, 'X-Cmc-Forwarded': '1',
+          ...(peer.address ? { 'Accept-Encoding': req.headers['accept-encoding'] ?? 'identity' } : {}),
+          ...(input ? { 'Content-Type': 'application/json' } : {}) },
         ...(input ? { body: JSON.stringify(input) } : {}), signal: controller.signal }, peer.address);
-      res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') ?? 'application/json', 'Cache-Control': 'no-store' });
+      // Address-pinned HTTPS returns raw bytes, so preserve their encoding for
+      // the phone. The native-fetch fallback has already decoded its body.
+      const encoding = peer.address && upstream.headers.get('content-encoding');
+      res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') ?? 'application/json',
+        'Cache-Control': 'no-store', Vary: 'Accept-Encoding', ...(encoding ? { 'Content-Encoding': encoding } : {}) });
       if (upstream.body) await pipeline(Readable.fromWeb(upstream.body), res); else res.end();
     } catch {
       if (!res.headersSent && !res.destroyed) sendJson(res, 502, { error: '目标电脑暂时无法连接，请稍后重试' });
