@@ -12,6 +12,9 @@ import { createGateway } from '../mobile/gateway.mjs';
 import { Journal, writePrivate } from '../mobile/store.mjs';
 import { requestFingerprint } from '../mobile/requests.mjs';
 import { ThreadCatalog } from '../mobile/history.mjs';
+import { OwnerClient } from '../mobile/owner.mjs';
+import { OWNER_METHODS, OWNER_SUPPORTED_VERSIONS } from '../mobile/protocols.mjs';
+import { runtimeStatus } from '../src/state.mjs';
 
 const threadId = '11111111-1111-4111-8111-111111111111';
 const selfKey = 'synthetic-self-pairing-key-for-isolated-tests';
@@ -72,6 +75,64 @@ function openPeerStream(gateway) {
     res.on('error', () => {}); res.once('close', closed.resolve);
   });
   req.on('error', () => { if (!response) ready.resolve({ status: 0 }); });
+  return { ready: ready.promise, closed: closed.promise, cancel() { response?.destroy(); req.destroy(); } };
+}
+
+// Keep live-state tests on a synthetic verified desktop, with no native socket,
+// real credentials, history, navigation or task-write method available.
+async function ownerRig(t, options = {}) {
+  const f = await rig(t), code = Buffer.from(JSON.stringify(Object.fromEntries(Object.entries(OWNER_METHODS)
+    .map(([key, method]) => [method, OWNER_SUPPORTED_VERSIONS[key].at(-1)]))));
+  const header = Buffer.from(JSON.stringify({ files: { '.vite': { files: { build: { files: {
+    'synthetic.js': { size: code.length, offset: '0' },
+  } } } } } }));
+  const padded = Math.ceil((header.length + 8) / 4) * 4, prefix = Buffer.alloc(16);
+  prefix.writeUInt32LE(4, 0); prefix.writeUInt32LE(padded, 4); prefix.writeUInt32LE(padded - 4, 8); prefix.writeUInt32LE(header.length, 12);
+  const asarPath = path.join(f.dir, 'synthetic.asar');
+  fs.writeFileSync(asarPath, Buffer.concat([prefix, header, Buffer.alloc(8 + padded - 16 - header.length), code]));
+  const identity = { verified: true, fingerprint: 'synthetic-desktop', asarPath, socketPath: '/never-connect-synthetic.sock' };
+  const control = { ready: false, exists: true, reads: 0, opens: [], openAttempts: 0, unfollows: 0, mutations: 0, owner: null };
+  const catalog = { get: async id => control.exists && id === threadId ? { id, title: 'Existing fixture' } : null,
+    read: async () => ({ messages: [{ id: 'existing-user', role: 'user', text: 'Previous user message' }] }), query: async () => ({ threads: [] }) };
+  t.mock.method(OwnerClient.prototype, 'connect', async function () {
+    this.connected = true; this.generation++; this.identity = identity; this.abort = new AbortController();
+    this.pipe = { socket: { destroyed: false }, off() {}, close() {} }; control.owner = this;
+    return identity;
+  });
+  t.mock.method(OwnerClient.prototype, 'freshSnapshot', async function (id) {
+    control.reads++; this.unknown(id, 'Waiting for a fresh owner snapshot', { refreshing: true });
+    control.readStarted?.resolve(); if (control.readGate) await control.readGate.promise;
+    if (!control.ready || !this.connected) throw Object.assign(Error('No live Desktop owner was found'), { code: 'OWNER_UNAVAILABLE' });
+    const state = { id, title: 'Existing fixture', resumeState: control.resumeState ?? 'resumed',
+      threadRuntimeStatus: { type: control.runtimeType ?? 'idle' }, turns: control.turns ?? [], requests: [] };
+    if (control.omitResumeState) delete state.resumeState;
+    const snapshot = { threadId: id, owner: 'fixture-owner', generation: this.generation, revision: 1, sequence: control.reads,
+      activeTurnId: null, status: runtimeStatus(state), source: 'official-desktop-owner-IPC-live', state };
+    this.snapshots.set(id, snapshot); this.owners.set(id, { owner: snapshot.owner, generation: this.generation, supportsUntrustedAppInput: true });
+    return structuredClone(snapshot);
+  });
+  const unfollow = OwnerClient.prototype.unfollow;
+  t.mock.method(OwnerClient.prototype, 'unfollow', function (id) { if (this === control.owner) control.unfollows++; return unfollow.call(this, id); });
+  for (const name of ['sendText', 'requestToOwner']) t.mock.method(OwnerClient.prototype, name, async () => { control.mutations++; throw Error('Task writes forbidden'); });
+  const nativeTools = { capability: async () => ({ supported: false }), statuses: async () => [],
+    openExistingThread: async (id, { signal } = {}) => {
+      control.openAttempts++; control.openSignal = signal; control.openStarted?.resolve();
+      if (control.openGate) await control.openGate.promise;
+      if (signal?.aborted) throw signal.reason;
+      control.opens.push(id);
+    } };
+  const gateway = await f.start({ discover: async () => identity, catalog, nativeTools, ...options });
+  return { ...f, gateway, control };
+}
+
+function localStream(gateway) {
+  const ready = deferred(), closed = deferred(); let response;
+  const observe = (req, res) => { if (req.url.startsWith('/api/events')) { gateway.server.off('request', observe); res.once('close', closed.resolve); } };
+  gateway.server.on('request', observe);
+  const req = http.get({ host: '127.0.0.1', port: gateway.port, path: '/api/events?host=mac&id=' + threadId, headers: auth }, res => {
+    response = res; res.on('error', () => {}); res.once('data', ready.resolve);
+  });
+  req.on('error', () => {});
   return { ready: ready.promise, closed: closed.promise, cancel() { response?.destroy(); req.destroy(); } };
 }
 
@@ -432,4 +493,194 @@ test('idle SSE sends a JavaScript-visible ping so the phone can detect a stalled
   heartbeat.run(); await within(ping.promise, 'JavaScript-visible heartbeat did not arrive');
   assert.equal(f.calls.discover, 1, 'heartbeat must not trigger another owner read');
   response.destroy(); req.destroy(); await within(serverClosed.promise, 'SSE close did not settle'); await f.close(gateway); assert.equal(timers.size, 0);
+});
+
+test('history GET identifies a known unloaded chat without navigating or enabling any task action', async t => {
+  const { gateway, control } = await ownerRig(t);
+  const first = await request(gateway, { route: '/api/thread?id=' + threadId, headers: auth });
+  assert.equal(first.data.connectionState, 'needs-load'); assert.equal(first.data.canLoad, true);
+  assert.equal(first.data.connected, false); assert.equal(first.data.source, 'local-history-only');
+  assert.ok(Object.values(first.data.capabilities).every(value => value === false));
+  assert.deepEqual(control.opens, []); assert.equal(control.mutations, 0);
+  control.exists = false;
+  const missing = await gateway.state(threadId, { refresh: true });
+  assert.equal(missing.connectionState, 'unavailable'); assert.equal(missing.canLoad, false);
+  control.exists = true; control.ready = true;
+  const live = await gateway.state(threadId, { refresh: true });
+  assert.equal(live.connectionState, 'ready'); assert.equal(live.canLoad, false); assert.equal(live.capabilities.send, true);
+});
+
+test('offline or unverified desktop cannot offer loading even when its local catalog contains the chat', async t => {
+  const f = await rig(t), catalog = { get: async () => ({ id: threadId, title: 'Existing' }), read: async () => ({ messages: [] }) };
+  const gateway = await f.start({ catalog });
+  const view = await gateway.state(threadId);
+  assert.equal(view.connectionState, 'unavailable'); assert.equal(view.canLoad, false);
+});
+
+test('an owner snapshot can preserve visible messages while unloaded or unconfirmed state still requires explicit loading', async t => {
+  const { gateway, control } = await ownerRig(t); control.ready = true;
+  control.turns = [{ turnId: 'existing-completed-turn', status: 'completed', items: [
+    { id: 'existing-assistant', type: 'agentMessage', text: 'Owner history stays visible before resume' },
+  ] }];
+  for (const [runtimeType, resumeState, omitResumeState] of [
+    ['notLoaded', 'resumed', false], ['unknown', 'resumed', false],
+    ['idle', 'needs_resume', false], ['idle', 'resuming', false], ['idle', 'resumed', true],
+  ]) {
+    Object.assign(control, { runtimeType, resumeState, omitResumeState });
+    const result = await request(gateway, { route: '/api/thread?id=' + threadId, headers: auth });
+    assert.equal(result.data.connectionState, 'needs-load', runtimeType + ':' + resumeState);
+    assert.equal(result.data.canLoad, true); assert.equal(result.data.connected, false); assert.equal(result.data.ownerConfirmed, false);
+    assert.equal(result.data.connectionId, null); assert.equal(result.data.ownerId, null);
+    assert.equal(result.data.messages[0].text, 'Owner history stays visible before resume');
+    assert.ok(Object.values(result.data.capabilities).every(value => value === false));
+  }
+  control.exists = false;
+  const unavailable = await gateway.state(threadId, { refresh: true });
+  assert.equal(unavailable.connectionState, 'unavailable'); assert.equal(unavailable.canLoad, false);
+  assert.equal(unavailable.messages[0].text, 'Owner history stays visible before resume');
+  assert.deepEqual(control.opens, []); assert.equal(control.mutations, 0);
+});
+
+test('navigation plus a residual idle snapshot cannot confirm loading while resume is still pending', async t => {
+  const { gateway, control } = await ownerRig(t, { loadTimeoutMs: 25 });
+  control.ready = true; control.resumeState = 'resuming';
+  const result = await gateway.action({ host: 'mac', threadId, operationId: 'load-resume-not-finished', action: 'load' });
+  assert.equal(result.status, 'rejected'); assert.equal(result.state.connectionState, 'needs-load');
+  assert.equal(result.state.connected, false); assert.equal(result.state.capabilities.send, false);
+  assert.deepEqual(control.opens, [threadId]); assert.equal(control.mutations, 0);
+});
+
+test('explicit loads merge navigation and require a fresh owner snapshot before becoming confirmed', async t => {
+  const { gateway, control } = await ownerRig(t);
+  control.openStarted = deferred(); control.openGate = deferred(); control.readStarted = deferred(); control.readGate = deferred();
+  const input = { host: 'mac', threadId, action: 'load' };
+  let settled = false;
+  const first = request(gateway, { route: '/api/action', method: 'POST', headers: auth,
+    body: { ...input, operationId: 'explicit-load-first' } }).then(value => { settled = true; return value; });
+  await within(control.openStarted.promise, 'Explicit load did not invoke the navigation adapter');
+  const secondStarted = deferred(); gateway.server.once('request', secondStarted.resolve);
+  const second = request(gateway, { route: '/api/action', method: 'POST', headers: auth,
+    body: { ...input, operationId: 'explicit-load-second' } });
+  await within(secondStarted.promise, 'Second load did not reach the gateway');
+  await new Promise(resolve => setImmediate(resolve)); control.openGate.resolve();
+  await within(control.readStarted.promise, 'Navigation ACK did not start a fresh owner read');
+  assert.equal(settled, false, 'navigation ACK alone cannot confirm readiness');
+  control.ready = true; control.readGate.resolve();
+  const responses = await Promise.all([first, second]);
+  for (const response of responses) {
+    assert.equal(response.data.status, 'confirmed'); assert.equal(response.data.state.connectionState, 'ready');
+    assert.equal(response.data.state.ownerConfirmed, true); assert.equal(response.data.state.capabilities.send, true);
+  }
+  assert.deepEqual(control.opens, [threadId]); assert.equal(control.mutations, 0);
+});
+
+test('load rejects a non-catalog ID and a navigation ACK without a confirmed runtime never enables sending', async t => {
+  const { gateway, control } = await ownerRig(t, { loadTimeoutMs: 25 });
+  const missingId = '22222222-2222-4222-8222-222222222222';
+  const missing = await request(gateway, { route: '/api/action', method: 'POST', headers: auth,
+    body: { host: 'mac', threadId: missingId, operationId: 'load-missing-chat', action: 'load' } });
+  assert.equal(missing.data.status, 'rejected'); assert.deepEqual(control.opens, []);
+  const pending = await request(gateway, { route: '/api/action', method: 'POST', headers: auth,
+    body: { host: 'mac', threadId, operationId: 'load-without-owner', action: 'load' } });
+  assert.equal(pending.data.status, 'rejected'); assert.equal(pending.data.state.connected, false);
+  assert.equal(pending.data.state.connectionState, 'needs-load');
+  assert.deepEqual(control.opens, [threadId]); assert.equal(control.mutations, 0);
+});
+
+test('refresh-generated unknown events cannot make an unloaded SSE repeatedly refresh itself', async t => {
+  const { gateway, control } = await ownerRig(t), stream = localStream(gateway); t.after(() => stream.cancel());
+  await within(stream.ready, 'Initial history-only SSE state did not arrive');
+  await new Promise(resolve => setTimeout(resolve, 260));
+  assert.equal(control.reads, 1, 'an internal refresh is not a new external invalidation');
+  assert.deepEqual(control.opens, []); assert.equal(control.mutations, 0);
+  stream.cancel(); await within(stream.closed, 'SSE cleanup did not finish');
+});
+
+test('closing the last SSE cannot cancel an in-flight fresh GET for the same chat', async t => {
+  const { gateway, control } = await ownerRig(t); control.ready = true;
+  const stream = localStream(gateway); t.after(() => stream.cancel()); await within(stream.ready, 'Initial live SSE did not arrive');
+  control.readStarted = deferred(); control.readGate = deferred();
+  t.after(() => control.readGate.resolve());
+  const pending = request(gateway, { route: '/api/thread?id=' + threadId, headers: auth });
+  await within(control.readStarted.promise, 'Fresh GET did not start'); stream.cancel();
+  await within(stream.closed, 'Server did not observe the SSE close');
+  assert.equal(control.unfollows, 0, 'the fresh GET still owns a follower reference');
+  control.readGate.resolve(); const result = await pending;
+  assert.equal(result.data.connected, true); assert.equal(result.data.connectionState, 'ready');
+});
+
+test('closing the last SSE cannot cancel an explicitly requested load while navigation is pending', async t => {
+  const { gateway, control } = await ownerRig(t), stream = localStream(gateway); t.after(() => stream.cancel());
+  await within(stream.ready, 'Initial history SSE did not arrive');
+  control.openStarted = deferred(); control.openGate = deferred();
+  const pending = request(gateway, { route: '/api/action', method: 'POST', headers: auth,
+    body: { host: 'mac', threadId, operationId: 'load-during-stream-close', action: 'load' } });
+  await within(control.openStarted.promise, 'Explicit load did not reach navigation'); stream.cancel();
+  await within(stream.closed, 'Server did not observe the SSE close'); assert.equal(control.unfollows, 0);
+  control.ready = true; control.openGate.resolve();
+  const result = await pending; assert.equal(result.data.status, 'confirmed'); assert.equal(control.mutations, 0);
+});
+
+test('a timed-out load cancels delayed navigation and never turns a late ACK into readiness', async t => {
+  const { gateway, control } = await ownerRig(t, { loadTimeoutMs: 25 });
+  control.openGate = deferred(); t.after(() => control.openGate.resolve());
+  const result = await gateway.action({ host: 'mac', threadId, operationId: 'load-navigation-timeout', action: 'load' });
+  assert.equal(result.status, 'rejected'); assert.equal(result.state.connected, false);
+  assert.equal(control.openSignal.aborted, true); assert.deepEqual(control.opens, []);
+  control.ready = true; control.openGate.resolve(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(control.opens, []); assert.equal(control.reads, 0); assert.equal(control.mutations, 0);
+});
+
+test('one cancelled load caller leaves the shared navigation available to the remaining caller', async t => {
+  const { gateway, control } = await ownerRig(t), abort = new AbortController();
+  control.openGate = deferred(); control.openStarted = deferred(); t.after(() => control.openGate.resolve());
+  const first = gateway.action({ host: 'mac', threadId, operationId: 'load-cancelled-caller', action: 'load' }, { signal: abort.signal });
+  const rejected = assert.rejects(first, /fixture caller departed/);
+  await within(control.openStarted.promise, 'First load did not start');
+  const second = gateway.action({ host: 'mac', threadId, operationId: 'load-remaining-caller', action: 'load' });
+  await new Promise(resolve => setImmediate(resolve)); abort.abort(Error('fixture caller departed')); await rejected;
+  assert.equal(control.openSignal.aborted, false);
+  control.ready = true; control.openGate.resolve();
+  assert.equal((await second).status, 'confirmed'); assert.equal(control.openAttempts, 1);
+  assert.deepEqual(control.opens, [threadId]); assert.equal(control.mutations, 0);
+});
+
+test('a disconnected load HTTP client cancels pending navigation before the adapter can launch', async t => {
+  const { gateway, control } = await ownerRig(t);
+  control.openGate = deferred(); control.openStarted = deferred(); t.after(() => control.openGate.resolve());
+  const bytes = Buffer.from(JSON.stringify({ host: 'mac', threadId, operationId: 'load-phone-disappeared', action: 'load' }));
+  const req = http.request({ host: '127.0.0.1', port: gateway.port, path: '/api/action', method: 'POST',
+    headers: { ...auth, 'Content-Type': 'application/json', 'Content-Length': bytes.length } });
+  req.on('error', () => {}); req.end(bytes); t.after(() => req.destroy());
+  await within(control.openStarted.promise, 'HTTP load did not reach its adapter');
+  const aborted = deferred(); control.openSignal.addEventListener('abort', aborted.resolve, { once: true });
+  req.destroy(); await within(aborted.promise, 'Closed HTTP load did not cancel its delayed navigation');
+  control.openGate.resolve(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(control.opens, []); assert.equal(control.reads, 0); assert.equal(control.mutations, 0);
+});
+
+test('a desktop disconnect cancels a pending load without navigating on a replacement connection', async t => {
+  const { gateway, control } = await ownerRig(t);
+  control.openGate = deferred(); control.openStarted = deferred(); t.after(() => control.openGate.resolve());
+  const pending = gateway.action({ host: 'mac', threadId, operationId: 'load-owner-disappeared', action: 'load' });
+  await within(control.openStarted.promise, 'Load did not reach its adapter');
+  control.owner.invalidate(control.owner.pipe, control.owner.generation, 'fixture owner disconnected');
+  const result = await pending;
+  assert.equal(result.status, 'rejected'); assert.equal(result.state.connectionState, 'unavailable');
+  assert.equal(control.openSignal.aborted, true); control.openGate.resolve(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(control.opens, []); assert.equal(control.reads, 0); assert.equal(control.mutations, 0);
+});
+
+test('closing the last SSE cannot cancel an action while its fresh owner check is pending', async t => {
+  const { gateway, control } = await ownerRig(t); control.ready = true;
+  const stream = localStream(gateway); t.after(() => stream.cancel()); await within(stream.ready, 'Initial live SSE did not arrive');
+  control.readGate = deferred(); control.readStarted = deferred(); t.after(() => control.readGate.resolve());
+  const pending = request(gateway, { route: '/api/action', method: 'POST', headers: auth, body: {
+    host: 'mac', threadId, operationId: 'action-during-stream-close', action: 'send', text: 'Never dispatched',
+    ownerId: 'obsolete-owner', connectionId: 'obsolete-connection', activeTurnId: null,
+  } });
+  await within(control.readStarted.promise, 'Action did not start its owner check'); stream.cancel();
+  await within(stream.closed, 'SSE close did not finish'); assert.equal(control.unfollows, 0);
+  control.readGate.resolve(); const result = await pending;
+  assert.equal(result.data.status, 'rejected'); assert.match(result.data.message, /状态已变化/); assert.equal(control.mutations, 0);
 });

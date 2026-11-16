@@ -30,6 +30,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .connection-bar .text-button { min-height: 38px; font-size: 12px; }
 .notice { grid-row: 3; padding: 10px 16px; background: #fff5dd; border-bottom: 1px solid #eddfba; color: #715221; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; max-height: 23vh; overflow-y: auto; }
 .conversation { grid-row: 4; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 20px 16px 28px; scroll-padding-bottom: 24px; }
+.load-thread-panel { max-width: 760px; margin: 0 auto 10px; padding: 12px; border: 1px solid #e6d5ad; border-radius: 14px; background: #fff9eb; }
+.load-thread-panel h2 { margin: 0 0 8px; color: #715221; font-size: 16px; line-height: 1.6; }
+.load-thread-hint, .load-thread-result { margin: 0 0 12px; color: #715e3b; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.load-thread-result { margin: 12px 0 0; }
+.load-thread-button { min-height: 44px; max-width: 100%; padding: 10px 14px; border: 0; border-radius: 10px; background: #2f684b; color: #fff; font-size: 14px; line-height: 1.5; }
 .messages, .request-cards { display: flex; flex-direction: column; gap: 20px; max-width: 760px; margin: 0 auto; }
 .request-cards:not(:empty) { margin-top: 24px; }
 .message { min-width: 0; max-width: 100%; }

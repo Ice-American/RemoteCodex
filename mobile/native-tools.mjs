@@ -1,4 +1,4 @@
-// Uses verified Windows app-tools for creation and isolated owner snapshots for live status.
+// Uses verified Desktop navigation, Windows creation tools and isolated owner snapshots.
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -12,6 +12,7 @@ import { readOwnerProtocols } from './protocols.mjs';
 
 const exec = promisify(execFile);
 const officialImage = /\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$/i;
+const macApp = '/Applications/ChatGPT.app';
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
 const toolPipe = value => /^(?:codex-browser-use-|codex-app-tools-)/.test(path.win32.basename(value ?? ''));
 const localProject = project => (project.projectKind ?? project.kind) === 'local' && (!project.hostId || project.hostId === 'local');
@@ -109,9 +110,9 @@ async function ownerStatuses({ ids, identity, discover, timeoutMs, registerClean
 export class NativeTools {
   constructor({ platform = process.platform, home = codexHome(), discover = discoverNativeDesktop,
     probe = probePipes, pipeFactory = (endpoint, kind) => new Pipe(endpoint, kind), contextResolver = localContext,
-    ownerStatusReader = ownerStatuses,
+    ownerStatusReader = ownerStatuses, openRunner = exec,
     timeoutMs = 10000, statusTtlMs = 10000, statusTimeoutMs = 5500, now = Date.now } = {}) {
-    Object.assign(this, { platform, home, discover, probe, pipeFactory, contextResolver, ownerStatusReader, timeoutMs, statusTtlMs, statusTimeoutMs, now });
+    Object.assign(this, { platform, home, discover, probe, pipeFactory, contextResolver, ownerStatusReader, openRunner, timeoutMs, statusTtlMs, statusTimeoutMs, now });
     this.pipes = new Set(); this.ownerCleanups = new Set(); this.statusCache = null; this.statusInflight = null; this.closed = false;
   }
   #available() { return this.platform === 'win32' && !this.closed; }
@@ -181,6 +182,59 @@ export class NativeTools {
       return { supported: true, reason: null, projectless: true, projects };
     } catch (error) { return { supported: false, reason: error.message, projectless: false, projects: [] }; }
     finally { this.#release(session); }
+  }
+  async openExistingThread(threadId, { signal } = {}) {
+    // The caller must confirm this exact ID in the local catalog. Navigation
+    // only loads that existing chat; it must never fill or submit its composer.
+    if (!uuid(threadId) || threadId.length !== 36) throw Error('无效聊天标识');
+    const check = () => {
+      if (this.closed) throw Error('官方导航连接已关闭');
+      if (signal?.aborted) throw Error('原聊天导航已取消');
+    };
+    check();
+    if (this.platform === 'darwin') {
+      const verify = async () => {
+        const identity = await this.discover({ platform: this.platform, home: this.home, verifySignature: true });
+        check();
+        if (identity.platform !== 'darwin' || !Number.isSafeInteger(identity.pid) || identity.pid <= 0 ||
+            identity.image !== macApp + '/Contents/MacOS/ChatGPT' ||
+            identity.asarPath !== macApp + '/Contents/Resources/app.asar' ||
+            typeof identity.fingerprint !== 'string' || !identity.fingerprint)
+          throw Error('官方 Mac 桌面身份未确认或已变化');
+        return identity;
+      };
+      const before = await verify();
+      // A fixed executable and argument array prevent prompt/query injection.
+      // -g avoids requesting foreground activation; Desktop may still navigate
+      // its own window. A process exit is only a navigation acknowledgement.
+      await this.openRunner('/usr/bin/open', ['-g', '-a', macApp, 'codex://threads/' + threadId],
+        { timeout: this.timeoutMs, maxBuffer: 65536, ...(signal ? { signal } : {}) });
+      check();
+      const after = await verify();
+      if (before.pid !== after.pid || before.image !== after.image || before.fingerprint !== after.fingerprint)
+        throw Error('官方桌面身份已变化，导航结果未确认，请刷新后重试');
+    } else if (this.platform === 'win32') {
+      let session;
+      try {
+        session = await this.#open();
+        check();
+        const matches = session.catalog.filter(tool => tool.namespace === 'codex_app' && tool.name === 'navigate_to_codex_page');
+        const schema = matches[0]?.inputSchema;
+        if (matches.length !== 1 || schema?.properties?.threadId?.type !== 'string' ||
+            schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.some(key => key !== 'threadId')))
+          throw Error('官方打开原聊天接口格式未确认');
+        await this.#verify(session);
+        check();
+        const response = await session.pipe.request('tools/call', this.#params(session, 'navigate_to_codex_page', { threadId }),
+          { timeoutMs: this.timeoutMs });
+        // Navigation may return plain text. success confirms only the route
+        // request, while a fresh owner snapshot must prove the chat is ready.
+        if (response?.result?.success !== true) throw Error('官方工具未确认导航成功');
+        await this.#verify(session);
+        check();
+      } finally { this.#release(session); }
+    } else throw Error('当前电脑不支持打开官方原聊天');
+    return { threadId, opened: true, source: 'official-desktop-navigation' };
   }
   async create(input, { beforeDispatch } = {}) {
     const selection = createSelection(input);

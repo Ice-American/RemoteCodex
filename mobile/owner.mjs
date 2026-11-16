@@ -18,6 +18,13 @@ const validOwner = value => typeof value === 'string' && value.length > 0 && val
 const revision = value => Number.isSafeInteger(value) && value >= 0 || typeof value === 'string' && value.length > 0 && value.length <= 200;
 const failure = (message, code = 'OWNER_UNAVAILABLE') => Object.assign(Error(message), { code });
 
+// Desktop can expose history and a residual idle runtime before resuming.
+// Only its explicit resumed state permits actions or confirms loading.
+export function ownerSnapshotReady(snapshot) {
+  return snapshot?.status?.confirmed === true && snapshot.state?.resumeState === 'resumed' &&
+    ['idle', 'active'].includes(snapshot.state?.threadRuntimeStatus?.type);
+}
+
 export class OwnerClient extends EventEmitter {
   constructor({ socketPath, verifyEndpoint, pipeFactory = path => new Pipe(path, 'desktop'),
     protocolVersions = {}, hostId = 'local', timeoutMs = 15000, operations = new Map(),
@@ -34,6 +41,7 @@ export class OwnerClient extends EventEmitter {
     this.snapshots = new Map();
     this.waiters = new Set();
     this.followIntents = new Map();
+    this.freshSnapshots = new Map();
     this.nativeSubscriptions = new Map();
     // A process restart cannot establish whether an earlier write reached
     // Desktop. Retain its fence and expose uncertainty instead of replaying it.
@@ -116,6 +124,7 @@ export class OwnerClient extends EventEmitter {
     this.abort?.abort();
     for (const intent of this.followIntents.values()) intent.abort();
     this.followIntents.clear();
+    this.freshSnapshots.clear();
     this.nativeSubscriptions.clear();
     this.owners.clear();
     this.snapshots.clear();
@@ -169,7 +178,7 @@ export class OwnerClient extends EventEmitter {
     const intent = new AbortController();
     this.followIntents.set(threadId, intent);
     this.owners.delete(threadId);
-    this.unknown(threadId, 'Refreshing Desktop owner');
+    this.unknown(threadId, 'Refreshing Desktop owner', { refreshing: true });
     const result = await this.#rpc('owner', { hostId: this.hostId, conversationId: threadId }, { signal: intent.signal });
     if (!validOwner(result.handledByClientId)) throw failure('No live Desktop owner was found');
     if (connection.generation !== this.generation || this.followIntents.get(threadId) !== intent || intent.signal.aborted)
@@ -195,6 +204,7 @@ export class OwnerClient extends EventEmitter {
     const native = this.nativeSubscriptions.get(threadId);
     this.followIntents.get(threadId)?.abort();
     this.followIntents.delete(threadId);
+    this.freshSnapshots.delete(threadId);
     this.nativeSubscriptions.delete(threadId);
     this.owners.delete(threadId);
     // Clear local facts before sending, so a queued frame cannot revive a
@@ -223,7 +233,7 @@ export class OwnerClient extends EventEmitter {
     try { this.version(key); } catch { return false; }
     if (!WRITES.has(key)) return true;
     const owner = this.owners.get(threadId), snapshot = this.snapshots.get(threadId);
-    if (!owner?.supportsUntrustedAppInput || !snapshot?.status.confirmed ||
+    if (!owner?.supportsUntrustedAppInput || !ownerSnapshotReady(snapshot) ||
         owner.generation !== this.generation || snapshot.generation !== this.generation || snapshot.owner !== owner.owner)
       return false;
     if (key === 'start') return snapshot.status.type === 'idle';
@@ -236,8 +246,22 @@ export class OwnerClient extends EventEmitter {
     return value ? clone(value) : null;
   }
   async freshSnapshot(threadId, { timeoutMs = this.timeoutMs } = {}) {
+    const connection = this.currentConnection(), current = this.freshSnapshots.get(threadId);
+    // GET, SSE and an explicit action can all require the same fresh state.
+    // Share that read; only departure or connection loss cancels its follower.
+    if (current?.generation === connection.generation) return clone(await current.promise);
+    let resolve, reject;
+    const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+    const record = { generation: connection.generation, promise };
+    this.freshSnapshots.set(threadId, record);
+    this.#freshSnapshot(threadId, timeoutMs).then(resolve, reject).finally(() => {
+      if (this.freshSnapshots.get(threadId) === record) this.freshSnapshots.delete(threadId);
+    });
+    return clone(await promise);
+  }
+  async #freshSnapshot(threadId, timeoutMs) {
     const minimum = this.sequence;
-    this.unknown(threadId, 'Waiting for a fresh owner snapshot');
+    this.unknown(threadId, 'Waiting for a fresh owner snapshot', { refreshing: true });
     const owner = await this.follow(threadId);
     this.currentConnection();
     if (this.owners.get(threadId)?.owner !== owner.owner || !this.nativeSubscriptions.has(threadId))
@@ -255,9 +279,9 @@ export class OwnerClient extends EventEmitter {
       this.waiters.add(waiter);
     });
   }
-  unknown(threadId, reason) {
+  unknown(threadId, reason, { refreshing = false } = {}) {
     this.snapshots.delete(threadId);
-    this.publish('unknown', { threadId, reason });
+    this.publish('unknown', { threadId, reason, ...(refreshing ? { refreshing: true } : {}) });
   }
   receive(frame, pipe, generation) {
     if (!this.connected || this.pipe !== pipe || this.generation !== generation || frame.type !== 'broadcast' ||
@@ -293,7 +317,7 @@ export class OwnerClient extends EventEmitter {
       throw failure('The Desktop owner does not accept input from this client', 'INPUT_NOT_SUPPORTED');
     if (expectedOwner !== owner.owner || expectedTurnId !== snapshot.activeTurnId)
       throw failure('The owner or active turn changed; review the current state', 'STALE_OWNER_STATE');
-    if (!snapshot.status.confirmed) throw failure('The Desktop runtime state is unknown');
+    if (!ownerSnapshotReady(snapshot)) throw failure('The Desktop thread has not resumed with a confirmed runtime state');
     return snapshot;
   }
   operation(record) {

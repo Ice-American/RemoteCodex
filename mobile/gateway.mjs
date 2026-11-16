@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { gzipSync } from 'node:zlib';
-import { OwnerClient } from './owner.mjs';
+import { OwnerClient, ownerSnapshotReady } from './owner.mjs';
 import { fetchPeer } from './peer.mjs';
 import { readOwnerProtocols } from './protocols.mjs';
 import { discoverNativeDesktop, codexHome } from './discovery.mjs';
@@ -22,6 +22,17 @@ const mime = { '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript; ch
   '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
 const digest = text => crypto.createHash('sha256').update(text).digest('hex');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const loadError = (message, code) => Object.assign(Error(message), { code });
+async function cancellable(promise, signal) {
+  if (!signal) return promise;
+  let abort;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      abort = () => reject(signal.reason);
+      if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+    })]);
+  } finally { signal.removeEventListener('abort', abort); }
+}
 const sendBytes = (res, code, bytes, headers) => {
   const gzip = bytes.length > 512 && /(?:^|,)\s*gzip(?:\s*;\s*q=(?!0(?:\.0*)?(?:,|$))[^,]*)?(?:,|$)/i.test(res.req?.headers['accept-encoding'] ?? '');
   res.writeHead(code, { ...headers, Vary: 'Accept-Encoding', ...(gzip ? { 'Content-Encoding': 'gzip' } : {}) });
@@ -38,6 +49,7 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   hostName = hostId === 'mac' ? 'Mac' : 'Windows', peers = [], dir = dataDirectory(),
   discover = discoverNativeDesktop, secrets = new Secrets(dir), journal = new Journal(dir),
   catalog = new ThreadCatalog(codexHome()), nativeTools = new NativeTools({ discover }),
+  loadTimeoutMs = 12000,
 } = {}) {
   const key = await secrets.get('self', { create: true });
   const assets = new Map(await Promise.all((await fs.readdir(publicDir)).filter(name => mime[path.extname(name)]).map(async name => [name, await fs.readFile(path.join(publicDir, name))])));
@@ -59,6 +71,24 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   const peerMap = new Map(peers.map(p => [p.id, p]));
   let client = null, connecting = null, identity = null, closed = false;
   const clients = new Set();
+  const activeThreads = new Map(), pendingUnfollows = new Set(), loads = new Map();
+
+  function releaseFollower(id) {
+    if ([...clients].some(listener => listener.id === id)) return;
+    watches.delete(id);
+    if (activeThreads.get(id)) { pendingUnfollows.add(id); return; }
+    pendingUnfollows.delete(id); client?.unfollow(id);
+  }
+  function holdThread(id) {
+    activeThreads.set(id, (activeThreads.get(id) ?? 0) + 1);
+    return () => {
+      const remaining = activeThreads.get(id) - 1;
+      if (remaining) activeThreads.set(id, remaining); else activeThreads.delete(id);
+      // An old stream may close after its replacement GET or explicit action
+      // has started. Release only after those users finish with the follower.
+      if (!remaining && pendingUnfollows.has(id)) releaseFollower(id);
+    };
+  }
 
   async function ensureClient() {
     if (client?.connected) return client;
@@ -70,6 +100,9 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
         protocolVersions: protocols, timeoutMs: 8000, operations: new Map(journal.records),
         onOperation: r => journal.save({ ...r, ...operationContexts.get(r.operationId) }) });
       created.subscribe(event => {
+        // Refreshing already has a read in progress. Re-reading its temporary
+        // unknown state would otherwise create an SSE refresh feedback loop.
+        if (event.type === 'unknown' && event.refreshing) return;
         if (['snapshot', 'connection', 'unknown'].includes(event.type)) {
           for (const listener of clients) if (!event.threadId || event.threadId === listener.id) listener.schedule();
         }
@@ -82,22 +115,80 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   }
   async function state(id, { refresh = false } = {}) {
     if (!validThreadId(id)) throw Error('无效聊天标识');
-    let live, error = null;
-    try { const owner = await ensureClient(); live = refresh || !owner.snapshot(id) ? await owner.freshSnapshot(id) : owner.snapshot(id); }
-    catch (e) { error = e.code ?? '暂时无法读取原会话'; }
-    const metadata = live?.state?.title ? null : await catalog.get(id);
+    const release = holdThread(id);
+    try {
+      let live, error = null;
+      try { const owner = await ensureClient(); live = refresh || !owner.snapshot(id) ? await owner.freshSnapshot(id) : owner.snapshot(id); }
+      catch (e) { error = e.code ?? '暂时无法读取原会话'; }
+      return await view(id, live, error);
+    } finally { release(); }
+  }
+  async function view(id, live, error = null, knownMetadata) {
+    const ready = ownerSnapshotReady(live) && client?.connected === true && live.generation === client.generation &&
+      client.owners.get(id)?.owner === live.owner;
+    const metadata = knownMetadata === undefined ? ready && live?.state?.title ? null : await catalog.get(id) : knownMetadata;
     const messages = live ? visibleTurns(live.state) : (await catalog.read(id)).messages;
     const status = live?.status?.type ?? 'unknown';
-    return { host: hostId, id, title: live?.state?.title ?? metadata?.title ?? '原聊天', connected: !!live,
-      ownerConfirmed: !!live, revision: live?.revision ?? null, connectionId: live ? String(live.generation) + ':' + live.owner : null,
-      ownerId: live?.owner ?? null, activeTurnId: live?.activeTurnId ?? null, status, messages,
-      questions: live ? questionViews(live.state) : [], approvals: live ? approvalViews(live.state) : [],
-      capabilities: { send: !!live && status === 'idle' && client.supports(id, 'start'),
-        steer: !!live && status === 'running' && client.supports(id, 'steer'),
-        answer: !!live && (client.supports(id, 'userInput') || client.supports(id, status === 'idle' ? 'start' : 'steer')),
-        approve: !!live && ['commandApproval', 'fileApproval', 'permissions', 'mcpElicitation'].some(k => client.supports(id, k)),
-        interrupt: !!live && status === 'running' && client.supports(id, 'interrupt') },
+    const canLoad = !ready && client?.connected === true && !client.pipe?.socket?.destroyed && metadata?.id === id &&
+      typeof nativeTools.openExistingThread === 'function';
+    return { host: hostId, id, title: live?.state?.title ?? metadata?.title ?? '原聊天', connected: ready,
+      connectionState: ready ? 'ready' : canLoad ? 'needs-load' : 'unavailable', canLoad: !!canLoad,
+      ownerConfirmed: ready, revision: ready ? live.revision : null, connectionId: ready ? String(live.generation) + ':' + live.owner : null,
+      ownerId: ready ? live.owner : null, activeTurnId: ready ? live.activeTurnId : null, status, messages,
+      questions: ready ? questionViews(live.state) : [], approvals: ready ? approvalViews(live.state) : [],
+      capabilities: { send: ready && status === 'idle' && client.supports(id, 'start'),
+        steer: ready && status === 'running' && client.supports(id, 'steer'),
+        answer: ready && (client.supports(id, 'userInput') || client.supports(id, status === 'idle' ? 'start' : 'steer')),
+        approve: ready && ['commandApproval', 'fileApproval', 'permissions', 'mcpElicitation'].some(k => client.supports(id, k)),
+        interrupt: ready && status === 'running' && client.supports(id, 'interrupt') },
       source: live ? live.source : 'local-history-only', error };
+  }
+  async function loadExisting(id, signal) {
+    const metadata = await cancellable(catalog.get(id), signal);
+    if (metadata?.id !== id) throw Error('原聊天不在当前电脑目录中，未打开其他聊天');
+    const owner = await cancellable(ensureClient(), signal), connection = owner.currentConnection();
+    if (typeof nativeTools.openExistingThread !== 'function') throw Error('当前电脑尚不支持加载原聊天');
+    let record = loads.get(id);
+    if (!record || record.owner !== owner || record.generation !== connection.generation) {
+      const controller = new AbortController();
+      record = { owner, generation: connection.generation, controller, consumers: new Set(), settled: false };
+      loads.set(id, record);
+      const timeout = setTimeout(() => controller.abort(loadError('尚未确认原聊天已加载，请稍后重试。', 'LOAD_TIMEOUT')), loadTimeoutMs);
+      const lost = () => controller.abort(loadError('官方桌面连接已变化，请重新读取原聊天。', 'CONNECTION_INTERRUPTED'));
+      connection.signal.addEventListener('abort', lost, { once: true });
+      const current = record;
+      record.promise = Promise.resolve().then(async () => {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        // Opening is navigation only. Its ACK cannot establish a live owner,
+        // and this path never sends a turn, answer, approval or interrupt.
+        await cancellable(nativeTools.openExistingThread(id, { signal: controller.signal }), controller.signal);
+        let snapshot;
+        while (!controller.signal.aborted) {
+          try {
+            snapshot = await cancellable(owner.freshSnapshot(id, { timeoutMs: Math.min(1500, loadTimeoutMs) }), controller.signal);
+            if (ownerSnapshotReady(snapshot)) break;
+          } catch (error) { if (controller.signal.aborted) throw controller.signal.reason; }
+          await cancellable(sleep(250), controller.signal);
+        }
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (!owner.connected || owner !== client || owner.generation !== connection.generation)
+          throw loadError('官方桌面连接已变化，请重新读取原聊天。', 'CONNECTION_INTERRUPTED');
+        return { status: 'confirmed', message: '原聊天已加载，可以继续对话。', state: await view(id, snapshot, null, metadata) };
+      }).catch(async error => ({ status: 'rejected', message: error?.message ?? '暂时无法加载原聊天，请稍后重试。',
+        state: await view(id, null, error?.code ?? 'LOAD_UNAVAILABLE', metadata) }))
+        .finally(() => {
+          current.settled = true; clearTimeout(timeout); connection.signal.removeEventListener('abort', lost);
+          if (loads.get(id) === current) loads.delete(id);
+        });
+    }
+    // Separate HTTP clients can join one navigation. One departed phone must
+    // not cancel the other, but no remaining caller permits a late navigation.
+    const consumer = {}; record.consumers.add(consumer);
+    try { return structuredClone(await cancellable(record.promise, signal)); }
+    finally {
+      record.consumers.delete(consumer);
+      if (!record.settled && !record.consumers.size) record.controller.abort(loadError('加载已取消。', 'LOAD_CANCELLED'));
+    }
   }
   async function statuses(ids) {
     let rows = [], partial = false;
@@ -115,9 +206,15 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       return { id, status: 'unknown', statusConfirmed: false, observedAt: null };
     }), partial };
   }
-  async function action(input) {
+  async function action(input, { signal } = {}) {
     const { threadId: id, operationId } = input;
     if (!validThreadId(id) || typeof operationId !== 'string' || !/^[\w-]{8,160}$/.test(operationId)) throw Error('操作标识无效');
+    const release = holdThread(id);
+    try { return await performAction(input, signal); }
+    finally { release(); }
+  }
+  async function performAction(input, signal) {
+    const { threadId: id, operationId } = input;
     const apiFingerprint = requestFingerprint({ host: hostId, id, action: input.action,
       text: input.text, requestId: input.requestId, answers: input.answers, choice: input.choice });
     const previous = journal.records.get(operationId);
@@ -125,6 +222,10 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       if (previous.apiFingerprint && previous.apiFingerprint !== apiFingerprint) throw Object.assign(Error('此发送标识已用于不同内容'), { notDispatched: true });
       return { status: previous.status === 'submitted' ? 'confirmed' : previous.status === 'dispatched' ? 'unknown' : previous.status,
         message: '此操作已有发送收据，未重复发送', deduplicated: true };
+    }
+    if (input.action === 'load') {
+      if (Object.keys(input).some(key => !['host', 'threadId', 'operationId', 'action'].includes(key))) throw Error('加载原聊天不能包含消息或其他操作');
+      return await loadExisting(id, signal);
     }
     operationContexts.set(operationId, { apiFingerprint });
     try {
@@ -242,14 +343,18 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       if (url.pathname === '/api/create' && req.method === 'POST') return sendJson(res, 200, await creation.create(input));
       if (url.pathname === '/api/thread' && req.method === 'GET') return sendJson(res, 200, await state(url.searchParams.get('id'), { refresh: true }));
       if (url.pathname === '/api/action' && req.method === 'POST') {
-        try { return sendJson(res, 200, await action(input)); }
+        const controller = new AbortController();
+        const gone = () => controller.abort(loadError('加载已取消。', 'LOAD_CANCELLED'));
+        res.once('close', gone);
+        try { const result = await action(input, { signal: controller.signal }); if (!res.destroyed) return sendJson(res, 200, result); }
         catch (e) {
           // Only an absent dispatch receipt proves that retrying is safe. A lost
           // native reply retains its fence even if the HTTP client disappeared.
           const receipt = journal.records.get(input.operationId);
-          return sendJson(res, 200, { status: receipt && !e.notDispatched ? 'unknown' : 'rejected',
+          if (!res.destroyed) return sendJson(res, 200, { status: receipt && !e.notDispatched ? 'unknown' : 'rejected',
             message: receipt && !e.notDispatched ? '发送结果未知，请先查看原会话，勿重复提交' : e.message });
-        }
+        } finally { res.off('close', gone); }
+        return;
       }
       if (url.pathname === '/api/events' && req.method === 'GET') {
         const id = url.searchParams.get('id'); if (!validThreadId(id)) throw Error('无效聊天标识');
@@ -266,13 +371,12 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
           finally { busy = false; }
         };
         const listener = { id, schedule: () => { if (!timer && !stopped) timer = setTimeout(() => { timer = null; push(); }, 100); } };
-        clients.add(listener); watches.add(id); res.on('drain', listener.schedule);
+        clients.add(listener); watches.add(id); pendingUnfollows.delete(id); res.on('drain', listener.schedule);
         res.once('close', () => { stopped = true; clients.delete(listener); res.off('drain', listener.schedule); clearTimeout(timer); clearInterval(heartbeat);
-          if (![...clients].some(c => c.id === id)) { watches.delete(id); client?.unfollow(id); }
+          releaseFollower(id);
         });
         heartbeat = setInterval(() => { if (!stopped && !res.destroyed && !res.writableNeedDrain) res.write('event: ping\ndata: {}\n\n'); }, 15000);
         await push();
-        if (stopped && ![...clients].some(c => c.id === id)) client?.unfollow(id);
         return;
       }
       return sendJson(res, 404, { error: 'Not found' });
@@ -289,6 +393,8 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   }, 5000);
   recovery.unref();
   return { server, port: server.address().port, hostId, state, action, secrets,
-    async close() { closed = true; clearInterval(recovery); client?.close(); nativeTools.close?.(); for (const listener of clients) listener.schedule = () => {};
+    async close() { closed = true; clearInterval(recovery);
+      for (const record of loads.values()) record.controller.abort(loadError('加载已取消。', 'LOAD_CANCELLED'));
+      client?.close(); nativeTools.close?.(); for (const listener of clients) listener.schedule = () => {};
       server.closeAllConnections(); await new Promise(r => server.close(r)); } };
 }

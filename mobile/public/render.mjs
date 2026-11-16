@@ -7,6 +7,7 @@ const statusLabels = {
 const statusType = (state) => typeof state?.status === 'string' ? state.status : state?.status?.type;
 const isRunning = (state) => ['running', 'working', 'inProgress'].includes(statusType(state));
 const isHistoryOnly = (state) => state?.source === 'local-history-only';
+const needsLoad = (state) => state?.connectionState === 'needs-load';
 const scopeOf = (state) => JSON.stringify([state?.host ?? '', state?.id ?? '']);
 const stringify = (value) => { try { return JSON.stringify(value, null, 2); } catch { return '详情无法显示'; } };
 // A compact local lookup key, not an authorization token. The server validates the full owner request.
@@ -30,6 +31,7 @@ export function viewportMetrics(viewport, fallbackHeight) {
 
 export function canAct(state, action, transportConnected = true) {
   if (isHistoryOnly(state) || !transportConnected || state?.connected !== true || state?.ownerConfirmed !== true) return false;
+  if (state.connectionState != null && state.connectionState !== 'ready') return false;
   if (!state.connectionId || !state.ownerId || state.revision == null) return false;
   const capability = action === 'approval' ? 'approve' : action === 'send' && isRunning(state) ? 'steer' : action;
   return state.capabilities?.[capability] === true && (action !== 'interrupt' || !!state.activeTurnId);
@@ -250,7 +252,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   let creationOpen = false, creationReturnDrawer = false, creationGeneration = 0, creationBusy = false, creationLoading = false, creationHost = initialHost;
   let creation = null, creationError = '', creationResult = null, creationDesiredProject = null, creationSelectedProjectId = '';
   let creationProjectsOpen = false, creationRead = null;
-  const createDrafts = new Map(), threadRowViews = new Map();
+  const createDrafts = new Map(), threadRowViews = new Map(), loadAttempts = new Map();
   let connected = false, destroyed = false, closeEvents = () => {}, loading = false, drawerOpen = false;
   const later = (fn, ms) => timers.setTimeout(fn, ms), cancel = id => { if (id != null) timers.clearTimeout(id); };
   const now = () => typeof timers.now === 'function' ? timers.now() : Date.now();
@@ -275,6 +277,12 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const refresh = button('刷新', 'text-button', () => refreshCurrent()); connection.append(connectionLabel, refresh);
   const notice = node('div', 'notice'); notice.hidden = true; notice.setAttribute('role', 'status'); notice.setAttribute('aria-live', 'polite');
   const main = node('main', 'conversation'); main.setAttribute('aria-label', '聊天记录');
+  const loadPanel = node('section', 'load-thread-panel'); loadPanel.hidden = true;
+  const loadHeading = node('h2', '', '原聊天尚未在电脑上加载');
+  const loadHint = node('p', 'load-thread-hint', '此操作会在电脑上打开原聊天，可能切换电脑前台。草稿会保留，连接确认后才能发送。');
+  const loadButton = button('在电脑上加载原会话', 'load-thread-button', () => loadOriginalThread());
+  const loadResult = node('p', 'load-thread-result'); loadResult.setAttribute('role', 'status'); loadResult.setAttribute('aria-live', 'polite'); loadResult.hidden = true;
+  loadPanel.append(loadHeading, loadHint, loadButton, loadResult);
   const empty = node('div', 'empty-state', '从对话列表选择一个已有对话。');
   const messages = node('div', 'messages'), requests = node('div', 'request-cards');
   main.append(empty, messages, requests);
@@ -286,7 +294,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const send = node('button', 'send-button', '发送'); send.type = 'submit';
   composeRow.append(input, send);
   const composeFoot = node('div', 'composer-foot'), draftHint = node('span', 'draft-hint', '草稿只保存在本设备'), interrupt = button('停止运行', 'stop-button', () => stopTurn());
-  interrupt.hidden = true; composeFoot.append(draftHint, interrupt); composer.append(composerHint, composeRow, composeFoot);
+  interrupt.hidden = true; composeFoot.append(draftHint, interrupt); composer.append(loadPanel, composerHint, composeRow, composeFoot);
   const backdrop = button('关闭对话列表', 'drawer-backdrop', () => setDrawer(false)); backdrop.hidden = true; backdrop.tabIndex = -1;
   const drawer = node('aside', 'thread-drawer'); drawer.id = 'thread-drawer'; drawer.hidden = true; drawer.setAttribute('aria-label', '已有对话列表');
   const drawerHeading = node('div', 'drawer-heading'); drawerHeading.append(node('h2', '', '聊天'), button('新建', 'drawer-new-chat', () => openCreation()), button('刷新', 'text-button drawer-refresh', () => loadThreads()), button('关闭', 'text-button', () => setDrawer(false)));
@@ -574,12 +582,19 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (hostError || listError) threadList.append(node('p', 'list-empty', [hostError, listError].filter(Boolean).join('；')));
     else if (!filtered.length) threadList.append(node('p', 'list-empty', listLoading ? '正在读取对话…' : query ? '当前范围没有匹配对话，可切换全部历史' : selectedRange === 'week' ? '最近7天没有对话，可切换全部历史' : '这台电脑暂未返回已有对话'));
   }
-  function writeAllowed(action) { return canAct(state, action, connected); }
+  function writeAllowed(action) { return !loadAttempts.get(currentScope())?.pending && canAct(state, action, connected); }
   function sendKey(text) { return JSON.stringify([currentScope(), 'send', fingerprint(text)]); }
   function renderStatus() {
     title.textContent = state?.title || (selectedId ? '正在读取对话…' : 'Codex 随行');
     subtitle.textContent = state ? (hosts.find((host) => host.id === selectedHost)?.name || selectedHost) + (isHistoryOnly(state) ? ' · 只读历史' : ' · 原桌面会话') : '选择一个已有对话';
-    connectionLabel.textContent = !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
+    connectionLabel.textContent = !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
+    const loadAttempt = loadAttempts.get(currentScope());
+    loadPanel.hidden = !needsLoad(state);
+    loadButton.hidden = state?.canLoad !== true || typeof api.action !== 'function';
+    loadButton.disabled = !!loadAttempt?.pending;
+    loadButton.textContent = loadAttempt?.pending ? '正在连接原聊天…' : loadAttempt ? '重试连接原聊天' : '在电脑上加载原会话';
+    loadResult.textContent = loadAttempt?.message || (needsLoad(state) && state?.canLoad !== true ? '请在电脑上打开这个原聊天，再刷新手机页面。' : '');
+    loadResult.hidden = !loadResult.textContent;
     connection.classList.toggle('disconnected', !!selectedId && !connected);
     titleRunning.hidden = !connected || state?.ownerConfirmed !== true || isHistoryOnly(state) || !isRunning(state);
     const selectedRow = threadRowViews.get(selectedId); if (selectedRow) updateRowStatus(selectedRow.item, selectedRow);
@@ -590,7 +605,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     interrupt.hidden = !state?.activeTurnId;
     const stopAttempt = gate.get(JSON.stringify([currentScope(), 'interrupt', state?.activeTurnId]));
     interrupt.disabled = !writeAllowed('interrupt') || !!stopAttempt && stopAttempt.status !== 'rejected';
-    composerHint.textContent = !selectedId ? '先选择对话' : isHistoryOnly(state) ? '只读历史，原会话未连接；草稿会保留' : !connected ? '连接恢复后才能发送，草稿会保留' : !state?.ownerConfirmed ? '等待原会话确认，草稿会保留' : !writeAllowed('send') ? (isRunning(state) ? '运行中，当前连接暂不支持补充方向' : '当前状态只读，不能发送') : isRunning(state) ? '运行中发送会补充当前方向' : '继续这个对话';
+    composerHint.textContent = !selectedId ? '先选择对话' : loadAttempt?.pending ? '正在连接原聊天，草稿会保留' : needsLoad(state) ? '先在电脑上加载原聊天，草稿会保留' : isHistoryOnly(state) ? '只读历史，原会话未连接；草稿会保留' : !connected ? '连接恢复后才能发送，草稿会保留' : !state?.ownerConfirmed ? '等待原会话确认，草稿会保留' : !writeAllowed('send') ? (isRunning(state) ? '运行中，当前连接暂不支持补充方向' : '当前状态只读，不能发送') : isRunning(state) ? '运行中发送会补充当前方向' : '继续这个对话';
     draftHint.textContent = attempt?.status === 'unknown' ? '结果未确认，此内容已禁止重复发送' : attempt?.status === 'submitted' ? '已提交，保留草稿并等待确认' : '草稿只保存在本设备';
   }
   function renderMessages() {
@@ -687,7 +702,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (state?.connectionId === next.connectionId && typeof next.revision === 'number' && typeof state.revision === 'number' && next.revision < state.revision) return false;
     const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 100;
     // Disk history can display messages, but it can never establish a live owner or authorize writes.
-    state = next; connected = next.connected === true && next.ownerConfirmed === true && !isHistoryOnly(next); loading = false;
+    state = next; connected = next.connected === true && next.ownerConfirmed === true && !isHistoryOnly(next) && (next.connectionState == null || next.connectionState === 'ready'); loading = false;
     render({ navigation: navigated }); if (atBottom) main.scrollTop = main.scrollHeight; return true;
   }
   async function loadThreads({ append = false } = {}) {
@@ -784,6 +799,11 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
         const result = await Promise.race([api.getThread(host, id, { signal: attempt.controller.signal }), timeout, cancelled]);
         if (!current()) return;
         if (!update(result)) throw Error('返回的会话与当前电脑不匹配，请重新读取。');
+        // A known unloaded chat needs user intent to open its desktop window.
+        // Repeating network reads cannot load it, and must never trigger a POST.
+        if (needsLoad(result)) {
+          clearRecovery(); if (recoveryNotice) showNotice(''); renderStatus(); return;
+        }
         if (!connected) throw Error('原桌面会话尚未连接。');
         // subscribe() may report an unavailable EventSource synchronously. The
         // GET is complete, so that failure must start recovery rather than join it.
@@ -822,6 +842,39 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   async function refreshCurrent() {
     if (selectedId) return recover({ immediate: true });
     return loadThreads();
+  }
+  async function loadOriginalThread() {
+    const scope = currentScope();
+    if (destroyed || !selectedId || !needsLoad(state) || state?.canLoad !== true || typeof api.action !== 'function' || loadAttempts.get(scope)?.pending) return;
+    const host = selectedHost, threadId = selectedId, navigation = generation;
+    const current = () => !destroyed && navigation === generation && scope === currentScope();
+    const attempt = { pending: true, operationId: operationId(), message: '正在电脑上打开原聊天，请稍候。' };
+    let accepted = false;
+    loadAttempts.set(scope, attempt); renderStatus(); renderRequests();
+    try {
+      // Loading opens the existing chat. It carries no draft, owner action,
+      // approval or placeholder message, and is dispatched only by this click.
+      const response = await api.action({ host, threadId, operationId: attempt.operationId, action: 'load' });
+      accepted = response?.status === 'confirmed' || response?.status === 'submitted';
+      attempt.message = response?.status === 'rejected' ? response.message || '未能加载原聊天，可以重试。' :
+        accepted ? '已请求加载，正在确认原聊天连接。' : '加载结果未确认，请刷新状态后再重试。';
+    } catch { attempt.message = '加载结果未确认，请刷新状态后再重试。'; }
+    // A receipt, including response.state, cannot grant send authority. Read
+    // the selected owner afresh, and never redirect navigation on a late reply.
+    if (current()) {
+      // A GET already in flight may predate the load. Retire it before checking
+      // the resulting desktop owner, including when a refresh raced this click.
+      stopReadAndStream(); await recover({ immediate: true });
+    }
+    attempt.pending = false;
+    if (current()) {
+      if (!connected && accepted) attempt.message = '原聊天连接尚未确认，可以刷新状态或重试连接。';
+      renderStatus(); renderRequests();
+    } else if (!destroyed && scope === currentScope()) {
+      // Returning to the same chat retires the old navigation. Unlock only its
+      // load button; the current snapshot still controls every owner action.
+      attempt.message = '之前的连接请求已结束，请刷新原聊天状态。'; renderStatus(); renderRequests();
+    }
   }
   async function dispatch(action, key) {
     if (!writeAllowed(action.action)) return;

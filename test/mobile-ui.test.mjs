@@ -306,6 +306,104 @@ test('local history is visibly read-only even when inconsistent live capability 
   view.update(thread({ revision: 2 })); assert.equal(one(root, 'send-button').disabled, false);
 });
 
+const unloadedThread = (overrides = {}) => thread({ connectionState: 'needs-load', canLoad: true, connected: false,
+  ownerConfirmed: false, connectionId: null, ownerId: null, revision: null, ...overrides });
+
+test('an unloaded original chat offers an explicit load action without treating it as a network failure', async (t) => {
+  const timers = fakeClock(); let reads = 0, posts = 0;
+  const { root } = mount(t, { getThread: async () => { reads++; return unloadedThread(); }, action: async () => { posts++; } },
+    { initialThreadId: thread().id, timers });
+  await tick(); type(root, '保留原聊天草稿');
+  assert.equal(one(root, 'connection-label').textContent, '原聊天尚未在电脑上加载');
+  assert.equal(one(root, 'load-thread-panel').hidden, false); assert.equal(one(root, 'load-thread-button').disabled, false);
+  assert.equal(one(root, 'load-thread-panel').parentNode, one(root, 'composer'), 'loading remains visible beside the draft even at the bottom of a long chat');
+  assert.ok(one(root, 'load-thread-hint').textContent.includes('电脑前台'));
+  assert.equal(one(root, 'send-button').disabled, true); assert.equal(posts, 0);
+  await timers.advance(30000); assert.equal(reads, 1); assert.equal(posts, 0);
+  assert.equal(one(root, 'message-input').value, '保留原聊天草稿');
+});
+
+test('loading coalesces clicks and requires a fresh owner read before enabling the retained draft', async (t) => {
+  const pending = deferred(), fresh = deferred(), writes = []; let reads = 0;
+  const { root } = mount(t, { getThread: async () => ++reads === 1 ? unloadedThread() : fresh.promise,
+    action: body => { writes.push(body); return pending.promise; } }, { initialThreadId: thread().id });
+  await tick(); type(root, '加载不是发送此草稿');
+  one(root, 'load-thread-button').click(); one(root, 'load-thread-button').click();
+  assert.equal(writes.length, 1); assert.deepEqual(Object.keys(writes[0]).sort(), ['action', 'host', 'operationId', 'threadId']);
+  assert.equal(writes[0].action, 'load'); assert.equal(writes[0].threadId, thread().id); assert.equal(writes[0].host, 'mac');
+  assert.match(writes[0].operationId, /^[\da-f-]{36}$/i);
+  pending.resolve({ status: 'confirmed', state: thread({ connectionState: 'ready' }), message: '已打开原聊天' }); await tick();
+  assert.equal(reads, 2); assert.equal(one(root, 'send-button').disabled, true); assert.equal(one(root, 'load-thread-button').disabled, true);
+  assert.equal(one(root, 'message-input').value, '加载不是发送此草稿'); assert.equal(byClass(root, 'message-user').length, 0);
+  fresh.resolve(thread({ connectionState: 'ready', canLoad: false, revision: 2 })); await tick();
+  assert.equal(one(root, 'send-button').disabled, false); assert.equal(one(root, 'load-thread-panel').hidden, true);
+  assert.equal(one(root, 'message-input').value, '加载不是发送此草稿'); assert.equal(writes.length, 1);
+});
+
+test('an unconfirmed load keeps the draft locked and permits only an explicit load retry', async (t) => {
+  const timers = fakeClock(), writes = []; let reads = 0;
+  const { root, doc, view } = mount(t, { getThread: async () => { reads++; return unloadedThread(); },
+    action: async body => { writes.push(body); if (writes.length === 1) throw Error('connection lost'); return { status: 'rejected', message: '请在电脑上重试' }; } },
+    { initialThreadId: thread().id, timers });
+  await tick(); type(root, '尚未确认的草稿'); one(root, 'load-thread-button').click(); await tick(); await tick();
+  assert.equal(writes.length, 1); assert.equal(one(root, 'send-button').disabled, true); assert.equal(one(root, 'load-thread-button').disabled, false);
+  assert.ok(one(root, 'load-thread-result').textContent.includes('未确认'));
+  doc.defaultView.fire('online'); await view.refresh(); await timers.advance(30000);
+  assert.equal(writes.length, 1); assert.ok(reads >= 2);
+  one(root, 'load-thread-button').click(); await tick(); await tick(); assert.equal(writes.length, 2);
+  assert.notEqual(writes[0].operationId, writes[1].operationId); assert.equal(one(root, 'message-input').value, '尚未确认的草稿');
+});
+
+test('late load receipts cannot change a different host or replay the original load', async (t) => {
+  const pending = deferred(), writes = [], reads = [];
+  const { root, view } = mount(t, { getThreads: async () => ({ threads: [] }), getThread: async (host, id) => { reads.push([host, id]); return host === 'mac' ? unloadedThread({ id }) : thread({ host, id, title: '当前Windows聊天' }); },
+    action: body => { writes.push(body); return pending.promise; } }, { initialThreadId: thread().id });
+  await tick(); type(root, 'Mac草稿'); one(root, 'load-thread-button').click();
+  await view.selectHost('windows'); await view.selectThread('windows-chat'); type(root, 'Windows草稿');
+  pending.resolve({ status: 'confirmed', state: thread({ revision: 99, title: '迟到Mac聊天' }) }); await tick(); await tick();
+  assert.equal(one(root, 'thread-title').textContent, '当前Windows聊天'); assert.equal(one(root, 'message-input').value, 'Windows草稿');
+  assert.equal(one(root, 'load-thread-panel').hidden, true); assert.equal(writes.length, 1);
+  assert.deepEqual(reads, [['mac', thread().id], ['windows', 'windows-chat']]);
+});
+
+test('a load receipt retires an earlier GET and reads a fresh owner after the action', async (t) => {
+  const stale = deferred(), fresh = deferred(), pending = deferred(); let reads = 0, staleSignal;
+  const { root, view } = mount(t, { getThread: (_host, _id, options) => {
+    reads++; if (reads === 1) { staleSignal = options.signal; return stale.promise; } return fresh.promise;
+  }, action: () => pending.promise });
+  view.update(unloadedThread()); type(root, '等待加载后的owner'); const oldRead = view.refresh();
+  one(root, 'load-thread-button').click(); pending.resolve({ status: 'confirmed' }); await tick();
+  assert.equal(staleSignal.aborted, true); assert.equal(reads, 2);
+  stale.resolve(thread({ connectionState: 'ready', revision: 99, title: '加载前的旧读取' })); await tick();
+  assert.equal(one(root, 'send-button').disabled, true); assert.notEqual(one(root, 'thread-title').textContent, '加载前的旧读取');
+  fresh.resolve(thread({ connectionState: 'ready', revision: 2 })); await oldRead; await tick();
+  assert.equal(one(root, 'send-button').disabled, false); assert.equal(one(root, 'message-input').value, '等待加载后的owner');
+});
+
+test('leaving and returning to the same chat cannot leave a late load permanently pending', async (t) => {
+  const pending = deferred(); let reads = 0, posts = 0;
+  const { root, view } = mount(t, { getThread: async (_host, id) => { reads++; return unloadedThread({ id }); },
+    action: () => { posts++; return pending.promise; } }, { initialThreadId: thread().id });
+  await tick(); type(root, '原聊天草稿'); one(root, 'load-thread-button').click();
+  await view.selectThread('other-chat'); await view.selectThread(thread().id);
+  assert.equal(one(root, 'load-thread-button').disabled, true);
+  pending.resolve({ status: 'confirmed', state: thread({ connectionState: 'ready', title: '旧回执' }) }); await tick();
+  assert.equal(reads, 3); assert.equal(posts, 1); assert.equal(one(root, 'load-thread-button').disabled, false);
+  assert.equal(one(root, 'send-button').disabled, true); assert.equal(one(root, 'message-input').value, '原聊天草稿');
+  assert.notEqual(one(root, 'thread-title').textContent, '旧回执');
+});
+
+test('load controls require explicit server capability and cannot weaken unknown send guards', async (t) => {
+  const { root, view } = mount(t, { action: async () => ({ status: 'unknown' }), getThread: async () => thread() });
+  view.update(thread()); type(root, '结果未知的原草稿'); one(root, 'composer').fire('submit'); await tick(); await tick();
+  view.update(unloadedThread()); assert.equal(one(root, 'load-thread-button').disabled, false);
+  view.update(thread({ connectionState: 'ready', revision: 2 })); assert.equal(one(root, 'send-button').disabled, true);
+  view.update(unloadedThread({ canLoad: false })); assert.equal(one(root, 'load-thread-button').hidden, true);
+  view.update(thread({ connectionState: 'unavailable', connected: false, ownerConfirmed: false }));
+  assert.equal(one(root, 'load-thread-panel').hidden, true);
+  for (const connectionState of ['needs-load', 'unavailable']) assert.equal(canAct(thread({ connectionState }), 'send'), false);
+});
+
 test('double submit and unknown results preserve the draft and never append optimistic messages', async (t) => {
   const pending = deferred(), calls = [], state = thread();
   const { root, view } = mount(t, { action: (body) => { calls.push(body); return pending.promise; }, getThread: async () => state });

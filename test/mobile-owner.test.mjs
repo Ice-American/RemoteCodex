@@ -10,7 +10,7 @@ import { OWNER_METHODS, OWNER_SUPPORTED_VERSIONS, readOwnerProtocols } from '../
 const threadId = '11111111-1111-4111-8111-111111111111';
 const otherId = '22222222-2222-4222-8222-222222222222';
 const versions = Object.fromEntries(Object.entries(OWNER_METHODS).map(([key, method]) => [method, OWNER_SUPPORTED_VERSIONS[key].at(-1)]));
-const idle = () => ({ id: threadId, cwd: '/test/workspace', threadRuntimeStatus: { type: 'idle' }, turns: [], requests: [] });
+const idle = () => ({ id: threadId, cwd: '/test/workspace', resumeState: 'resumed', threadRuntimeStatus: { type: 'idle' }, turns: [], requests: [] });
 const running = (turnId = 'turn-1') => ({ ...idle(), threadRuntimeStatus: { type: 'active', activeFlags: [] },
   turns: [{ turnId, status: 'inProgress', items: [] }] });
 
@@ -77,6 +77,35 @@ test('fresh owner snapshots and patches are isolated from callers and foreign so
   assert.equal(client.snapshot(threadId), null);
   assert.ok(seen.includes('unknown'));
   unsubscribe();
+});
+
+test('overlapping fresh reads share one owner lookup without cancelling each other or sharing mutable results', async t => {
+  const { client, pipe } = await fixture(t);
+  let release, lookups = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const request = pipe.request.bind(pipe);
+  pipe.request = async (...args) => { lookups++; await gate; return request(...args); };
+  const results = Promise.allSettled([client.freshSnapshot(threadId), client.freshSnapshot(threadId)]);
+  await new Promise(resolve => setImmediate(resolve)); release();
+  const values = await results;
+  assert.equal(lookups, 1);
+  assert.deepEqual(values.map(value => value.status), ['fulfilled', 'fulfilled']);
+  values[0].value.state.cwd = '/caller-only';
+  assert.equal(values[1].value.state.cwd, '/test/workspace');
+  assert.equal(pipe.following.filter(value => value.params.following).length, 1);
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('an unfollow retires a shared refresh before a later refresh can establish a new subscription', async t => {
+  const { client, pipe } = await fixture(t);
+  pipe.silent = true;
+  const previous = Promise.allSettled([client.freshSnapshot(threadId), client.freshSnapshot(threadId)]);
+  await new Promise(resolve => setImmediate(resolve)); client.unfollow(threadId);
+  pipe.silent = false;
+  const current = client.freshSnapshot(threadId);
+  assert.deepEqual((await previous).map(value => value.reason?.code), ['SUBSCRIPTION_CANCELLED', 'SUBSCRIPTION_CANCELLED']);
+  assert.equal((await current).status.type, 'idle');
+  assert.equal(client.snapshot(threadId).status.type, 'idle');
 });
 
 test('initialize is a live transport handshake even when absent from the ASAR table', async t => {
@@ -185,6 +214,21 @@ test('supports is read-only and follows protocol, input capability and runtime a
   assert.equal(f.client.supports(threadId, 'fileApproval'), false);
   f.client.close();
   assert.equal(f.client.supports(threadId, 'stream'), false);
+});
+
+test('visible history and an idle runtime cannot authorize a turn before the desktop has resumed the thread', async t => {
+  const { client, pipe, options } = await fixture(t);
+  for (const resumeState of ['needs_resume', 'resuming', undefined]) {
+    pipe.state = { ...idle(), resumeState, turns: [{ turnId: 'historical-turn', status: 'completed', items: [
+      { type: 'agentMessage', id: 'historical-answer', text: 'Existing visible answer' },
+    ] }] };
+    const snapshot = await client.freshSnapshot(threadId);
+    assert.equal(snapshot.state.turns[0].items[0].text, 'Existing visible answer');
+    assert.equal(client.supports(threadId, 'start'), false, String(resumeState));
+    assert.equal(client.supports(threadId, 'userInput'), false, String(resumeState));
+    await assert.rejects(client.sendText(threadId, 'Must not dispatch', options), /not resumed|runtime state/);
+  }
+  assert.equal(pipe.writes.length, 0);
 });
 
 test('invalid thread, unsafe patches and a new stream version never become current facts', async t => {

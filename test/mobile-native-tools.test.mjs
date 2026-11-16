@@ -7,8 +7,12 @@ const created = '22222222-2222-4222-8222-222222222222';
 const image = 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1106.6628.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe';
 const endpoint = { path: '\\\\.\\pipe\\codex-browser-use-native-test', pid: 123, image };
 const owner = { platform: 'win32', pid: 123, image, fingerprint: 'native-test', home: '/synthetic' };
+const macOwner = { platform: 'darwin', pid: 123, image: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+  asarPath: '/Applications/ChatGPT.app/Contents/Resources/app.asar', fingerprint: 'mac-native-test', home: '/synthetic' };
 const catalog = ['create_thread', 'list_projects', 'list_threads', 'wait_threads'].map(name => ({ namespace: 'codex_app', name,
   inputSchema: { properties: name === 'create_thread' ? { target: {}, prompt: {} } : {} } }));
+const navigation = { namespace: 'codex_app', name: 'navigate_to_codex_page',
+  inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'] } };
 const success = value => ({ result: { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(value) }] } });
 const local = { projectId: 'real-native-id', projectKind: 'local', hostId: 'local', label: 'red-app', path: 'D:\\Project\\red-app' };
 
@@ -195,4 +199,131 @@ test('status deadline ends a stalled identity read and stops late work before an
   const f = rig({ native: { discover: () => identity, statusTimeoutMs: 20 } });
   await assert.rejects(f.native.statuses([context]), /超时/);
   release(owner); await new Promise(resolve => setImmediate(resolve)); assert.equal(f.pipes.length, 0);
+});
+
+test('Mac opens only the exact existing-chat URL in the verified app without a prompt or tool call', async () => {
+  const checks = [], launches = [];
+  const f = rig({ native: { platform: 'darwin',
+    discover: async options => { checks.push(options); return macOwner; },
+    openRunner: async (...args) => { launches.push(args); return { stdout: '', stderr: '' }; } } });
+  assert.deepEqual(await f.native.openExistingThread(context),
+    { threadId: context, opened: true, source: 'official-desktop-navigation' });
+  assert.equal(checks.length, 2);
+  assert.ok(checks.every(options => options.platform === 'darwin' && options.verifySignature === true));
+  assert.deepEqual(launches.map(([file, args]) => [file, args]),
+    [['/usr/bin/open', ['-g', '-a', '/Applications/ChatGPT.app', 'codex://threads/' + context]]]);
+  assert.deepEqual(f.calls, []); assert.deepEqual(f.events, []);
+});
+
+test('existing-chat navigation rejects input injection and unsupported or closed hosts before discovery', async () => {
+  const inputs = ['new', 'codex://threads/' + context, context + '?prompt=send', context + '/new', context + '\n',
+    { threadId: context, prompt: 'must not send' }, null, undefined];
+  for (const platform of ['darwin', 'win32']) for (const id of inputs) {
+    const f = rig({ native: { platform, openRunner: async () => { assert.fail('must not launch'); } } });
+    await assert.rejects(f.native.openExistingThread(id), /聊天标识/);
+    assert.deepEqual(f.events, []); assert.deepEqual(f.calls, []);
+  }
+  const f = rig(); f.native.close();
+  await assert.rejects(f.native.openExistingThread(context), /关闭/);
+  assert.deepEqual(f.events, []);
+  const unsupportedHost = rig({ native: { platform: 'linux' } });
+  await assert.rejects(unsupportedHost.native.openExistingThread(context), /不支持/);
+  assert.deepEqual(unsupportedHost.events, []);
+});
+
+test('Mac navigation refuses another bundle, missing identity or failed signature and never retries a launch', async () => {
+  for (const identity of [{ ...macOwner, image: '/Users/synthetic/ChatGPT.app/Contents/MacOS/ChatGPT' },
+    { ...macOwner, asarPath: '/another/app.asar' }, { ...macOwner, pid: 0 }, { ...macOwner, fingerprint: '' }]) {
+    const f = rig({ native: { platform: 'darwin', discover: async () => identity,
+      openRunner: async () => { assert.fail('must not launch'); } } });
+    await assert.rejects(f.native.openExistingThread(context), /身份/);
+  }
+  let launches = 0;
+  const failedSignature = rig({ native: { platform: 'darwin', discover: async () => { throw Error('signature failed'); },
+    openRunner: async () => { launches++; } } });
+  await assert.rejects(failedSignature.native.openExistingThread(context), /signature/);
+  assert.equal(launches, 0);
+  const failedLaunch = rig({ native: { platform: 'darwin', discover: async () => macOwner,
+    openRunner: async () => { launches++; throw Error('navigation acknowledgement lost'); } } });
+  await assert.rejects(failedLaunch.native.openExistingThread(context), /acknowledgement/);
+  assert.equal(launches, 1);
+});
+
+test('Mac post-navigation identity drift is not reported as opened or owner ready', async () => {
+  for (const change of [{ pid: 456 }, { fingerprint: 'replaced' }, { image: '/another/ChatGPT' }]) {
+    let checks = 0, launches = 0;
+    const f = rig({ native: { platform: 'darwin', discover: async () => ++checks === 1 ? macOwner : { ...macOwner, ...change },
+      openRunner: async () => { launches++; } } });
+    await assert.rejects(f.native.openExistingThread(context), /身份/);
+    assert.equal(launches, 1); assert.equal(checks, 2); assert.deepEqual(f.calls, []);
+  }
+});
+
+test('Windows navigation uses only the observed navigation schema and returns an acknowledgement without ready', async () => {
+  const f = rig({ catalog: [...catalog, navigation], request: async name => name === navigation.name ?
+    { result: { success: true, contentItems: [{ type: 'inputText', text: 'Navigated' }] } } : undefined });
+  assert.deepEqual(await f.native.openExistingThread(context),
+    { threadId: context, opened: true, source: 'official-desktop-navigation' });
+  const calls = f.calls.filter(call => call.method === 'tools/call');
+  assert.equal(calls.length, 1); assert.equal(calls[0].params.tool, navigation.name);
+  assert.deepEqual(calls[0].params.arguments, { threadId: context });
+  assert.equal(f.creations().length, 0); assert.ok(f.pipes.every(pipe => pipe.socket.destroyed));
+});
+
+test('Windows refuses absent or changed navigation schemas and identity drift before dispatch', async () => {
+  for (const schema of [null, { properties: {} }, { properties: { threadId: { type: 'number' } } },
+    { properties: { threadId: { type: 'string' } }, required: ['threadId', 'prompt'] }]) {
+    const f = rig({ catalog: [...catalog, ...(schema ? [{ ...navigation, inputSchema: schema }] : [])] });
+    await assert.rejects(f.native.openExistingThread(context), /接口/);
+    assert.equal(f.calls.filter(call => call.method === 'tools/call').length, 0);
+  }
+  const f = rig({ catalog: [...catalog, navigation], owner: count => count < 3 ? owner : { ...owner, fingerprint: 'replaced' } });
+  await assert.rejects(f.native.openExistingThread(context), /身份/);
+  assert.equal(f.calls.filter(call => call.method === 'tools/call').length, 0);
+});
+
+test('Windows navigation loses no identity checks and never falls back to a message or create after a failed ACK', async () => {
+  for (const response of [Error('navigation acknowledgement lost'), { result: { success: false } }, {}]) {
+    const f = rig({ catalog: [...catalog, navigation], request: async name => {
+      if (name !== navigation.name) return;
+      if (response instanceof Error) throw response;
+      return response;
+    } });
+    await assert.rejects(f.native.openExistingThread(context));
+    assert.deepEqual(f.calls.filter(call => call.method === 'tools/call').map(call => call.params.tool), [navigation.name]);
+  }
+  const f = rig({ catalog: [...catalog, navigation], owner: count => count < 4 ? owner : { ...owner, fingerprint: 'replaced' },
+    request: async name => name === navigation.name ? success({ navigated: true }) : undefined });
+  await assert.rejects(f.native.openExistingThread(context), /身份/);
+  assert.deepEqual(f.calls.filter(call => call.method === 'tools/call').map(call => call.params.tool), [navigation.name]);
+});
+
+test('aborted navigation cannot launch after delayed identity or tool discovery', async () => {
+  const controller = new AbortController(); let release, launches = 0;
+  const identity = new Promise(resolve => { release = resolve; });
+  const mac = rig({ native: { platform: 'darwin', discover: () => identity,
+    openRunner: async () => { launches++; } } });
+  const job = mac.native.openExistingThread(context, { signal: controller.signal });
+  controller.abort(); release(macOwner);
+  await assert.rejects(job, /取消/); assert.equal(launches, 0);
+  const aborted = rig();
+  await assert.rejects(aborted.native.openExistingThread(context, { signal: controller.signal }), /取消/);
+  assert.deepEqual(aborted.events, []);
+  const winController = new AbortController();
+  const win = rig({ catalog: [...catalog, navigation], request: async name => {
+    if (name === 'tools/list') winController.abort();
+  } });
+  await assert.rejects(win.native.openExistingThread(context, { signal: winController.signal }), /取消/);
+  assert.equal(win.calls.filter(call => call.method === 'tools/call').length, 0);
+  assert.ok(win.pipes.every(pipe => pipe.socket.destroyed));
+});
+
+test('Mac passes cancellation to its launcher and never reports an aborted request as opened', async () => {
+  const controller = new AbortController(); let launches = 0;
+  const f = rig({ native: { platform: 'darwin', discover: async () => macOwner,
+    openRunner: async (_file, _args, options) => {
+      launches++; assert.equal(options.signal, controller.signal); controller.abort();
+    } } });
+  await assert.rejects(f.native.openExistingThread(context, { signal: controller.signal }), /取消/);
+  assert.equal(launches, 1); assert.deepEqual(f.calls, []);
 });
