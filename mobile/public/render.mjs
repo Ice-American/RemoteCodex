@@ -1,4 +1,7 @@
 // Mobile view of an existing desktop owner. Only server snapshots establish messages or completed requests.
+import { applyStateDelta } from './thread-updates.mjs';
+import {createCodeBlock} from './code-copy.mjs';
+import {ThreadPreviewCache} from './thread-cache.mjs';
 const statusLabels = {
   idle: '可继续对话', running: '正在运行', working: '正在运行', inProgress: '正在运行',
   waiting: '等待回答', waitingForInput: '等待回答', waiting_for_input: '等待回答',
@@ -130,7 +133,7 @@ export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, Ev
     const response = await fetchImpl(url, { credentials: 'same-origin', ...options });
     let data;
     try { data = await response.json(); } catch { throw new Error('服务返回了无法读取的结果，请重新读取状态。'); }
-    if (!response.ok && !(acceptRejection && data?.status === 'rejected')) throw new Error(data?.message || `读取失败（${response.status}）`);
+    if (!response.ok && !(acceptRejection && data?.status === 'rejected')) throw Object.assign(new Error(data?.message || `读取失败（${response.status}）`),{code:data?.code,status:response.status});
     return data;
   }
   return {
@@ -148,6 +151,7 @@ export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, Ev
     },
     getThread: (host, id, { signal } = {}) => json(path('/api/thread', { host, id }), { signal }),
     getTodayImages: (host, id, { signal } = {}) => json(path('/api/thread', { host, id, view: 'today-images' }), { signal }),
+    getThreadHistory: (host, id, { cursor, limit=40, signal } = {}) => json(path('/api/thread', { host, id, view:'history',limit,...(cursor?{cursor}:{}) }), { signal }),
     async action(body) {
       const controller = new AbortController();
       // A handover can leave an HTTP reply pending indefinitely. Stop waiting,
@@ -159,13 +163,26 @@ export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, Ev
     },
     subscribe(host, id, { onState, onStatus, onHeartbeat = () => {} }) {
       if (!EventSourceImpl) { onStatus('disconnected'); return () => {}; }
-      const stream = new EventSourceImpl(path('/api/events', { host, id }), { withCredentials: true });
-      let closed = false;
+      const stream = new EventSourceImpl(path('/api/events', { host, id, delta: '1' }), { withCredentials: true });
+      let closed = false, baseline = null, sequence = 0;
       stream.addEventListener('open', () => { if (!closed) onStatus('connecting'); });
       stream.addEventListener('ping', () => { if (!closed) onHeartbeat(); });
       stream.addEventListener('state', (event) => {
         if (closed) return;
-        try { onState(JSON.parse(event.data)); } catch { onStatus('disconnected'); }
+        try { baseline = JSON.parse(event.data); sequence = 0; onState(baseline); } catch { baseline = null; onStatus('disconnected'); }
+      });
+      stream.addEventListener('snapshot', event => {
+        if (closed) return;
+        try {
+          const frame = JSON.parse(event.data);
+          if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1 || frame.state?.host !== host || frame.state?.id !== id || !Array.isArray(frame.state.messages)) throw Error('快照无效');
+          baseline = frame.state; sequence = frame.sequence; onState(baseline);
+        } catch { baseline = null; sequence = 0; onStatus('disconnected'); }
+      });
+      stream.addEventListener('delta', event => {
+        if (closed) return;
+        try { const frame = JSON.parse(event.data); const next = applyStateDelta(baseline, frame, sequence); baseline = next; sequence = frame.sequence; onState(next); }
+        catch { baseline = null; sequence = 0; onStatus('disconnected'); }
       });
       // EventSource may reconnect GET requests. It never resends a write or clears a draft.
       stream.addEventListener('error', () => { if (!closed) onStatus('disconnected'); });
@@ -207,7 +224,7 @@ export function renderSafeText(container, text, { markdown = false } = {}) {
   // This small Markdown subset creates nodes. Raw HTML, links and image syntax remain inert text.
   let fenced = false, code = [], paragraph = [];
   const flushParagraph = () => { if (!paragraph.length) return; const p = element(doc, 'p'); inlineText(p, paragraph.join('\n')); container.append(p); paragraph = []; };
-  const flushCode = () => { const pre = element(doc, 'pre'); pre.append(element(doc, 'code', '', code.join('\n'))); container.append(pre); code = []; };
+  const flushCode = () => { container.append(createCodeBlock(doc,code.join('\n'))); code = []; };
   for (const line of String(text).split('\n')) {
     if (/^\s*```/.test(line)) { flushParagraph(); if (fenced) flushCode(); fenced = !fenced; continue; }
     if (fenced) { code.push(line); continue; }
@@ -283,6 +300,11 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const drafts = new Map(), answers = new Map(), gate = new ActionGate({ storage: draftStorage }), messageNodes = new Map();
   let previewRecord = null;
   let galleryOpen = false, galleryGeneration = 0, galleryRead = null;
+  let history = {messages:[],loaded:false,hasMore:true,nextCursor:null,complete:true,issues:[],error:'',reset:false}, historyRead=null;
+  let prefetchGeneration=0,prefetchRead=null,prefetchQueue=[];
+  let selectedSyncTimer=null,selectedSyncRead=null;
+  let acceptedUpdates=0;
+  const previewCache=new ThreadPreviewCache({now});
   const galleryRecords = new Map();
   const node = (tag, cls, text) => element(doc, tag, cls, text);
   const button = (text, cls, fn) => { const b = node('button', cls, text); b.type = 'button'; if (fn) b.addEventListener('click', fn); return b; };
@@ -317,7 +339,10 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   runtimeErrorPanel.append(runtimeErrorHeading, runtimeErrorMessage, retryTurnButton, retryTurnResult);
   const empty = node('div', 'empty-state', '从对话列表选择一个已有对话。');
   const messages = node('div', 'messages'), requests = node('div', 'request-cards');
-  main.append(empty, messages, requests);
+  const historyPanel=node('div','history-panel'),historyHint=node('p','history-hint');
+  const historyMore=button('加载更早消息','history-more',()=>loadHistory({older:history.loaded&&!history.reset}));
+  historyHint.setAttribute('role','status');historyPanel.append(historyMore,historyHint);
+  main.append(historyPanel,empty, messages, requests);
   const latest = button('回到最新 ↓', 'latest-button', () => { main.scrollTop = main.scrollHeight; latest.hidden = true; }); latest.hidden = true;
   const composer = node('form', 'composer');
   const composerHint = node('p', 'composer-hint', '先选择对话');
@@ -407,8 +432,8 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function resize() { const metrics = viewportMetrics(win?.visualViewport, win?.innerHeight); app.style.setProperty('--app-height', metrics.height + 'px'); app.style.setProperty('--app-top', metrics.top + 'px'); autoSize(); }
   function setDrawer(open) {
     drawerOpen = open; drawer.hidden = !open; backdrop.hidden = !open; menu.setAttribute('aria-expanded', String(open)); syncOverlays();
-    stopStatuses();
-    if (open) { clearStatusConfirmations(); renderThreads(); search.focus(); void pollStatuses(); } else menu.focus();
+    if (open) { clearStatusConfirmations(); renderThreads(); search.focus(); } else menu.focus();
+    void pollStatuses();
   }
   function syncOverlays() {
     const blocked = drawerOpen || creationOpen;
@@ -565,6 +590,103 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     const terms = query.split(/\s+/).filter(Boolean);
     return threads.filter(item => { const text = [item.title, item.projectName, item.cwd, item.projectPath].map(value => String(value ?? '')).join(' ').toLocaleLowerCase(); return terms.every(term => text.includes(term)); });
   }
+  function cancelHistory() {
+    if(historyRead){cancel(historyRead.timeout);historyRead.controller.abort();historyRead.reject?.(Error('历史读取已取消'));historyRead=null;}
+  }
+  function renderHistory() {
+    historyPanel.hidden=!selectedId||typeof api.getThreadHistory!=='function';
+    historyMore.hidden=history.loaded&&!history.hasMore&&!history.error&&history.complete;
+    historyMore.disabled=!!historyRead;
+    historyMore.textContent=historyRead?'正在读取历史…':history.reset?'重新读取历史':history.error?'重试读取历史':history.loaded?'加载更早消息':'读取已保存历史';
+    historyHint.textContent=history.error||(history.complete===false?'部分历史暂未取得，当前内容不完整。':history.loaded&&!history.hasMore?'已加载全部已保存历史':'');
+    historyHint.hidden=!historyHint.textContent;
+  }
+  function showHistoryPreview(page) {
+    if(state)return;
+    state={host:selectedHost,id:selectedId,title:threads.find(t=>t.id===selectedId)?.title||'已保存对话',source:'local-history-only',preloaded:true,
+      connected:false,ownerConfirmed:false,connectionState:'syncing-cache',status:'unknown',messages:page.messages,questions:[],approvals:[],capabilities:{}};
+    connected=false;render();
+  }
+  async function loadHistory({older=false}={}) {
+    if(destroyed||!selectedId||doc.visibilityState==='hidden'||!api.getThreadHistory||historyRead||older&&!history.hasMore)return;
+    const host=selectedHost,id=selectedId,navigation=generation,cursor=older?history.nextCursor:null;
+    const attempt={controller:new AbortController(),timeout:null,reject:null};historyRead=attempt;history.error='';renderHistory();
+    const current=()=>!destroyed&&navigation===generation&&host===selectedHost&&id===selectedId&&historyRead===attempt;
+    const top=main.scrollTop,height=main.scrollHeight;
+    try {
+      const deadline=new Promise((_,reject)=>{attempt.timeout=later(()=>{attempt.controller.abort();reject(Error('历史读取超时，请重试。'));},readTimeoutMs);});
+      const cancelled=new Promise((_,reject)=>{attempt.reject=reject;});
+      // A larger older page crosses the existing 100-message live window on
+      // the first click; the speculative first screen stays small.
+      const page=await Promise.race([api.getThreadHistory(host,id,{cursor,limit:older?80:40,signal:attempt.controller.signal}),deadline,cancelled]);
+      if(!current())return;
+      if(page?.host!==host||page?.id!==id||!Array.isArray(page.messages))throw Error('返回的历史与当前聊天不匹配。');
+      const saved=dedupeMessages(older?[...page.messages,...history.messages]:page.messages);
+      const complete=page.complete===true&&(!older||history.complete);
+      history={messages:saved,loaded:true,nextCursor:page.nextCursor??null,hasMore:page.hasMore===true,complete,
+        issues:[...new Set([...(older?history.issues:[]),...page.issues??[]])],error:'',reset:!complete};
+      if(!older)previewCache.set(host,id,page);
+      showHistoryPreview(page);renderMessages();
+      if(older)main.scrollTop=top+Math.max(0,main.scrollHeight-height);
+      else if(!connected)main.scrollTop=main.scrollHeight;
+    }catch(error){if(current()){history.error=error.message||'历史读取失败，请重试。';if(['HISTORY_CURSOR_EXPIRED','HISTORY_CURSOR_INVALID'].includes(error.code)){history.reset=true;history.error='历史已更新，请重新读取历史。';}}}
+    finally{cancel(attempt.timeout);if(historyRead===attempt){historyRead=null;renderHistory();}}
+  }
+  function stopPrefetch() {
+    prefetchGeneration++;prefetchQueue=[];
+    if(prefetchRead){cancel(prefetchRead.timeout);prefetchRead.controller.abort();prefetchRead.reject?.(Error('预加载已取消'));prefetchRead=null;}
+  }
+  function startPrefetch() {
+    stopPrefetch();
+    if(destroyed||doc.visibilityState==='hidden'||!api.getThreadHistory)return;
+    prefetchQueue=[...threads].sort((a,b)=>(b.updatedAt??0)-(a.updatedAt??0)).filter(t=>t.id!==selectedId).slice(0,2).filter(t=>!previewCache.get(selectedHost,t.id)).map(t=>t.id);
+    void prefetchNext();
+  }
+  async function prefetchNext() {
+    if(destroyed||doc.visibilityState==='hidden'||prefetchRead||!prefetchQueue.length)return;
+    const id=prefetchQueue.shift(),host=selectedHost,stamp=prefetchGeneration;
+    const attempt={controller:new AbortController(),timeout:null,reject:null};prefetchRead=attempt;
+    const current=()=>!destroyed&&stamp===prefetchGeneration&&host===selectedHost&&doc.visibilityState!=='hidden'&&prefetchRead===attempt;
+    try {
+      const deadline=new Promise((_,reject)=>{attempt.timeout=later(()=>{attempt.controller.abort();reject(Error('预加载超时'));},readTimeoutMs);});
+      const cancelled=new Promise((_,reject)=>{attempt.reject=reject;});
+      const page=await Promise.race([api.getThreadHistory(host,id,{limit:40,signal:attempt.controller.signal}),deadline,cancelled]);
+      if(current()&&page?.host===host&&page?.id===id)previewCache.set(host,id,page);
+    }catch{/* A speculative preview cannot fail or authorize the active chat. */}
+    finally{cancel(attempt.timeout);if(prefetchRead===attempt){prefetchRead=null;if(currentPrefetch(stamp,host))void prefetchNext();}}
+  }
+  function currentPrefetch(stamp,host){return !destroyed&&stamp===prefetchGeneration&&host===selectedHost&&doc.visibilityState!=='hidden';}
+  function stopSelectedSync() {
+    cancel(selectedSyncTimer);selectedSyncTimer=null;
+    if(selectedSyncRead){cancel(selectedSyncRead.timeout);selectedSyncRead.controller.abort();selectedSyncRead.reject?.(Error('状态同步已取消'));selectedSyncRead=null;}
+  }
+  function scheduleSelectedSync() {
+    if(destroyed||!selectedId||doc.visibilityState==='hidden'||!api.getThread||selectedSyncTimer!=null||selectedSyncRead)return;
+    selectedSyncTimer=later(()=>{selectedSyncTimer=null;void syncSelected();},15000);
+  }
+  async function syncSelected() {
+    if(destroyed||!selectedId||doc.visibilityState==='hidden')return;
+    if(readAttempt||selectedSyncRead){scheduleSelectedSync();return;}
+    const host=selectedHost,id=selectedId,navigation=generation,stamp=attemptGeneration,updateStamp=acceptedUpdates;
+    const attempt={controller:new AbortController(),timeout:null,reject:null};selectedSyncRead=attempt;
+    const current=()=>!destroyed&&navigation===generation&&stamp===attemptGeneration&&host===selectedHost&&id===selectedId&&selectedSyncRead===attempt;
+    try {
+      const deadline=new Promise((_,reject)=>{attempt.timeout=later(()=>{attempt.controller.abort();reject(Error('状态同步超时'));},readTimeoutMs);});
+      const cancelled=new Promise((_,reject)=>{attempt.reject=reject;});
+      const next=await Promise.race([api.getThread(host,id,{signal:attempt.controller.signal}),deadline,cancelled]);
+      if(!current())return;
+      if(next?.host!==host||next?.id!==id)throw Error('状态同步目标不匹配');
+      // A new owner/connection retires the old stream together. A periodic
+      // observation never opens a second SSE beside the current subscription.
+      if(state?.ownerId!==next.ownerId||state?.connectionId!==next.connectionId){void recover({immediate:true});return;}
+      // Native revisions may be opaque strings. A GET started before an
+      // accepted stream update cannot order itself above that newer state.
+      if(updateStamp!==acceptedUpdates)return;
+      update(next);
+      if(!connected&&!needsLoad(next)&&!incompatible(next))void recover();
+    }catch{/* SSE remains authoritative during a failed background GET. */}
+    finally{cancel(attempt.timeout);if(selectedSyncRead===attempt)selectedSyncRead=null;scheduleSelectedSync();}
+  }
   function rowStatus(item) {
     if (item.id === selectedId) return { status: statusType(state), confirmed: connected && state?.ownerConfirmed === true && !isHistoryOnly(state) };
     return { status: typeof item.status === 'string' ? item.status : item.status?.type, confirmed: item.statusConfirmed === true };
@@ -581,10 +703,11 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     statusPending = null;
   }
   async function pollStatuses() {
-    if (destroyed || !drawerOpen || doc.visibilityState === 'hidden' || !api.getThreadStatuses || listLoading || statusPending) return;
-    const ids = [...new Set(filteredThreads().map(item => item.id))].slice(0, 100); if (!ids.length) return;
+    if (destroyed || doc.visibilityState === 'hidden' || !api.getThreadStatuses || listLoading || statusPending) return;
+    cancel(statusTimer);statusTimer=null;
+    const ids = [...new Set(filteredThreads().map(item => item.id))].slice(0, drawerOpen||!selectedId?100:20); if (!ids.length) return;
     const host = selectedHost, scope = catalogScope(), stamp = statusGeneration, attempt = { controller: new AbortController(), timeout: null }; statusPending = attempt;
-    const current = () => !destroyed && drawerOpen && doc.visibilityState !== 'hidden' && host === selectedHost && scope === catalogScope() && stamp === statusGeneration && statusPending === attempt;
+    const current = () => !destroyed && doc.visibilityState !== 'hidden' && host === selectedHost && scope === catalogScope() && stamp === statusGeneration && statusPending === attempt;
     try {
       const deadline = new Promise((_, reject) => { attempt.timeout = later(() => { attempt.controller.abort(); reject(Error('状态读取超时')); }, readTimeoutMs); });
       const result = await Promise.race([api.getThreadStatuses(host, ids, { signal: attempt.controller.signal }), deadline]); if (!current()) return;
@@ -640,7 +763,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     todayImagesButton.disabled = !selectedId;
     title.textContent = state?.title || (selectedId ? '正在读取对话…' : 'Codex 随行');
     subtitle.textContent = state ? (hosts.find((host) => host.id === selectedHost)?.name || selectedHost) + (isHistoryOnly(state) ? ' · 只读历史' : ' · 原桌面会话') : '选择一个已有对话';
-    connectionLabel.textContent = incompatible(state) ? '电脑网关需要更新' : !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : isRuntimeError(state) ? '上一轮运行失败' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
+    connectionLabel.textContent = incompatible(state) ? '电脑网关需要更新' : !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : state?.preloaded ? '已预加载 · 正在同步（只读）' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : isRuntimeError(state) ? '上一轮运行失败' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
     const loadAttempt = loadAttempts.get(currentScope());
     loadPanel.hidden = !needsLoad(state) && !incompatible(state);
     loadHeading.textContent = incompatible(state) ? '电脑会话接口已更新' : '原聊天尚未在电脑上加载';
@@ -787,9 +910,10 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     reconcile(item.media, children); item.media.hidden = !children.length;
   }
   function renderMessages() {
+    renderHistory();
     if (!state) { closePreview({ restoreFocus: false }); messageNodes.clear(); messages.replaceChildren(); requests.replaceChildren(); empty.hidden = false; return; }
     const scope = scopeOf(state); if (scope !== messageScope) { closePreview({ restoreFocus: false }); messageNodes.clear(); messageScope = scope; }
-    const rows = dedupeMessages(state.messages), children = [];
+    const rows = dedupeMessages([...history.messages,...state.messages??[]]), children = [];
     rows.forEach((message, index) => {
       const key = JSON.stringify([message.role, message.id ?? ['position', index]]);
       let item = messageNodes.get(key);
@@ -884,11 +1008,11 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (state?.connectionId === next.connectionId && typeof next.revision === 'number' && typeof state.revision === 'number' && next.revision < state.revision) return false;
     const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 100;
     // Disk history can display messages, but it can never establish a live owner or authorize writes.
-    state = next; connected = next.connected === true && next.ownerConfirmed === true && !isHistoryOnly(next) && readableConnection(next); loading = false;
-    render({ navigation: navigated }); if (atBottom) main.scrollTop = main.scrollHeight; return true;
+    state = next;acceptedUpdates++; connected = next.connected === true && next.ownerConfirmed === true && !isHistoryOnly(next) && readableConnection(next); loading = false;
+    render({ navigation: navigated }); if (atBottom) main.scrollTop = main.scrollHeight; scheduleSelectedSync(); return true;
   }
   async function loadThreads({ append = false } = {}) {
-    if (!api.getThreads || destroyed || append && (!nextCursor || listLoading)) return;
+    if (!api.getThreads || destroyed || doc.visibilityState==='hidden' || append && (!nextCursor || listLoading)) return;
     const host = selectedHost, stamp = hostGeneration, request = ++listRequest, scope = catalogScope(), cursor = append ? nextCursor : null;
     const current = () => !destroyed && stamp === hostGeneration && host === selectedHost && scope === catalogScope() && request === listRequest;
     stopStatuses(); listLoading = true; listError = ''; renderThreads();
@@ -900,19 +1024,19 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
       if (Array.isArray(result.projects)) projects = result.projects;
       nextCursor = result.nextCursor ?? null; listTotal = Number.isFinite(result.total) ? result.total : null; catalogPartial = result.catalog?.partial === true;
     } catch (error) { if (current()) { listError = error.message || '对话列表读取失败，原有草稿已保留。'; if (!selectedId) showNotice(listError); } }
-    finally { if (current()) { listLoading = false; renderThreads(); void pollStatuses(); } }
+    finally { if (current()) { listLoading = false; renderThreads(); void pollStatuses(); startPrefetch(); } }
   }
   function changeCatalog() {
-    cancel(searchTimer); searchTimer = null; listRequest++; stopStatuses(); nextCursor = null; threads = []; listTotal = null; listError = ''; renderThreads(); void loadThreads();
+    cancel(searchTimer); searchTimer = null; listRequest++; stopStatuses(); stopPrefetch(); nextCursor = null; threads = []; listTotal = null; listError = ''; renderThreads(); void loadThreads();
   }
   async function selectHost(host) {
     if (destroyed || host === selectedHost && (selectedId || threads.length)) return;
     if (selectedId) saveDraft(currentScope(), input.value);
     if (creationOpen) closeCreation({ restore: false });
     closeTodayImages({ restoreFocus: false });
-    cancel(searchTimer); searchTimer = null; stopStatuses();
+    cancel(searchTimer); searchTimer = null; stopStatuses();stopPrefetch();cancelHistory();
     generation++; hostGeneration++; const stamp = hostGeneration;
-    stopReadAndStream(); clearRecovery(); state = null; selectedHost = host; selectedId = ''; connected = false; loading = false;
+    stopReadAndStream(); clearRecovery(); history={messages:[],loaded:false,hasMore:true,nextCursor:null,complete:true,issues:[],error:'',reset:false};state = null; selectedHost = host; selectedId = ''; connected = false; loading = false;
     threads = []; projects = []; selectedProject = ''; selectedRange = 'week'; rangeSelect.value = 'week'; search.value = ''; nextCursor = null; listTotal = null; listLoading = false; listError = ''; hostError = ''; input.value = ''; showNotice(''); render({ navigation: true });
     onNavigate({ host, id: null });
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
@@ -922,8 +1046,12 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (destroyed) return;
     closeTodayImages({ restoreFocus: false });
     if (selectedId) saveDraft(currentScope(), input.value);
-    generation++; const host = selectedHost; stopReadAndStream(); clearRecovery();
+    generation++; const host = selectedHost; stopReadAndStream(); clearRecovery();stopPrefetch();cancelHistory();
+    const cached=previewCache.get(host,id);
+    history=cached?{...cached,loaded:true,error:'',reset:false}:{messages:[],loaded:false,hasMore:true,nextCursor:null,complete:true,issues:[],error:'',reset:false};
     state = null; selectedId = id; connected = false; loading = true; input.value = draft(currentScope()); cardsSignature = ''; showNotice(''); autoSize(); setDrawer(false); render({ navigation: true }); onNavigate({ host, id });
+    if(cached)showHistoryPreview(cached);else void loadHistory();
+    startPrefetch();scheduleSelectedSync();
     return readCurrent();
   }
   function clearRecovery() {
@@ -932,13 +1060,14 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function stopReadAndStream() {
     // Navigation and each recovery retire the entire attempt, including callbacks
     // for the same host/id. A late response may belong to an obsolete owner.
-    attemptGeneration++; cancel(wakeTimer); wakeTimer = null; cancel(retryTimer); retryTimer = null; cancel(heartbeatTimer); heartbeatTimer = null;
+    attemptGeneration++; stopSelectedSync();cancel(wakeTimer); wakeTimer = null; cancel(retryTimer); retryTimer = null; cancel(heartbeatTimer); heartbeatTimer = null;
     closeEvents(); closeEvents = () => {};
     if (readAttempt) {
       cancel(readAttempt.timeout); readAttempt.controller.abort(); readAttempt.reject?.(Error('读取已取消。')); readAttempt = null;
     }
   }
   function markRecovering(error = '') {
+    stopSelectedSync();
     connected = false; loading = false;
     if (failureSince == null) {
       failureSince = now();
@@ -952,12 +1081,12 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
       (now() - failureSince >= 15000 ? '暂时无法连接，将继续自动恢复。' : '正在恢复连接。') + '草稿已保留，操作不会自动重发。', true);
   }
   function scheduleRead() {
-    if (destroyed || !selectedId || retryTimer != null) return;
+    if (destroyed || !selectedId || doc.visibilityState==='hidden' || retryTimer != null) return;
     const delay = [1000, 2000, 4000, 8000, 15000][Math.min(retryStep++, 4)];
     retryTimer = later(() => { retryTimer = null; void readCurrent(); }, delay);
   }
   function recover({ immediate = false, error = '' } = {}) {
-    if (destroyed || !selectedId) return Promise.resolve();
+    if (destroyed || !selectedId || doc.visibilityState==='hidden') return Promise.resolve();
     // Repeated browser hints join the current GET rather than aborting it and
     // opening more connections. POSTs never enter this scheduler.
     if (readAttempt) return readAttempt.promise;
@@ -970,7 +1099,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     heartbeatTimer = later(() => { heartbeatTimer = null; if (current()) void recover(); }, heartbeatTimeoutMs);
   }
   function readCurrent() {
-    if (destroyed || !selectedId || !api.getThread) return Promise.resolve();
+    if (destroyed || !selectedId || doc.visibilityState==='hidden' || !api.getThread) return Promise.resolve();
     if (readAttempt) return readAttempt.promise;
     cancel(retryTimer); retryTimer = null;
     const host = selectedHost, id = selectedId, navigation = generation, attemptId = ++attemptGeneration;
@@ -1101,7 +1230,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     saveCreateDraft(); creationResult = null; gate.forgetConfirmed(creationKey()); renderCreation();
   });
   search.addEventListener('input', () => {
-    cancel(searchTimer); listRequest++; stopStatuses(); nextCursor = null; renderThreads();
+    cancel(searchTimer); listRequest++; stopStatuses();stopPrefetch(); nextCursor = null; renderThreads();
     searchTimer = later(() => { searchTimer = null; void loadThreads(); }, 250);
   });
   projectSelect.addEventListener('change', () => { selectedProject = projectSelect.value; changeCatalog(); });
@@ -1119,12 +1248,13 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     }
     cancel(wakeTimer); wakeTimer = null; lastWakeAt = now(); void recover({ immediate: true });
   };
-  const visibility = () => { if (doc.visibilityState !== 'hidden') { wake(); if (drawerOpen) { clearStatusConfirmations(); renderThreads(); void pollStatuses(); } } else stopStatuses(); };
-  const offline = () => { if (!destroyed && selectedId) { stopReadAndStream(); markRecovering(); scheduleRead(); } };
+  const visibility = () => { if (doc.visibilityState !== 'hidden') { wake();clearStatusConfirmations();renderThreads();void pollStatuses();scheduleSelectedSync();if(!history.loaded)void loadHistory();startPrefetch();if(!threads.length&&!listLoading)void loadThreads();if(!hosts.length&&api.getHosts)void loadHosts({background:!!selectedId,loadList:false}); } else {stopStatuses();stopReadAndStream();clearRecovery();connected=false;cancelHistory();stopPrefetch();render();} };
+  const offline = () => { if (!destroyed && selectedId) { stopReadAndStream();cancelHistory();stopPrefetch();if(doc.visibilityState==='hidden'){connected=false;loading=false;render();return;}markRecovering(); scheduleRead(); } };
   doc.addEventListener('keydown', escape); doc.addEventListener('visibilitychange', visibility); win?.addEventListener('online', wake); win?.addEventListener('offline', offline);
   win?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('scroll', resize);
   resize(); render({ navigation: true });
   async function loadHosts({ background = !!selectedId, loadList = true } = {}) {
+    if(destroyed||doc.visibilityState==='hidden')return;
     const stamp = hostGeneration, host = selectedHost, request = ++hostsRequest;
     const current = () => !destroyed && stamp === hostGeneration && host === selectedHost && request === hostsRequest;
     try {
@@ -1146,7 +1276,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
   } else if (api.getHosts) void loadHosts();
   return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts, openCreation,
-    destroy() { destroyed = true; closeTodayImages({ restoreFocus: false }); closePreview({ restoreFocus: false }); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses(); creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
+    destroy() { destroyed = true; closeTodayImages({ restoreFocus: false }); closePreview({ restoreFocus: false }); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses();stopPrefetch();cancelHistory();creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
   };
 }
 

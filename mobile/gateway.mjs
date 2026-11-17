@@ -18,6 +18,7 @@ import { Secrets, Journal, secretEqual, dataDirectory, writePrivate } from './st
 import { NativeTools } from './native-tools.mjs';
 import { CreationManager } from './creation.mjs';
 import { readTodayGallery } from './today-gallery.mjs';
+import { createStateFrame } from './public/thread-updates.mjs';
 import { MobileMedia } from './media.mjs';
 
 const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
@@ -425,6 +426,28 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
         }
       }
       if (url.pathname === '/api/thread' && req.method === 'GET') {
+        if (url.searchParams.get('view') === 'history') {
+          const allowed = new Set(['host', 'id', 'view', 'cursor', 'limit']);
+          if ([...url.searchParams.keys()].some(key => !allowed.has(key) || url.searchParams.getAll(key).length !== 1))
+            return sendJson(res, 400, { error: '历史查询参数无效' });
+          const id = url.searchParams.get('id'), limit = Number(url.searchParams.get('limit') || 40);
+          if (!validThreadId(id) || !Number.isInteger(limit) || limit < 1 || limit > 80)
+            return sendJson(res, 400, { error: '历史查询范围无效' });
+          const controller = new AbortController(), gone = () => controller.abort(Error('历史读取已取消'));
+          res.once('close', gone);
+          try {
+            // Preloading and pagination never discover/connect an owner. Disk
+            // messages are useful immediately, but cannot authorize a write.
+            const page = await catalog.readPage(id, { cursor: url.searchParams.get('cursor') || undefined,
+              limit, media, signal: controller.signal });
+            if (!res.destroyed) return sendJson(res, 200, { host: hostId, id, ...page });
+          } catch (error) {
+            if (!res.destroyed) return sendJson(res, error.code === 'HISTORY_CURSOR_EXPIRED' ? 409 : error.code === 'HISTORY_CURSOR_INVALID' ? 400 : 503, {
+              code: ['HISTORY_CURSOR_EXPIRED', 'HISTORY_CURSOR_INVALID'].includes(error.code) ? error.code : 'HISTORY_READ_FAILED',
+              message: error.code === 'HISTORY_CURSOR_EXPIRED' ? '历史已更新，请重新读取。' : '历史暂时无法读取，请稍后重试。' });
+          } finally { res.off('close', gone); }
+          return;
+        }
         if (url.searchParams.get('view') === 'today-images') {
           const id = url.searchParams.get('id');
           if (!validThreadId(id)) return sendJson(res, 400, { error: '图片聊天标识无效' });
@@ -459,13 +482,21 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       if (url.pathname === '/api/events' && req.method === 'GET') {
         const id = url.searchParams.get('id'); if (!validThreadId(id)) throw Error('无效聊天标识');
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
-        let busy = false, timer, heartbeat, stopped = false, lastView = null;
+        const incremental = url.searchParams.get('delta') === '1';
+        let busy = false, timer, heartbeat, stopped = false, lastView = null, previous = null, sequence = 0;
         const push = async () => { if (busy || stopped || res.destroyed || res.writableNeedDrain) return; busy = true;
           try { const view = await state(id);
             // Reasoning-only native patches do not change the visible phone view.
             // Coalesce them instead of retransmitting the full chat over mobile.
             const visible = JSON.stringify({ ...view, revision: null });
-            if (!stopped && !res.destroyed && visible !== lastView) { lastView = visible; res.write('event: state\ndata: ' + JSON.stringify(view) + '\n\n'); }
+            if (!stopped && !res.destroyed && visible !== lastView) {
+              if (incremental) {
+                const frame = createStateFrame(previous, view, ++sequence);
+                res.write('event: ' + frame.event + '\ndata: ' + JSON.stringify(frame.data) + '\n\n');
+                previous = view;
+              } else res.write('event: state\ndata: ' + JSON.stringify(view) + '\n\n');
+              lastView = visible;
+            }
           }
           catch { if (!stopped && !res.destroyed) res.write('event: error\ndata: {}\n\n'); }
           finally { busy = false; }

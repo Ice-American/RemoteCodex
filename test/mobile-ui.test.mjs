@@ -391,16 +391,16 @@ test('runtime errors keep their read connection and SSE can restore active and i
   await view.selectThread(thread().id); type(root, '连接保留期间的草稿');
   assert.equal(streams.length, 1); assert.equal(reads, 1); assert.equal(one(root, 'connection-label').textContent, '上一轮运行失败');
   for (let index = 0; index < 4; index++) { await timers.advance(15000); streams[0].callbacks.onHeartbeat(); }
-  assert.equal(reads, 1); assert.equal(streams.length, 1); assert.equal(streams[0].closed, 0);
+  assert.equal(reads, 5); assert.equal(streams.length, 1); assert.equal(streams[0].closed, 0);
   streams[0].callbacks.onState(runtimeErrorThread({ revision: 2, runtimeError: { failedTurnId: 'failed-turn-2', message: '新的真实错误' } }));
-  await tick(); assert.equal(reads, 1); assert.equal(streams[0].closed, 0);
+  await tick(); assert.equal(reads, 5); assert.equal(streams[0].closed, 0);
   assert.equal(one(root, 'runtime-error-message').textContent, '新的真实错误');
   streams[0].callbacks.onState(thread({ connectionState: 'ready', revision: 3, status: 'running', activeTurnId: 'active-turn' }));
   assert.equal(one(root, 'runtime-error-panel').hidden, true); assert.equal(one(root, 'send-button').disabled, false);
   assert.equal(one(root, 'send-button').textContent, '补充方向'); assert.equal(one(root, 'stop-button').disabled, false);
   streams[0].callbacks.onState(thread({ connectionState: 'ready', revision: 4, status: 'idle' }));
   assert.equal(one(root, 'send-button').disabled, false); assert.equal(one(root, 'send-button').textContent, '发送');
-  assert.equal(one(root, 'message-input').value, '连接保留期间的草稿'); assert.equal(reads, 1); assert.equal(writes, 0);
+  assert.equal(one(root, 'message-input').value, '连接保留期间的草稿'); assert.equal(reads, 5); assert.equal(writes, 0);
 });
 
 test('a late failed-turn retry receipt cannot navigate or refresh a different current chat', async t => {
@@ -481,7 +481,7 @@ test('SSE reconnect events only report transport and never replay an action', ()
   const statuses = [], snapshots = [], api = createMobileAPI({ EventSourceImpl: Events });
   const close = api.subscribe('windows', 'thread', { onStatus: (status) => statuses.push(status), onState: (state) => snapshots.push(state) });
   stream.listeners.open(); stream.listeners.error(); stream.listeners.state({ data: JSON.stringify(thread()) }); stream.listeners.state({ data: '{invalid' }); close();
-  assert.equal(stream.url, '/api/events?host=windows&id=thread');
+  assert.equal(stream.url, '/api/events?host=windows&id=thread&delta=1');
   assert.deepEqual(statuses, ['connecting', 'disconnected', 'disconnected']); assert.equal(snapshots.length, 1); assert.equal(stream.closed, true);
 });
 
@@ -645,7 +645,7 @@ test('a changed desktop protocol explains the cause without repeated loading or 
   assert.equal(one(root, 'load-thread-button').hidden, true); assert.equal(one(root, 'send-button').disabled, true);
   assert.match(one(root, 'load-thread-hint').textContent, /需要更新/);
   await timers.advance(30000);
-  assert.equal(reads, 1); assert.equal(posts, 0); assert.equal(one(root, 'message-input').value, '协议升级期间保留的草稿');
+  assert.equal(reads, 3); assert.equal(posts, 0); assert.equal(one(root, 'message-input').value, '协议升级期间保留的草稿');
 });
 
 test('an unloaded original chat offers an explicit load action without treating it as a network failure', async (t) => {
@@ -658,7 +658,7 @@ test('an unloaded original chat offers an explicit load action without treating 
   assert.equal(one(root, 'load-thread-panel').parentNode, one(root, 'composer'), 'loading remains visible beside the draft even at the bottom of a long chat');
   assert.ok(one(root, 'load-thread-hint').textContent.includes('电脑前台'));
   assert.equal(one(root, 'send-button').disabled, true); assert.equal(posts, 0);
-  await timers.advance(30000); assert.equal(reads, 1); assert.equal(posts, 0);
+  await timers.advance(30000); assert.equal(reads, 3); assert.equal(posts, 0);
   assert.equal(one(root, 'message-input').value, '保留原聊天草稿');
 });
 
@@ -842,16 +842,16 @@ test('recovery uses capped exponential delay and a 15 second message without ena
   assert.equal(one(root, 'send-button').disabled, true); assert.equal(one(root, 'message-input').value, '离线草稿');
 });
 
-test('idle heartbeat keeps one stream alive without periodic GETs and silence starts one recovery', async (t) => {
+test('idle heartbeat keeps one stream while periodic GETs sync status and silence starts one recovery', async (t) => {
   const timers = fakeClock(), streams = []; let reads = 0;
   const { root, view } = mount(t, { getThread: async () => { reads++; return thread({ messages: [] }); }, subscribe: (_host, _id, callbacks) => {
     const s = { callbacks, closed: 0 }; streams.push(s); return () => s.closed++;
   } }, { timers });
   await view.selectThread(thread().id); type(root, '空闲也可输入');
   for (let i = 0; i < 8; i++) { await timers.advance(15000); streams[0].callbacks.onHeartbeat(); }
-  assert.equal(reads, 1); assert.equal(streams.length, 1); assert.equal(one(root, 'send-button').disabled, false);
+  assert.equal(reads, 9); assert.equal(streams.length, 1); assert.equal(one(root, 'send-button').disabled, false);
   await timers.advance(45000); assert.equal(one(root, 'send-button').disabled, true); assert.equal(streams[0].closed, 1);
-  await timers.advance(1000); assert.equal(reads, 2); assert.equal(streams.length, 2); assert.equal(one(root, 'send-button').disabled, false);
+  await timers.advance(1000); assert.equal(reads, 12); assert.equal(streams.length, 2); assert.equal(one(root, 'send-button').disabled, false);
 });
 
 test('foreground revalidation joins online recovery and destroy aborts and clears every pending read', async (t) => {
@@ -1081,7 +1081,7 @@ test('a late confirmed create cannot steal the screen after dialog closure or a 
   assert.deepEqual(navigations, [{ host: 'windows', id: null }]); assert.equal(one(root, 'creation-dialog').hidden, true);
 });
 
-test('only confirmed live status spins; drawer polling is visible-only and failures clear old running', async (t) => {
+test('only confirmed live status spins; polling continues outside the drawer but pauses when hidden', async (t) => {
   const timers = fakeClock(), current = thread().id, other = '22222222-2222-4222-8222-222222222222'; let calls = 0, fail = false;
   const { root, doc, view } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async () => ({ threads: [{ id: current, title: '当前聊天', status: 'running', statusConfirmed: true }, { id: other, title: '其他聊天', status: 'running', statusConfirmed: false }] }),
     getThreadStatuses: async (host, ids) => { calls++; assert.deepEqual(ids, [current, other]); if (fail) throw Error('owner unavailable'); return { statuses: [{ id: current, status: 'running', statusConfirmed: true }, { id: other, status: 'working', statusConfirmed: true }] }; } }, { timers }); await tick();
@@ -1092,7 +1092,7 @@ test('only confirmed live status spins; drawer polling is visible-only and failu
   fail = true; await timers.advance(10000); assert.equal(calls, 2); assert.equal(one(rows()[1], 'row-running').hidden, true);
   doc.visibilityState = 'hidden'; doc.fire('visibilitychange'); await timers.advance(30000); assert.equal(calls, 2);
   doc.visibilityState = 'visible'; doc.fire('visibilitychange'); await tick(); assert.equal(calls, 3);
-  one(root, 'menu-button').click(); await timers.advance(30000); assert.equal(calls, 3); view.destroy(); assert.equal(timers.size, 0);
+  one(root, 'menu-button').click(); await timers.advance(30000); assert.ok(calls > 3); view.destroy(); assert.equal(timers.size, 0);
 });
 
 test('status batches are capped and stale responses from a prior search cannot restore running', async (t) => {
@@ -1104,13 +1104,13 @@ test('status batches are capped and stale responses from a prior search cannot r
   assert.equal(byClass(root, 'thread-row').length, 1); assert.equal(one(root, 'row-running').hidden, true); assert.ok(one(root, 'thread-list').textContent.includes('新搜索'));
 });
 
-test('a hanging read-only status poll expires, removes stale running and is aborted on drawer close', async (t) => {
+test('a hanging read-only status poll expires, removes stale running and is aborted when hidden', async (t) => {
   const timers = fakeClock(); let calls = 0, signal;
-  const { root, view } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async () => ({ threads: [{ id: 'background', title: '后台任务' }] }),
+  const { root, doc, view } = mount(t, { getHosts: async () => ({ hosts: [{ id: 'mac' }] }), getThreads: async () => ({ threads: [{ id: 'background', title: '后台任务' }] }),
     getThreadStatuses: async (_host, _ids, options) => { calls++; signal = options.signal; return calls === 1 ? { statuses: [{ id: 'background', status: 'running', statusConfirmed: true }] } : new Promise(() => {}); } }, { timers }); await tick();
   assert.equal(one(root, 'row-running').hidden, false); await timers.advance(10000); assert.equal(calls, 2);
   await timers.advance(20000); assert.equal(signal.aborted, true); assert.equal(one(root, 'row-running').hidden, true);
-  await timers.advance(10000); assert.equal(calls, 3); one(root, 'menu-button').click(); assert.equal(signal.aborted, true);
+  await timers.advance(10000); assert.equal(calls, 3); one(root, 'menu-button').click(); assert.equal(signal.aborted, false);doc.visibilityState='hidden';doc.fire('visibilitychange');assert.equal(signal.aborted,true);
   view.destroy(); assert.equal(timers.size, 0);
 });
 
@@ -1327,4 +1327,131 @@ test('creation read timeout exposes a fresh GET and never accepts its late proje
   one(root, 'create-retry').click(); await tick(); chooseCreationProject(root, 'official-red');
   old.resolve({ supported: true, projectless: true, projects: [] }); await tick();
   assert.equal(one(root, 'create-project').textContent, 'red-app'); assert.equal(reads, 2); assert.equal(writes, 0);
+});
+
+const historyPage=(id,messages,extra={})=>({host:'mac',id,messages,nextCursor:null,hasMore:false,complete:true,issues:[],source:'local-history',...extra});
+const savedMessage=(id,text=id)=>({id,role:'assistant',text});
+
+test('history API is a cancellable GET and carries cursor error codes for explicit reset',async()=>{
+ const calls=[],controller=new AbortController();let fail=false;
+ const api=createMobileAPI({fetchImpl:async(url,options)=>{calls.push({url,options});return{ok:!fail,status:409,json:async()=>fail?{code:'HISTORY_CURSOR_EXPIRED',message:'历史已更新，请重新读取'}:{messages:[]}};}});
+ await api.getThreadHistory('windows','chat',{cursor:'a+/=',limit:40,signal:controller.signal});
+ const url=new URL(calls[0].url,'http://fixture');assert.equal(url.searchParams.get('view'),'history');assert.equal(url.searchParams.get('cursor'),'a+/=');assert.equal(url.searchParams.get('host'),'windows');assert.equal(calls[0].options.signal,controller.signal);assert.equal(calls[0].options.body,undefined);
+ fail=true;await assert.rejects(api.getThreadHistory('mac','chat'),e=>e.code==='HISTORY_CURSOR_EXPIRED'&&e.status===409);
+});
+
+test('preloading uses only the two most recent saved chats, one request at a time, and skips fresh cached previews',async t=>{
+ const pending=deferred(),calls=[];let active=0,maximum=0;
+ const {view}=mount(t,{getHosts:async()=>({hosts:[{id:'mac'}]}),getThreads:async()=>({threads:[{id:'a',title:'A',updatedAt:3},{id:'b',title:'B',updatedAt:2},{id:'c',title:'C',updatedAt:1}]}),
+  getThreadHistory:async(_host,id)=>{calls.push(id);active++;maximum=Math.max(maximum,active);if(id==='a')await pending.promise;active--;return historyPage(id,[savedMessage(id)]);}});
+ await tick();assert.deepEqual(calls,['a']);pending.resolve();await tick();await tick();assert.deepEqual(calls,['a','b']);assert.equal(maximum,1);
+ await view.loadHosts();await tick();assert.deepEqual(calls,['a','b']);
+});
+
+test('a cached preview appears before the fresh owner GET and never unlocks actions or request cards',async t=>{
+ const fresh=deferred();let posts=0;
+ const {root,view}=mount(t,{getHosts:async()=>({hosts:[{id:'mac'}]}),getThreads:async()=>({threads:[{id:'cached',title:'预加载聊天'}]}),
+  getThreadHistory:async(_host,id)=>historyPage(id,[savedMessage('saved','已保存内容')],{ownerConfirmed:true,capabilities:{send:true},questions:[{id:'forbidden'}]}),
+  getThread:()=>fresh.promise,action:async()=>{posts++;}});
+ await tick();await tick();const selecting=view.selectThread('cached');type(root,'缓存期间的草稿');
+ assert.equal(one(root,'message-assistant').textContent.includes('已保存内容'),true);assert.match(one(root,'connection-label').textContent,/预加载.*只读/);assert.equal(one(root,'send-button').disabled,true);assert.equal(byClass(root,'question-card').length,0);
+ one(root,'composer').fire('submit');assert.equal(posts,0);
+ fresh.resolve(thread({id:'cached',messages:[savedMessage('live','实时内容')]}));await selecting;
+ assert.equal(one(root,'send-button').disabled,false);assert.equal(one(root,'message-input').value,'缓存期间的草稿');assert.equal(byClass(root,'message-assistant').length,2);
+});
+
+test('older pages preserve the visible scroll anchor and survive live-tail updates with stable-id deduplication',async t=>{
+ const calls=[],callbacks=[];
+ const {root,view}=mount(t,{getThread:async()=>thread({messages:[savedMessage('new','live new')]}),subscribe:(_host,_id,c)=>{callbacks.push(c);return()=>{};},
+  getThreadHistory:async(_host,id,{cursor})=>{calls.push(cursor);return cursor?historyPage(id,[savedMessage('old'),savedMessage('new','saved old text')]):historyPage(id,[savedMessage('new','saved new')],{nextCursor:'older',hasMore:true});}});
+ await view.selectThread(thread().id);await tick();const main=one(root,'conversation');
+ Object.defineProperty(main,'scrollHeight',{configurable:true,get:()=>200*byClass(root,'message').length});main.scrollTop=50;
+ one(root,'history-more').click();await tick();assert.deepEqual(calls,[null,'older']);assert.equal(main.scrollTop,250);assert.equal(byClass(root,'message').length,2);
+ assert.equal(byClass(root,'message')[1].textContent.includes('live new'),true);
+ callbacks[0].onState(thread({revision:2,messages:[savedMessage('new','updated new'),savedMessage('next')]}));
+ assert.equal(byClass(root,'message').length,3);assert.equal(byClass(root,'message')[0].textContent.includes('old'),true);assert.equal(byClass(root,'message')[1].textContent.includes('updated new'),true);
+});
+
+test('an expired history cursor requires one explicit reset and never loops the bad cursor',async t=>{
+ const calls=[];
+ const {root,view}=mount(t,{getThread:async()=>thread(),getThreadHistory:async(_host,id,{cursor})=>{calls.push(cursor);if(cursor)throw Object.assign(Error('expired'),{code:'HISTORY_CURSOR_EXPIRED'});return historyPage(id,[savedMessage('saved')],{nextCursor:'expired',hasMore:true});}});
+ await view.selectThread(thread().id);await tick();one(root,'history-more').click();await tick();assert.deepEqual(calls,[null,'expired']);assert.equal(one(root,'history-more').textContent,'重新读取历史');assert.match(one(root,'history-hint').textContent,/历史已更新/);
+ await tick();assert.equal(calls.length,2);one(root,'history-more').click();await tick();assert.deepEqual(calls,[null,'expired',null]);assert.equal(one(root,'history-more').textContent,'加载更早消息');
+});
+
+test('navigation, host changes, hidden pages and destroy abort speculative/history reads and ignore late results',async t=>{
+ const slow=deferred(),signals=[];
+ const {root,doc,view}=mount(t,{getThread:async(host,id)=>thread({host,id}),getThreadHistory:(host,id,{signal})=>{signals.push(signal);return slow.promise;}});
+ await view.selectThread('a');await view.selectThread('b');assert.equal(signals[0].aborted,true);type(root,'B草稿');
+ doc.visibilityState='hidden';doc.fire('visibilitychange');assert.equal(signals[1].aborted,true);slow.resolve(historyPage('a',[savedMessage('wrong','不能串到B')]));await tick();assert.equal(one(root,'message-input').value,'B草稿');assert.equal(one(root,'thread-title').textContent,'手机适配');assert.equal(root.textContent.includes('不能串到B'),false);
+ doc.visibilityState='visible';doc.fire('visibilitychange');await tick();await view.selectHost('windows');assert.ok(signals.slice(0,2).every(s=>s.aborted));view.destroy();assert.equal(root.childNodes.length,0);
+});
+
+test('a backgrounded prefetch is cancelled without promoting its late result to a cached owner',async t=>{
+ const pending=deferred();let signal,calls=0;
+ const {root,doc,view}=mount(t,{getHosts:async()=>({hosts:[{id:'mac'}]}),getThreads:async()=>({threads:[{id:'a',title:'A'},{id:'b',title:'B'}]}),getThreadHistory:(_host,id,options)=>{calls++;signal=options.signal;return pending.promise;},getThread:async(_host,id)=>thread({id})});
+ await tick();assert.equal(calls,1);doc.visibilityState='hidden';doc.fire('visibilitychange');assert.equal(signal.aborted,true);
+ pending.resolve(historyPage('a',[savedMessage('late','迟到的预取')]));await tick();assert.equal(calls,1);assert.equal(root.textContent.includes('迟到的预取'),false);
+ view.destroy();
+});
+
+test('selected state sync is single-flight every fifteen seconds and never adds SSE streams or writes',async t=>{
+ const timers=fakeClock(),pending=deferred();let reads=0,streams=0,posts=0,signal;
+ const {root,doc,view}=mount(t,{getThread:(_host,_id,options)=>{reads++;if(reads===3){signal=options.signal;return pending.promise;}return Promise.resolve(thread({revision:reads}));},subscribe:()=>{streams++;return()=>{};},action:async()=>{posts++;}}, {timers});
+ await view.selectThread(thread().id);type(root,'定时同步保留草稿');await timers.advance(15000);assert.equal(reads,2);assert.equal(streams,1);
+ await timers.advance(15000);assert.equal(reads,3);await timers.advance(15000);assert.equal(reads,3);assert.equal(posts,0);
+ doc.visibilityState='hidden';doc.fire('visibilitychange');assert.equal(signal.aborted,true);await timers.advance(10000);assert.equal(reads,3);assert.equal(one(root,'message-input').value,'定时同步保留草稿');
+ pending.resolve(thread({title:'不接收迟到的定时结果',revision:99}));await tick();assert.notEqual(one(root,'thread-title').textContent,'不接收迟到的定时结果');
+ view.destroy();assert.equal(timers.size,0);
+});
+
+test('a periodic owner change retires the old stream and only the new fresh connection grants writes',async t=>{
+ const timers=fakeClock(),streams=[];let reads=0;
+ const {root,view}=mount(t,{getThread:async()=>thread({ownerId:++reads===1?'first':'second',connectionId:reads===1?'old':'new',revision:reads}),subscribe:(_host,_id,c)=>{const row={c,closed:0};streams.push(row);return()=>row.closed++;}}, {timers});
+ await view.selectThread(thread().id);type(root,'所有者变化草稿');await timers.advance(15000);await tick();assert.equal(streams.length,2);assert.equal(streams[0].closed,1);assert.equal(reads,3);assert.equal(one(root,'send-button').disabled,false);
+ streams[0].c.onState(thread({title:'旧流回调',revision:100}));assert.notEqual(one(root,'thread-title').textContent,'旧流回调');assert.equal(one(root,'message-input').value,'所有者变化草稿');
+});
+
+test('rendered fenced code has a copy button and copies only raw code without sending the draft',async t=>{
+ const copied=[];let posts=0;const {root,doc,view}=mount(t,{action:async()=>{posts++;}});
+ doc.defaultView.navigator={clipboard:{async writeText(text){copied.push(text);}}};
+ view.update(thread({messages:[savedMessage('code','说明\n```js\n  const x = "<tag>";\n\treturn x;\n```')]}));type(root,'代码复制时的聊天草稿');
+ one(root,'code-copy-button').click();await tick();assert.deepEqual(copied,['  const x = "<tag>";\n\treturn x;']);assert.equal(one(root,'code-copy-button').textContent,'已复制');assert.equal(posts,0);assert.equal(one(root,'message-input').value,'代码复制时的聊天草稿');
+});
+
+test('partial history remains explicit and its retry re-reads the first page instead of a dead cursor',async t=>{
+ const calls=[];
+ const {root,view}=mount(t,{getThread:async()=>thread(),getThreadHistory:async(_host,id,{cursor})=>{calls.push(cursor);return historyPage(id,[savedMessage('partial')],{complete:calls.length>1,issues:calls.length>1?[]:['source_budget']});}});
+ await view.selectThread(thread().id);await tick();assert.match(one(root,'history-hint').textContent,/不完整/);assert.equal(one(root,'history-more').hidden,false);assert.equal(one(root,'history-more').textContent,'重新读取历史');
+ one(root,'history-more').click();await tick();assert.deepEqual(calls,[null,null]);assert.equal(one(root,'history-more').hidden,true);
+});
+
+test('a delayed periodic GET cannot roll back an accepted SSE update with opaque string revisions',async t=>{
+ const timers=fakeClock(),pending=deferred(),streams=[];let reads=0,posts=0;
+ const {root,view}=mount(t,{getThread:()=>++reads===1?Promise.resolve(thread({revision:'r1',messages:[savedMessage('live','初始r1')]})):pending.promise,
+ subscribe:(_host,_id,c)=>{streams.push(c);return()=>{};},action:async()=>{posts++;}}, {timers});
+ await view.selectThread(thread().id);type(root,'竞态期间草稿');await timers.advance(15000);
+ streams[0].onState(thread({revision:'r2',status:'running',activeTurnId:'new-turn',messages:[savedMessage('live','最新r2')]}));
+ pending.resolve(thread({revision:'r1',status:'idle',messages:[savedMessage('live','迟到旧r1')]}));await tick();
+ assert.equal(one(root,'message-assistant').textContent.includes('最新r2'),true);assert.equal(one(root,'message-assistant').textContent.includes('迟到旧r1'),false);
+ assert.equal(one(root,'send-button').textContent,'补充方向');assert.equal(one(root,'message-input').value,'竞态期间草稿');assert.equal(streams.length,1);assert.equal(posts,0);
+});
+
+test('hidden offline hints and late navigation cannot start GETs or streams before one visible refresh',async t=>{
+ const timers=fakeClock();let reads=0,streams=0;
+ const {root,doc,view}=mount(t,{getThread:async(host,id)=>{reads++;return thread({host,id});},subscribe:()=>{streams++;return()=>{};}},{timers});
+ await view.selectThread(thread().id);type(root,'后台期间草稿');doc.visibilityState='hidden';doc.fire('visibilitychange');
+ doc.defaultView.fire('offline');doc.defaultView.fire('online');await view.selectThread('late-created-chat');await timers.advance(120000);
+ assert.equal(reads,1);assert.equal(streams,1);assert.equal(timers.size,0);assert.equal(one(root,'send-button').disabled,true);
+ doc.visibilityState='visible';doc.fire('visibilitychange');await tick();assert.equal(reads,2);assert.equal(streams,2);
+ assert.equal(one(root,'thread-title').textContent,'手机适配');view.destroy();assert.equal(timers.size,0);
+});
+
+test('the first older-page click advances past the hundred-message live window',async t=>{
+ const rows=Array.from({length:200},(_,i)=>savedMessage('m'+(i+1))),limits=[];
+ const {root,view}=mount(t,{getThread:async()=>thread({messages:rows.slice(-100)}),getThreadHistory:async(_host,id,{cursor,limit})=>{
+  limits.push(limit);return cursor?historyPage(id,rows.slice(160-limit,160),{hasMore:true,nextCursor:'oldest'}):historyPage(id,rows.slice(-40),{hasMore:true,nextCursor:'older'});
+ }});
+ await view.selectThread(thread().id);await tick();assert.equal(byClass(root,'message').length,100);
+ one(root,'history-more').click();await tick();assert.ok(byClass(root,'message').length>100);assert.deepEqual(limits,[40,80]);
 });

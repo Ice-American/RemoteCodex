@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { TodayImagesReader, shanghaiDate } from './today-images.mjs';
+import { HistoryPagesReader } from './history-pages.mjs';
 import { itemVisibleText, itemImageSource, itemHasImages, nativeImageContent } from './media.mjs';
 
 export const validThreadId = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9-]{27}$/i.test(value);
@@ -215,9 +216,10 @@ function projectMetadata(state) {
 }
 
 export class ThreadCatalog {
-  constructor(home, { now = () => Date.now(), todayImages = {} } = {}) {
+  constructor(home, { now = () => Date.now(), todayImages = {}, historyPages = {} } = {}) {
     this.home = home; this.now = now; this.paths = new Map(); this.pathsAt = 0;
     this.todayImages = new TodayImagesReader({project:parseVisibleHistoryRecords,...todayImages});
+    this.historyPages = new HistoryPagesReader({project:parseVisibleHistoryRecords,...historyPages});
   }
   async snapshot() {
     let state = {}, stateAvailable = false, indexAvailable = false;
@@ -349,6 +351,12 @@ export class ThreadCatalog {
     if (signal?.aborted) throw signal.reason ?? Error('读取已取消');
     await this.refreshPaths();
     return this.todayImages.read(this.paths.get(id),id,{media,date,signal});
+  }
+  async readPage(id, options = {}) {
+    if (!validThreadId(id)) throw Error('无效聊天标识');
+    if (options.signal?.aborted) throw options.signal.reason ?? Error('读取已取消');
+    await this.refreshPaths();
+    return this.historyPages.read(this.paths.get(id),id,options);
   }
   async read(id, limit = 80, {media} = {}) {
     if (!validThreadId(id)) throw Error('无效聊天标识');

@@ -1087,3 +1087,27 @@ test('closing the last SSE cannot cancel an action while its fresh owner check i
   control.readGate.resolve(); const result = await pending;
   assert.equal(result.data.status, 'rejected'); assert.match(result.data.message, /状态已变化/); assert.equal(control.mutations, 0);
 });
+
+test('saved history pages authenticate and validate before reading without connecting an owner', async t=>{
+ const f=await rig(t),calls=[];
+ const gateway=await f.start({catalog:{async readPage(id,options){calls.push({id,options});if(options.cursor==='expired')throw Object.assign(Error('/private/history'),{code:'HISTORY_CURSOR_EXPIRED'});return{messages:[{id:'older',role:'assistant',text:'saved'}],hasMore:true,nextCursor:'opaque',complete:true,issues:[],source:'local-history'};}}});
+ const route='/api/thread?view=history&id='+threadId;
+ assert.equal((await request(gateway,{route})).status,401);assert.equal(calls.length,0);
+ for(const suffix of ['&limit=0','&limit=81','&limit=2.5','&path=/private/file','&id='+threadId])assert.equal((await request(gateway,{route:route+suffix,headers:auth})).status,400);
+ assert.equal(calls.length,0);
+ const page=await request(gateway,{route:route+'&limit=20',headers:auth});assert.equal(page.status,200);assert.equal(page.data.messages[0].id,'older');assert.equal(page.data.host,'mac');assert.equal(calls[0].options.limit,20);assert.equal(page.data.ownerConfirmed,undefined);assert.equal(f.calls.discover,0);
+ const expired=await request(gateway,{route:route+'&cursor=expired',headers:auth});assert.equal(expired.status,409);assert.equal(expired.data.code,'HISTORY_CURSOR_EXPIRED');assert.ok(!expired.text.includes('/private/'));
+});
+test('closing a saved-history request cancels its read and never dispatches an action',async t=>{
+ const f=await rig(t),started=deferred(),cancelled=deferred();
+ const gateway=await f.start({catalog:{readPage(_id,{signal}){started.resolve();return new Promise((_,reject)=>signal.addEventListener('abort',()=>{cancelled.resolve();reject(signal.reason);},{once:true}));}}});
+ const req=http.get({host:'127.0.0.1',port:gateway.port,path:'/api/thread?view=history&id='+threadId,headers:auth});req.on('error',()=>{});t.after(()=>req.destroy());await within(started.promise,'history did not start');req.destroy();await within(cancelled.promise,'history did not cancel');assert.equal(f.calls.discover,0);
+});
+test('opt-in event streams start with a snapshot then send a smaller visible delta',async t=>{
+ const {gateway,control}=await ownerRig(t);control.ready=true;control.turns=[{items:Array.from({length:100},(_,i)=>({type:'agentMessage',id:'m'+i,text:'x'.repeat(1000),phase:'final'}))}];
+ const first=deferred(),second=deferred(),frames=[];let response,buffer='';
+ const req=http.get({host:'127.0.0.1',port:gateway.port,path:'/api/events?host=mac&id='+threadId+'&delta=1',headers:auth},res=>{response=res;res.on('error',()=>{});res.on('data',bytes=>{buffer+=bytes;let end;while((end=buffer.indexOf('\n\n'))>=0){const frame=buffer.slice(0,end);buffer=buffer.slice(end+2);const event=/event: (\w+)/.exec(frame)?.[1],data=/data: (.+)/.exec(frame)?.[1];if(data&&['snapshot','delta'].includes(event)){frames.push({event,data:JSON.parse(data)});(frames.length===1?first:second).resolve();}}});});req.on('error',()=>{});t.after(()=>{response?.destroy();req.destroy();});
+ await within(first.promise,'initial snapshot missing');assert.equal(frames[0].event,'snapshot');assert.equal(frames[0].data.sequence,1);
+ const snapshot=control.owner.snapshots.get(threadId);snapshot.state.turns[0].items[99].text+=' update';control.owner.publish('snapshot',{threadId});
+ await within(second.promise,'delta missing');assert.equal(frames[1].event,'delta');assert.equal(frames[1].data.base,1);assert.equal(frames[1].data.messages.upsert.length,1);assert.ok(JSON.stringify(frames[1]).length<JSON.stringify(frames[0]).length/10);assert.equal(control.mutations,0);
+});
