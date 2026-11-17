@@ -184,3 +184,8 @@ pre { margin: 10px 0; padding: 13px; white-space: pre-wrap; word-break: break-wo
 .create-submit { min-height: 46px; border: 0; border-radius: 11px; background: #345e4c; color: white; font-size: 15px; }
 @media (min-width: 700px) { .app-header { grid-template-columns: auto minmax(0, 1fr) auto auto; padding: 15px max(20px, calc((100% - 780px) / 2)); } .host-switch { grid-column: auto; min-width: 220px; } .composer { padding-left: max(20px, calc((100% - 760px) / 2)); padding-right: max(20px, calc((100% - 760px) / 2)); } .conversation { padding-top: 28px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; } .running-indicator { animation: none; } }
+/* A source boundary is explicit when no shared message identity orders both views. */
+.message-source-boundary { margin:16px 0 8px; padding:8px 0; color:#69776e; font-size:12px; border-bottom:1px solid #d4e3d9; }
+.same-text-saved-record { margin:6px 0; padding:0 10px; border-left:2px solid #d4e3d9; color:#69776e; font-size:12px; }
+.same-text-saved-record > summary { min-height:40px; display:list-item; align-content:center; cursor:pointer; }
+.same-text-saved-body { padding:4px 0 12px; white-space:pre-wrap; overflow-wrap:anywhere; }

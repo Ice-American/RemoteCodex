@@ -214,3 +214,41 @@ test('running conversation projects only confirmed native tool images and exclud
   assert.equal(captured.length,1);assert.deepEqual(Object.keys(captured[0]).sort(),['content','id','type']);assert.deepEqual(Object.keys(captured[0].content[0]).sort(),['data','mimeType','type']);
   for(const secret of ['arguments','private tool output','metadata','structure',data])assert.equal(JSON.stringify(messages).includes(secret),false);
 });
+
+test('mixed history retains response-only text before and after unrelated event rows', () => {
+  const rows = [
+    {type:'response_item',payload:{type:'message',role:'assistant',channel:'final',id:'response-a',content:[{type:'output_text',text:'response A'}]}},
+    {type:'response_item',payload:{type:'message',role:'user',id:'response-b',content:[{type:'input_text',text:'response B'}]}},
+    {type:'event_msg',payload:{type:'agent_message',message:'event C'}},
+    {type:'response_item',payload:{type:'message',role:'assistant',channel:'commentary',id:'response-d',content:[{type:'output_text',text:'response D'}]}},
+  ];
+  assert.deepEqual(parseVisibleHistory(rows.map(JSON.stringify).join('\n')).map(row=>row.text),['response A','response B','event C','response D']);
+});
+
+test('strict chronological event-response pairs keep repeated prompt occurrences without duplicate bodies', () => {
+  const event = message => ({type:'event_msg',payload:{type:'user_message',message}});
+  const response = (id,text) => ({type:'response_item',payload:{type:'message',role:'user',id,content:[{type:'input_text',text}]}});
+  const rows=[event('repeat'),response('first','repeat'),event('middle'),response('middle','middle'),event('repeat'),response('second','repeat')];
+  assert.deepEqual(parseVisibleHistory(rows.map(JSON.stringify).join('\n')).map(row=>row.text),['repeat','middle','repeat']);
+});
+
+test('unequal repeated-text source groups keep unpaired records rather than guessing identity', () => {
+  const rows=[
+    {type:'response_item',payload:{type:'message',role:'user',id:'early',content:[{type:'input_text',text:'repeat'}]}},
+    {type:'event_msg',payload:{type:'agent_message',message:'between'}},
+    {type:'event_msg',payload:{type:'user_message',message:'repeat'}},
+    {type:'response_item',payload:{type:'message',role:'user',id:'late',content:[{type:'input_text',text:'repeat'}]}},
+  ];
+  assert.deepEqual(parseVisibleHistory(rows.map(JSON.stringify).join('\n')).map(row=>row.text),['repeat','between','repeat','repeat']);
+});
+
+test('ambiguous repeated-text media stays attached to its original response occurrence', () => {
+  const rows=[
+    {type:'response_item',payload:{type:'message',role:'user',id:'early-photo',content:[{type:'input_text',text:'repeat'},{type:'input_image',image_url:'data:image/png;base64,Zmlyc3Q='}]}},
+    {type:'event_msg',payload:{type:'user_message',message:'repeat'}},
+    {type:'response_item',payload:{type:'message',role:'user',id:'late-photo',content:[{type:'input_text',text:'repeat'},{type:'input_image',image_url:'data:image/png;base64,c2Vjb25k'}]}},
+  ];
+  const media={decorateItem:(_thread,item)=>({text:item.text??item.content?.filter(c=>c.type==='text').map(c=>c.text).join('\n')??'',images:item.content?.some(c=>c.type==='image')?[{id:item.id,contentKey:'opaque',name:'picture'}]:[]})};
+  const messages=parseVisibleHistory(rows.map(JSON.stringify).join('\n'),80,{threadId:id(1),media});
+  assert.deepEqual(messages.map(m=>m.text),['repeat','repeat','repeat']);assert.deepEqual(messages.filter(m=>m.images?.length).map(m=>m.images[0].id),['early-photo','late-photo']);
+});

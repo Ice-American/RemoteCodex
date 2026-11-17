@@ -1,5 +1,6 @@
 // Mobile view of an existing desktop owner. Only server snapshots establish messages or completed requests.
 import { applyStateDelta } from './thread-updates.mjs';
+import { messageTimeline } from './message-timeline.mjs';
 import {createCodeBlock} from './code-copy.mjs';
 import {ThreadPreviewCache} from './thread-cache.mjs';
 const statusLabels = {
@@ -596,12 +597,13 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function cancelHistory() {
     if(historyRead){cancel(historyRead.timeout);historyRead.controller.abort();historyRead.reject?.(Error('历史读取已取消'));historyRead=null;}
   }
-  function renderHistory() {
+  function renderHistory(timeline = messageTimeline(history.messages, state?.messages ?? [])) {
     historyPanel.hidden=!selectedId||typeof api.getThreadHistory!=='function';
     historyMore.hidden=history.loaded&&!history.hasMore&&!history.error&&history.complete;
     historyMore.disabled=!!historyRead;
     historyMore.textContent=historyRead?'正在读取历史…':history.reset?'重新读取历史':history.error?'重试读取历史':history.loaded?'加载更早消息':'读取已保存历史';
-    historyHint.textContent=history.error||(history.complete===false?'部分历史暂未取得，当前内容不完整。':history.loaded&&!history.hasMore?'已加载全部已保存历史':'');
+    const alignment = timeline.separated ? '已保存记录与当前消息尚未对齐，分段显示。' : timeline.reason === 'conflict' ? '当前消息按电脑上的顺序显示。' : '';
+    historyHint.textContent=[history.error||(history.complete===false?'部分历史暂未取得，当前内容不完整。':history.loaded&&!history.hasMore?'已加载全部已保存历史':''),alignment].filter(Boolean).join(' ');
     historyHint.hidden=!historyHint.textContent;
   }
   function showHistoryPreview(page) {
@@ -912,15 +914,28 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     }
     reconcile(item.media, children); item.media.hidden = !children.length;
   }
+  const savedSourceHeading = node('p', 'message-source-boundary', '已保存记录');
+  const liveSourceHeading = node('p', 'message-source-boundary', '当前会话');
   function renderMessages() {
-    renderHistory();
+    const timeline = messageTimeline(history.messages, state?.messages ?? []);
+    renderHistory(timeline);
     if (!state) { closePreview({ restoreFocus: false }); messageNodes.clear(); messages.replaceChildren(); requests.replaceChildren(); empty.hidden = false; return; }
     const scope = scopeOf(state); if (scope !== messageScope) { closePreview({ restoreFocus: false }); messageNodes.clear(); messageScope = scope; }
-    const rows = dedupeMessages([...history.messages,...state.messages??[]]), children = [];
-    rows.forEach((message, index) => {
-      const key = JSON.stringify([message.role, message.id ?? ['position', index]]);
+    const rows = timeline.rows, children = [];
+    rows.forEach(({message,key,sameTextSaved}, index) => {
+      if(timeline.separated && index===0)children.push(savedSourceHeading);
+      if(timeline.separated && index===timeline.boundary)children.push(liveSourceHeading);
       let item = messageNodes.get(key);
-      if (!item) {
+      if(sameTextSaved) {
+        if(!item?.savedRecord) {
+          if(item && [...item.images.values()].includes(previewRecord))closePreview({restoreFocus:false});
+          const el=node('details','same-text-saved-record'),summary=node('summary','','同文的已保存记录'),body=node('div','same-text-saved-body');
+          el.append(summary,body);item={el,textBody:body,text:null,images:new Map(),savedRecord:true};messageNodes.set(key,item);
+        }
+        if(item.text!==message.text){renderSafeText(item.textBody,message.text);item.text=message.text;}
+        children.push(item.el);return;
+      }
+      if (!item || item.savedRecord) {
         const el = node('article', 'message ' + (message.role === 'user' ? 'message-user' : 'message-assistant'));
         const who = node('p', 'message-role', message.role === 'user' ? '你' : message.role === 'assistant' ? 'Codex' : '系统');
         const body = node('div', 'message-body'), text = node('div', 'message-text'), media = node('div', 'message-images');

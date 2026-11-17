@@ -192,7 +192,6 @@ export class HistoryPagesReader {
   }
   async index(data,threadId,record) {
     const groups=new Map(),index=[],issues=data.issues,resolvedKeys=new Set();
-    const anyEvents=data.records.some(r=>['user_message','agent_message'].includes(r.row.payload.type));
     for(const row of data.records) {
       const p=row.row.payload;
       // Only accepted public user records are evidence of an answer. Tool
@@ -214,12 +213,10 @@ export class HistoryPagesReader {
       for(const row of group.records) {
         for(const message of this.project([row],Infinity,{threadId}))if(!orders.has(message.id))orders.set(message.id,row.order);
       }
-      const hasEvents=group.records.some(r=>['user_message','agent_message'].includes(r.row.payload.type));
       const messages=this.project(group.records,Infinity,{threadId});
       messages.forEach((message,localIndex)=>{
-        // The full parser suppresses response-only text if any event rows exist
-        // elsewhere. Its image-bearing orphans must still remain visible.
-        if(anyEvents&&!hasEvents&&!('images'in message))return;
+        // Group projection already resolves exact duplicate representations.
+        // A different group's event cannot suppress this public message.
         index.push({id:message.id,group,localIndex,order:orders.get(message.id)??group.records[0].order});
       });
     }

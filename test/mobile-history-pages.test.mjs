@@ -17,7 +17,7 @@ test('distant event/response and tool wrappers keep full-parser identity, order 
  const rows=[event(0,'same text'),{type:'response_item',payload:{type:'function_call_output',call_id:'tool-call',output:[{type:'input_image',image_url:'data:image/png;base64,'+png}]}},response('orphan','response-only text'),...Array.from({length:40},(_,i)=>event(i+1)),{type:'response_item',payload:{type:'message',role:'assistant',channel:'final',id:'paired-response',content:[{type:'output_text',text:'same text'},{type:'input_image',image_url:'data:image/png;base64,'+png}]}},{type:'event_msg',payload:{type:'item_completed',item:{type:'McpToolCall',id:'tool-call',status:'completed',result:{content:[{type:'image',mimeType:'image/png',data:png}]}}}}];
  const {catalog,media,text}=await fixture(t,rows);const expected=parseVisibleHistory(text,Infinity,{media:new MobileMedia(),threadId:id});let cursor,all=[];
  do{const page=await catalog.readPage(id,{media,limit:5,cursor});assert.equal(page.complete,true);all.unshift(...page.messages);cursor=page.nextCursor;}while(cursor);
- assert.deepEqual(all,expected);assert.equal(all.filter(m=>m.id==='tool-call').length,1);assert.equal(all.some(m=>m.text==='response-only text'),false);assert.equal(all[0].images.length,1);
+ assert.deepEqual(all,expected);assert.deepEqual(all.map(m=>m.text),['same text','','response-only text',...Array.from({length:40},(_,i)=>'message '+(i+1))]);assert.equal(all.filter(m=>m.id==='tool-call').length,1);assert.equal(all[0].images.length,1);
 });
 test('only returned messages register media, including when a pairing group spans multiple pages',async t=>{
  const rows=Array.from({length:20},(_,i)=>({...event(i,'repeated text'),payload:{type:'agent_message',message:'repeated text',images:['data:image/png;base64,'+png]}}));
@@ -145,4 +145,26 @@ test('answer evidence is chat scoped, cached off the SSE path and explicitly ref
  const first=await catalog.readAnsweredQuestions(id);assert.equal(first.resolvedKeys.length,1);for(let n=0;n<10;n++)await catalog.readAnsweredQuestions(id);assert.equal(scans,1);
  await fs.appendFile(file,JSON.stringify(row('["request_user_input_async","second-call",0]'))+'\n');assert.equal((await catalog.readAnsweredQuestions(id)).resolvedKeys.length,1);assert.equal((await catalog.readAnsweredQuestions(id,{fresh:true})).resolvedKeys.length,2);assert.equal(scans,2);
  assert.deepEqual((await catalog.readAnsweredQuestions(other)).resolvedKeys,[]);
+});
+
+test('mixed-source pages retain every unmatched public response in source order',async t=>{
+ const rows=[response('a','response A'),response('b','response B'),event(0,'event C'),response('d','response D')];
+ const {catalog,media}=await fixture(t,rows);const tail=await catalog.readPage(id,{media,limit:2});
+ assert.equal(tail.complete,true);assert.deepEqual(tail.messages.map(m=>m.text),['event C','response D']);
+ const head=await catalog.readPage(id,{media,limit:2,cursor:tail.nextCursor});assert.equal(head.complete,true);assert.equal(head.hasMore,false);assert.deepEqual(head.messages.map(m=>m.text),['response A','response B']);
+});
+
+test('unequal repeated prompt groups remain lossless across page boundaries',async t=>{
+ const rows=[response('a','repeat'),event(0,'between'),event(1,'repeat'),response('b','repeat')];const {catalog,media}=await fixture(t,rows);let cursor,all=[];
+ do{const page=await catalog.readPage(id,{media,limit:1,cursor});assert.equal(page.complete,true);all.unshift(...page.messages);cursor=page.nextCursor;}while(cursor);
+ assert.deepEqual(all.map(m=>m.text),['repeat','between','repeat','repeat']);
+});
+
+test('keeping unmatched public responses does not expose hidden channels or raw tool text',async t=>{
+ const rows=[response('a','public response'),event(0,'public event'),
+  {type:'response_item',payload:{type:'message',role:'developer',content:[{type:'input_text',text:'hidden developer'}]}},
+  {type:'response_item',payload:{type:'message',role:'assistant',channel:'analysis',content:[{type:'output_text',text:'hidden reasoning'}]}},
+  {type:'response_item',payload:{type:'function_call_output',call_id:'raw-tool',output:'private raw output'}},
+  {type:'event_msg',payload:{type:'agent_message',channel:'analysis',message:'hidden event reasoning'}}];
+ const {catalog,media}=await fixture(t,rows);const page=await catalog.readPage(id,{media});assert.equal(page.complete,true);assert.deepEqual(page.messages.map(m=>m.text),['public response','public event']);assert.equal(JSON.stringify(page).includes('hidden'),false);assert.equal(JSON.stringify(page).includes('private raw output'),false);
 });

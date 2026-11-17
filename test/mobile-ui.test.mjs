@@ -1506,3 +1506,19 @@ test('a genuinely changed question reappears normally after an old submitted rec
  snapshot=thread({revision:2,questions:[fresh]});view.update(snapshot);assert.equal(byClass(root,'request-receipt').length,0);assert.equal(one(root,'answer-input').value,'');assert.equal(one(root,'primary-button').disabled,true);
  obsoleteSubmit.fire('click');assert.equal(calls.length,1);answerReceiptQuestion(root,'新回答');await tick();await tick();assert.equal(calls.length,2);assert.deepEqual(calls[1].answers.answer,['新回答']);
 });
+
+test('a saved suffix cannot rotate the authoritative live message order',async t=>{
+ const rows=Array.from({length:100},(_,i)=>savedMessage('ordered-'+i,'ordered '+i));
+ const {root,view}=mount(t,{getThread:async()=>thread({messages:rows}),getThreadHistory:async(_host,id)=>historyPage(id,rows.slice(-40),{hasMore:true,nextCursor:'older'})});
+ await view.selectThread(thread().id);await tick();const rendered=byClass(root,'message').map(n=>one(n,'message-text').textContent);assert.deepEqual(rendered,rows.map(m=>m.text));assert.equal(rendered.at(-1),'ordered 99');
+});
+test('unanchored saved and live records retain their identities and have visible source labels',async t=>{
+ const {root,view}=mount(t,{getThread:async()=>thread({messages:[savedMessage('live-id','same')] }),getThreadHistory:async(_host,id)=>historyPage(id,[savedMessage('saved-id','same')])});
+ await view.selectThread(thread().id);await tick();assert.equal(byClass(root,'message').length,2);assert.deepEqual(byClass(root,'message-source-boundary').map(n=>n.textContent),['已保存记录','当前会话']);assert.match(one(root,'history-hint').textContent,/分段显示/);
+});
+
+test('same-text saved records are expandable without deleting either original identity',async t=>{
+ const savedUser={id:'saved-user',role:'user',text:'a real repeated-looking prompt'},liveUser={...savedUser,id:'live-user'};
+ const {root,view}=mount(t,{getThread:async()=>thread({messages:[savedMessage('anchor-a'),liveUser,savedMessage('anchor-b')]}),getThreadHistory:async(_host,id)=>historyPage(id,[savedMessage('anchor-a'),savedUser,savedMessage('anchor-b')])});
+ await view.selectThread(thread().id);await tick();assert.equal(byClass(root,'message-user').length,1);const record=one(root,'same-text-saved-record');assert.match(record.textContent,/同文的已保存记录/);assert.match(record.textContent,/a real repeated-looking prompt/);assert.equal(record.tagName,'DETAILS');assert.equal(record.open,undefined);
+});

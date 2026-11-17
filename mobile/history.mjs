@@ -130,16 +130,15 @@ export function parseVisibleHistoryRecords(records, limit = 80, options = {}) {
     if (!groups.has(key)) groups.set(key,{events:[],responses:[]});
     groups.get(key)[kind].push(row);
   }
-  const signatures = new Set();
-  for (const [key,group] of groups) {
-    if (group.events.length) signatures.add(key);
+  for (const group of groups.values()) {
     // Repeated identical prompts must pair in chronological order. A nearest
     // match can steal the next message's photo across intervening tool rows.
-    // Unequal counts are ambiguous: preserve orphan media separately below.
+    // Unequal counts are ambiguous: preserve the original records below
+    // instead of deleting text or attaching a photo to a guessed occurrence.
     if (group.events.length !== group.responses.length) continue;
     group.events.forEach((event,index)=>paired.set(event,group.responses[index]));
   }
-  const rows = events.length ? events.map(event => {
+  const rows = events.map(event => {
     const match = paired.get(event);
     if (!match) return event;
     used.add(match);
@@ -148,13 +147,11 @@ export function parseVisibleHistoryRecords(records, limit = 80, options = {}) {
       const source = itemImageSource(value); if (source) sources.set(source,value);
     }
     return sources.size ? {...event,item:{...event.item,content:[{type:'text',text:itemVisibleText(event.item)},...sources.values()]}} : event;
-  }) : fallback;
-  if (events.length) for (const row of fallback) if (!used.has(row) && itemHasImages(row.item)) {
-    // Keep the original response media when legacy event rows are incomplete,
-    // without printing its body twice beside an identical event message.
-    const item = signatures.has(signature(row.item)) ? {...row.item,text:'',content:(row.item.content ?? []).filter(value=>!!itemImageSource(value))} : row.item;
-    rows.push({...row,item});
-  }
+  });
+  // Mixed rollouts can have event records for only part of their lifetime.
+  // An unrelated event never proves a response message is duplicated. Only
+  // an exact paired occurrence above may consume its response representation.
+  for (const row of fallback) if (!used.has(row)) rows.push(row);
   rows.push(...toolImages.values());
   return latestVisibleItems(rows.sort((a,b)=>a.order-b.order).map(row=>row.item),limit,options);
 }
