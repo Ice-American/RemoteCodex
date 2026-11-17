@@ -8,11 +8,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { createGateway } from '../mobile/gateway.mjs';
 import { Journal, writePrivate } from '../mobile/store.mjs';
 import { requestFingerprint } from '../mobile/requests.mjs';
 import { ThreadCatalog } from '../mobile/history.mjs';
-import { OwnerClient } from '../mobile/owner.mjs';
+import { OwnerClient, ownerSnapshotReady } from '../mobile/owner.mjs';
 import { OWNER_METHODS, OWNER_SUPPORTED_VERSIONS } from '../mobile/protocols.mjs';
 import { runtimeStatus } from '../src/state.mjs';
 
@@ -80,17 +81,20 @@ function openPeerStream(gateway) {
 
 // Keep live-state tests on a synthetic verified desktop, with no native socket,
 // real credentials, history, navigation or task-write method available.
-async function ownerRig(t, options = {}) {
-  const f = await rig(t), code = Buffer.from(JSON.stringify(Object.fromEntries(Object.entries(OWNER_METHODS)
-    .map(([key, method]) => [method, OWNER_SUPPORTED_VERSIONS[key].at(-1)]))));
+function syntheticIdentity(dir) {
+  const code = Buffer.from(JSON.stringify(Object.fromEntries(Object.entries(OWNER_METHODS)
+    .map(([key, method]) => [method, key === 'stream' ? 11 : OWNER_SUPPORTED_VERSIONS[key].at(-1)]))));
   const header = Buffer.from(JSON.stringify({ files: { '.vite': { files: { build: { files: {
     'synthetic.js': { size: code.length, offset: '0' },
   } } } } } }));
   const padded = Math.ceil((header.length + 8) / 4) * 4, prefix = Buffer.alloc(16);
   prefix.writeUInt32LE(4, 0); prefix.writeUInt32LE(padded, 4); prefix.writeUInt32LE(padded - 4, 8); prefix.writeUInt32LE(header.length, 12);
-  const asarPath = path.join(f.dir, 'synthetic.asar');
+  const asarPath = path.join(dir, 'synthetic.asar');
   fs.writeFileSync(asarPath, Buffer.concat([prefix, header, Buffer.alloc(8 + padded - 16 - header.length), code]));
-  const identity = { verified: true, fingerprint: 'synthetic-desktop', asarPath, socketPath: '/never-connect-synthetic.sock' };
+  return { verified: true, fingerprint: 'synthetic-desktop', asarPath, socketPath: '/never-connect-synthetic.sock' };
+}
+async function ownerRig(t, options = {}) {
+  const f = await rig(t), identity = syntheticIdentity(f.dir);
   const control = { ready: false, exists: true, reads: 0, opens: [], openAttempts: 0, unfollows: 0, mutations: 0, owner: null };
   const catalog = { get: async id => control.exists && id === threadId ? { id, title: 'Existing fixture' } : null,
     read: async () => ({ messages: [{ id: 'existing-user', role: 'user', text: 'Previous user message' }] }), query: async () => ({ threads: [] }) };
@@ -100,6 +104,7 @@ async function ownerRig(t, options = {}) {
     return identity;
   });
   t.mock.method(OwnerClient.prototype, 'freshSnapshot', async function (id) {
+    if (control.readError) throw control.readError;
     control.reads++; this.unknown(id, 'Waiting for a fresh owner snapshot', { refreshing: true });
     control.readStarted?.resolve(); if (control.readGate) await control.readGate.promise;
     if (!control.ready || !this.connected) throw Object.assign(Error('No live Desktop owner was found'), { code: 'OWNER_UNAVAILABLE' });
@@ -110,6 +115,16 @@ async function ownerRig(t, options = {}) {
       activeTurnId: null, status: runtimeStatus(state), source: 'official-desktop-owner-IPC-live', state };
     this.snapshots.set(id, snapshot); this.owners.set(id, { owner: snapshot.owner, generation: this.generation, supportsUntrustedAppInput: true });
     return structuredClone(snapshot);
+  });
+  // This rig isolates HTTP lifetime and cancellation. The wire integration
+  // tests below keep the real readiness method and stream decoder instead.
+  t.mock.method(OwnerClient.prototype, 'waitForReady', async function (id, { signal } = {}) {
+    while (!signal?.aborted) {
+      try { const snapshot = await this.freshSnapshot(id); if (ownerSnapshotReady(snapshot)) return snapshot; }
+      catch (error) { if (signal?.aborted) throw signal.reason; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    throw signal.reason;
   });
   const unfollow = OwnerClient.prototype.unfollow;
   t.mock.method(OwnerClient.prototype, 'unfollow', function (id) { if (this === control.owner) control.unfollows++; return unfollow.call(this, id); });
@@ -495,6 +510,82 @@ test('idle SSE sends a JavaScript-visible ping so the phone can detect a stalled
   response.destroy(); req.destroy(); await within(serverClosed.promise, 'SSE close did not settle'); await f.close(gateway); assert.equal(timers.size, 0);
 });
 
+test('cold load deadline also bounds desktop discovery before navigation', async t => {
+  const gate = deferred(); t.after(() => gate.resolve());
+  const { gateway, control } = await ownerRig(t, { discover: async () => { await gate.promise; throw Error('fixture discovery stopped'); } });
+  const timers = [], nativeTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (run, delay, ...args) => {
+    const timer = nativeTimeout(run, delay, ...args); timers.push({ run, delay }); return timer;
+  });
+  const pending = gateway.action({ host: 'mac', threadId, operationId: 'load-discovery-deadline', action: 'load' });
+  const outcome = assert.rejects(pending, /连接原聊天超时/);
+  await new Promise(resolve => setImmediate(resolve));
+  const deadline = timers.find(timer => timer.delay === 45000);
+  assert.ok(deadline, 'one 45s deadline covers preflight as well as navigation and restore');
+  deadline.run(); await outcome;
+  assert.deepEqual(control.opens, []); assert.equal(control.mutations, 0);
+});
+
+test('cold load uses the real owner stream through resume patches and concurrent HTTP reads', async t => {
+  const f = await rig(t), identity = syntheticIdentity(f.dir), pipe = new EventEmitter();
+  const opened = deferred(), navigate = deferred(), firstSnapshot = deferred();
+  const control = { navigations: 0, follows: 0, mutations: 0, navigated: false, revision: 1 };
+  let state = { id: threadId, title: 'Wire fixture', resumeState: 'resuming', threadRuntimeStatus: { type: 'idle' }, turns: [], requests: [] };
+  const frame = change => pipe.emit('frame', { type: 'broadcast', method: OWNER_METHODS.stream, version: 11,
+    sourceClientId: 'wire-owner', params: { hostId: 'local', conversationId: threadId, change } });
+  pipe.socket = { destroyed: false };
+  pipe.close = () => { pipe.socket.destroyed = true; pipe.emit('disconnected'); };
+  pipe.request = async method => {
+    if (method !== OWNER_METHODS.owner) { control.mutations++; throw Error('Task write forbidden'); }
+    if (!control.navigated) throw Error('no-client-found');
+    return { type: 'response', resultType: 'success', method, handledByClientId: 'wire-owner', result: { supportsUntrustedAppInput: true } };
+  };
+  pipe.broadcast = (method, params) => {
+    if (params.following) {
+      control.follows++;
+      frame({ type: 'snapshot', revision: control.revision, conversationState: state }); firstSnapshot.resolve();
+    }
+  };
+  t.mock.method(OwnerClient.prototype, 'connect', async function () {
+    this.connected = true; this.generation++; this.identity = identity; this.abort = new AbortController(); this.pipe = pipe;
+    const generation = this.generation;
+    pipe.on('frame', value => this.receive(value, pipe, generation));
+    pipe.on('disconnected', () => this.invalidate(pipe, generation, 'fixture disconnect'));
+    return identity;
+  });
+  const gateway = await f.start({ discover: async () => identity,
+    catalog: { get: async () => ({ id: threadId, title: 'Wire fixture' }), read: async () => ({ messages: [] }) },
+    nativeTools: { openExistingThread: async () => { control.navigations++; opened.resolve(); await navigate.promise; control.navigated = true; } } });
+  const pending = request(gateway, { route: '/api/action', method: 'POST', headers: auth,
+    body: { host: 'mac', threadId, action: 'load', operationId: 'wire-cold-load' } });
+  await within(opened.promise, 'navigation did not start'); navigate.resolve();
+  await within(firstSnapshot.promise, 'initial resume snapshot did not arrive');
+  const before = await gateway.state(threadId);
+  assert.equal(before.connected, false); assert.equal(before.ownerConfirmed, false); assert.equal(before.capabilities.send, false);
+  const concurrent = gateway.state(threadId, { refresh: true });
+  await new Promise(resolve => setImmediate(resolve));
+  state = { ...state, resumeState: 'resumed' }; control.revision = 2;
+  frame({ type: 'patches', baseRevision: 1, revision: 2, patches: [{ op: 'replace', path: ['resumeState'], value: 'resumed' }] });
+  const [loaded, read] = await Promise.all([pending, concurrent]);
+  assert.equal(loaded.data.status, 'confirmed'); assert.equal(loaded.data.state.connected, true);
+  assert.equal(read.connected, true); assert.equal(read.ownerConfirmed, true); assert.equal(read.capabilities.send, true);
+  assert.equal(control.navigations, 1); assert.equal(control.follows, 1); assert.equal(control.mutations, 0);
+  assert.equal(new Journal(f.dir).records.size, 0);
+});
+
+test('paired cold loads have transport headroom while message timeouts stay unchanged', async t => {
+  const calls = rawPeerResponse(t, () => ({ bytes: Buffer.from('{"status":"confirmed"}'), headers: { 'content-type': 'application/json' } }));
+  const f = await rig(t, { peers: [{ id: 'windows', url: 'https://windows-fixture.tailfixture.ts.net', address: '100.64.23.45' }] }), gateway = await f.start();
+  const delays = [], nativeTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (run, delay, ...args) => { delays.push(delay); return nativeTimeout(run, delay, ...args); });
+  for (const action of ['load', 'send']) {
+    const result = await request(gateway, { route: '/api/action', method: 'POST', headers: auth,
+      body: { host: 'windows', threadId, operationId: 'peer-budget-' + action, action } });
+    assert.equal(result.data.status, 'confirmed');
+  }
+  assert.deepEqual(delays, [55000, 20000]); assert.equal(calls.length, 2);
+});
+
 test('history GET identifies a known unloaded chat without navigating or enabling any task action', async t => {
   const { gateway, control } = await ownerRig(t);
   const first = await request(gateway, { route: '/api/thread?id=' + threadId, headers: auth });
@@ -515,6 +606,16 @@ test('offline or unverified desktop cannot offer loading even when its local cat
   const gateway = await f.start({ catalog });
   const view = await gateway.state(threadId);
   assert.equal(view.connectionState, 'unavailable'); assert.equal(view.canLoad, false);
+});
+
+test('a protocol change cannot be mislabelled as an unloaded chat', async t => {
+  const { gateway, control } = await ownerRig(t);
+  control.readError = Object.assign(Error('Unverified stream version'), { code: 'UNSUPPORTED_METHOD' });
+  const state = await gateway.state(threadId, { refresh: true });
+  assert.equal(state.connectionState, 'incompatible'); assert.equal(state.canLoad, false);
+  assert.equal(state.connected, false); assert.equal(state.error, 'UNSUPPORTED_METHOD');
+  assert.ok(Object.values(state.capabilities).every(value => value === false));
+  assert.equal(control.opens.length, 0); assert.equal(control.mutations, 0);
 });
 
 test('an owner snapshot can preserve visible messages while unloaded or unconfirmed state still requires explicit loading', async t => {

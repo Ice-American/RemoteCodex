@@ -21,7 +21,6 @@ const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
 const mime = { '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
 const digest = text => crypto.createHash('sha256').update(text).digest('hex');
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 const loadError = (message, code) => Object.assign(Error(message), { code });
 async function cancellable(promise, signal) {
   if (!signal) return promise;
@@ -49,7 +48,7 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   hostName = hostId === 'mac' ? 'Mac' : 'Windows', peers = [], dir = dataDirectory(),
   discover = discoverNativeDesktop, secrets = new Secrets(dir), journal = new Journal(dir),
   catalog = new ThreadCatalog(codexHome()), nativeTools = new NativeTools({ discover }),
-  loadTimeoutMs = 12000,
+  loadTimeoutMs = 45000,
 } = {}) {
   const key = await secrets.get('self', { create: true });
   const assets = new Map(await Promise.all((await fs.readdir(publicDir)).filter(name => mime[path.extname(name)]).map(async name => [name, await fs.readFile(path.join(publicDir, name))])));
@@ -129,10 +128,11 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
     const metadata = knownMetadata === undefined ? ready && live?.state?.title ? null : await catalog.get(id) : knownMetadata;
     const messages = live ? visibleTurns(live.state) : (await catalog.read(id)).messages;
     const status = live?.status?.type ?? 'unknown';
-    const canLoad = !ready && client?.connected === true && !client.pipe?.socket?.destroyed && metadata?.id === id &&
+    const incompatible = error === 'UNSUPPORTED_METHOD';
+    const canLoad = !ready && !incompatible && client?.connected === true && !client.pipe?.socket?.destroyed && metadata?.id === id &&
       typeof nativeTools.openExistingThread === 'function';
     return { host: hostId, id, title: live?.state?.title ?? metadata?.title ?? '原聊天', connected: ready,
-      connectionState: ready ? 'ready' : canLoad ? 'needs-load' : 'unavailable', canLoad: !!canLoad,
+      connectionState: ready ? 'ready' : incompatible ? 'incompatible' : canLoad ? 'needs-load' : 'unavailable', canLoad: !!canLoad,
       ownerConfirmed: ready, revision: ready ? live.revision : null, connectionId: ready ? String(live.generation) + ':' + live.owner : null,
       ownerId: ready ? live.owner : null, activeTurnId: ready ? live.activeTurnId : null, status, messages,
       questions: ready ? questionViews(live.state) : [], approvals: ready ? approvalViews(live.state) : [],
@@ -144,16 +144,28 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       source: live ? live.source : 'local-history-only', error };
   }
   async function loadExisting(id, signal) {
+    // Cold navigation includes desktop verification and history restoration.
+    // Bound the entire request, including discovery, inside the peer/UI budget.
+    const deadline = Date.now() + loadTimeoutMs, controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(loadError('连接原聊天超时，消息未发送，草稿已保留。请稍后重试。', 'LOAD_TIMEOUT')), loadTimeoutMs);
+    try {
+      return await joinExistingLoad(id, signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, deadline, () => clearTimeout(timeout));
+    } finally { clearTimeout(timeout); }
+  }
+  async function joinExistingLoad(id, signal, deadline, preflightDone) {
     const metadata = await cancellable(catalog.get(id), signal);
     if (metadata?.id !== id) throw Error('原聊天不在当前电脑目录中，未打开其他聊天');
     const owner = await cancellable(ensureClient(), signal), connection = owner.currentConnection();
     if (typeof nativeTools.openExistingThread !== 'function') throw Error('当前电脑尚不支持加载原聊天');
+    // The shared navigation now owns the remaining deadline. The independent
+    // preflight timer must not race its structured failure response.
+    preflightDone();
     let record = loads.get(id);
     if (!record || record.owner !== owner || record.generation !== connection.generation) {
       const controller = new AbortController();
-      record = { owner, generation: connection.generation, controller, consumers: new Set(), settled: false };
+      record = { owner, generation: connection.generation, controller, consumers: new Set(), settled: false, startedAt: Date.now(), phase: 'navigation' };
       loads.set(id, record);
-      const timeout = setTimeout(() => controller.abort(loadError('尚未确认原聊天已加载，请稍后重试。', 'LOAD_TIMEOUT')), loadTimeoutMs);
+      const timeout = setTimeout(() => controller.abort(loadError('电脑已打开，仍未确认原聊天加载完成。消息未发送，草稿已保留。', 'LOAD_TIMEOUT')), Math.max(1, deadline - Date.now()));
       const lost = () => controller.abort(loadError('官方桌面连接已变化，请重新读取原聊天。', 'CONNECTION_INTERRUPTED'));
       connection.signal.addEventListener('abort', lost, { once: true });
       const current = record;
@@ -162,20 +174,18 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
         // Opening is navigation only. Its ACK cannot establish a live owner,
         // and this path never sends a turn, answer, approval or interrupt.
         await cancellable(nativeTools.openExistingThread(id, { signal: controller.signal }), controller.signal);
-        let snapshot;
-        while (!controller.signal.aborted) {
-          try {
-            snapshot = await cancellable(owner.freshSnapshot(id, { timeoutMs: Math.min(1500, loadTimeoutMs) }), controller.signal);
-            if (ownerSnapshotReady(snapshot)) break;
-          } catch (error) { if (controller.signal.aborted) throw controller.signal.reason; }
-          await cancellable(sleep(250), controller.signal);
-        }
+        current.phase = 'owner';
+        // Keep the resume stream and its patch base. Repeated fresh reads used
+        // to clear both while Desktop was still restoring the conversation.
+        const snapshot = await owner.waitForReady(id, { signal: controller.signal, timeoutMs: Math.max(1, deadline - Date.now()) });
         if (controller.signal.aborted) throw controller.signal.reason;
         if (!owner.connected || owner !== client || owner.generation !== connection.generation)
           throw loadError('官方桌面连接已变化，请重新读取原聊天。', 'CONNECTION_INTERRUPTED');
-        return { status: 'confirmed', message: '原聊天已加载，可以继续对话。', state: await view(id, snapshot, null, metadata) };
+        return { status: 'confirmed', message: '原聊天已加载，可以继续对话。', state: await view(id, snapshot, null, metadata),
+          load: { phase: 'ready', elapsedMs: Date.now() - current.startedAt } };
       }).catch(async error => ({ status: 'rejected', message: error?.message ?? '暂时无法加载原聊天，请稍后重试。',
-        state: await view(id, null, error?.code ?? 'LOAD_UNAVAILABLE', metadata) }))
+        state: await view(id, null, error?.code ?? 'LOAD_UNAVAILABLE', metadata),
+        load: { phase: current.phase, elapsedMs: Date.now() - current.startedAt, code: error?.code ?? 'LOAD_UNAVAILABLE' } }))
         .finally(() => {
           current.settled = true; clearTimeout(timeout); connection.signal.removeEventListener('abort', lost);
           if (loads.get(id) === current) loads.delete(id);
@@ -261,7 +271,10 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
     const peerKey = await secrets.get('peer-' + target);
     if (!peerKey) throw Error('目标电脑尚未完成密钥配对');
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), url.pathname === '/api/events' ? 86400000 : 20000);
+    // A cold-load POST needs room for the remote 45s deadline and transport.
+    // Message/approval writes retain their existing timeout and are never retried.
+    const timer = setTimeout(() => controller.abort(), url.pathname === '/api/events' ? 86400000 :
+      url.pathname === '/api/action' && input?.action === 'load' ? 55000 : 20000);
     // The phone can disappear while a streamed upstream body is still active.
     // pipeline handles both sides' errors so a network change cannot crash us.
     const abort = () => controller.abort();

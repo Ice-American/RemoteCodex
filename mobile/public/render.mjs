@@ -8,6 +8,7 @@ const statusType = (state) => typeof state?.status === 'string' ? state.status :
 const isRunning = (state) => ['running', 'working', 'inProgress'].includes(statusType(state));
 const isHistoryOnly = (state) => state?.source === 'local-history-only';
 const needsLoad = (state) => state?.connectionState === 'needs-load';
+const incompatible = (state) => state?.connectionState === 'incompatible';
 const scopeOf = (state) => JSON.stringify([state?.host ?? '', state?.id ?? '']);
 const stringify = (value) => { try { return JSON.stringify(value, null, 2); } catch { return '详情无法显示'; } };
 // A compact local lookup key, not an authorization token. The server validates the full owner request.
@@ -113,7 +114,7 @@ export class ActionGate {
   get(key) { return this.attempts.get(key); }
 }
 
-export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, EventSourceImpl = globalThis.EventSource, actionTimeoutMs = 30000 } = {}) {
+export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, EventSourceImpl = globalThis.EventSource, actionTimeoutMs = 30000, loadTimeoutMs = 60000 } = {}) {
   const base = String(apiBase).replace(/\/$/, '');
   const path = (route, values) => base + route + (values ? '?' + new URLSearchParams(values) : '');
   async function json(url, options, acceptRejection = false) {
@@ -141,7 +142,7 @@ export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, Ev
       const controller = new AbortController();
       // A handover can leave an HTTP reply pending indefinitely. Stop waiting,
       // retain an unknown receipt, and never replay the already-dispatched POST.
-      const timer = setTimeout(() => controller.abort(), actionTimeoutMs);
+      const timer = setTimeout(() => controller.abort(), body.action === 'load' ? loadTimeoutMs : actionTimeoutMs);
       try { return await json(path('/api/action'), { method: 'POST', signal: controller.signal,
         headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }, true); }
       finally { clearTimeout(timer); }
@@ -587,9 +588,11 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function renderStatus() {
     title.textContent = state?.title || (selectedId ? '正在读取对话…' : 'Codex 随行');
     subtitle.textContent = state ? (hosts.find((host) => host.id === selectedHost)?.name || selectedHost) + (isHistoryOnly(state) ? ' · 只读历史' : ' · 原桌面会话') : '选择一个已有对话';
-    connectionLabel.textContent = !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
+    connectionLabel.textContent = incompatible(state) ? '电脑网关需要更新' : !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
     const loadAttempt = loadAttempts.get(currentScope());
-    loadPanel.hidden = !needsLoad(state);
+    loadPanel.hidden = !needsLoad(state) && !incompatible(state);
+    loadHeading.textContent = incompatible(state) ? '电脑会话接口已更新' : '原聊天尚未在电脑上加载';
+    loadHint.textContent = incompatible(state) ? '需要更新这台电脑上的手机网关。反复加载原聊天不能解决这个问题。消息未发送，草稿会保留。' : '此操作会在电脑上打开原聊天，可能切换电脑前台。草稿会保留，连接确认后才能发送。';
     loadButton.hidden = state?.canLoad !== true || typeof api.action !== 'function';
     loadButton.disabled = !!loadAttempt?.pending;
     loadButton.textContent = loadAttempt?.pending ? '正在连接原聊天…' : loadAttempt ? '重试连接原聊天' : '在电脑上加载原会话';
@@ -605,7 +608,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     interrupt.hidden = !state?.activeTurnId;
     const stopAttempt = gate.get(JSON.stringify([currentScope(), 'interrupt', state?.activeTurnId]));
     interrupt.disabled = !writeAllowed('interrupt') || !!stopAttempt && stopAttempt.status !== 'rejected';
-    composerHint.textContent = !selectedId ? '先选择对话' : loadAttempt?.pending ? '正在连接原聊天，草稿会保留' : needsLoad(state) ? '先在电脑上加载原聊天，草稿会保留' : isHistoryOnly(state) ? '只读历史，原会话未连接；草稿会保留' : !connected ? '连接恢复后才能发送，草稿会保留' : !state?.ownerConfirmed ? '等待原会话确认，草稿会保留' : !writeAllowed('send') ? (isRunning(state) ? '运行中，当前连接暂不支持补充方向' : '当前状态只读，不能发送') : isRunning(state) ? '运行中发送会补充当前方向' : '继续这个对话';
+    composerHint.textContent = !selectedId ? '先选择对话' : incompatible(state) ? '电脑网关更新后才能发送，草稿会保留' : loadAttempt?.pending ? '正在连接原聊天，草稿会保留' : needsLoad(state) ? '先在电脑上加载原聊天，草稿会保留' : isHistoryOnly(state) ? '只读历史，原会话未连接；草稿会保留' : !connected ? '连接恢复后才能发送，草稿会保留' : !state?.ownerConfirmed ? '等待原会话确认，草稿会保留' : !writeAllowed('send') ? (isRunning(state) ? '运行中，当前连接暂不支持补充方向' : '当前状态只读，不能发送') : isRunning(state) ? '运行中发送会补充当前方向' : '继续这个对话';
     draftHint.textContent = attempt?.status === 'unknown' ? '结果未确认，此内容已禁止重复发送' : attempt?.status === 'submitted' ? '已提交，保留草稿并等待确认' : '草稿只保存在本设备';
   }
   function renderMessages() {
@@ -801,7 +804,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
         if (!update(result)) throw Error('返回的会话与当前电脑不匹配，请重新读取。');
         // A known unloaded chat needs user intent to open its desktop window.
         // Repeating network reads cannot load it, and must never trigger a POST.
-        if (needsLoad(result)) {
+        if (needsLoad(result) || incompatible(result)) {
           clearRecovery(); if (recoveryNotice) showNotice(''); renderStatus(); return;
         }
         if (!connected) throw Error('原桌面会话尚未连接。');
@@ -848,7 +851,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (destroyed || !selectedId || !needsLoad(state) || state?.canLoad !== true || typeof api.action !== 'function' || loadAttempts.get(scope)?.pending) return;
     const host = selectedHost, threadId = selectedId, navigation = generation;
     const current = () => !destroyed && navigation === generation && scope === currentScope();
-    const attempt = { pending: true, operationId: operationId(), message: '正在电脑上打开原聊天，请稍候。' };
+    const attempt = { pending: true, operationId: operationId(), message: '正在电脑上打开原聊天，首次加载可能需要约一分钟，草稿会保留。' };
     let accepted = false;
     loadAttempts.set(scope, attempt); renderStatus(); renderRequests();
     try {

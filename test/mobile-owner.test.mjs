@@ -10,6 +10,8 @@ import { OWNER_METHODS, OWNER_SUPPORTED_VERSIONS, readOwnerProtocols } from '../
 const threadId = '11111111-1111-4111-8111-111111111111';
 const otherId = '22222222-2222-4222-8222-222222222222';
 const versions = Object.fromEntries(Object.entries(OWNER_METHODS).map(([key, method]) => [method, OWNER_SUPPORTED_VERSIONS[key].at(-1)]));
+// Default fixtures model the installed Mac stream. Windows 13 is explicit below.
+versions[OWNER_METHODS.stream] = 11;
 const idle = () => ({ id: threadId, cwd: '/test/workspace', resumeState: 'resumed', threadRuntimeStatus: { type: 'idle' }, turns: [], requests: [] });
 const running = (turnId = 'turn-1') => ({ ...idle(), threadRuntimeStatus: { type: 'active', activeFlags: [] },
   turns: [{ turnId, status: 'inProgress', items: [] }] });
@@ -28,7 +30,8 @@ class FakePipe extends EventEmitter {
   async connect() {}
   close() { this.socket.destroyed = true; this.emit('disconnected'); }
   async request(method, params, options) {
-    if (method === OWNER_METHODS.owner) return { handledByClientId: this.owner, result: { supportsUntrustedAppInput: this.acceptsInput } };
+    if (method === OWNER_METHODS.owner) return { type: 'response', resultType: 'success', method,
+      handledByClientId: this.owner, result: { supportsUntrustedAppInput: this.acceptsInput } };
     this.writes.push({ method, params, options });
     if (this.mutate) return this.mutate(method, params, options);
     return { type: 'response', resultType: 'success', method, handledByClientId: this.owner, result: { method, result: {
@@ -37,7 +40,11 @@ class FakePipe extends EventEmitter {
   }
   broadcast(method, params, version, targets) {
     this.following.push({ method, params, version, targets });
-    if (params.following && !this.silent) this.snapshot();
+    this.followers ??= new Set();
+    const prior = this.followers.has(targets?.[0]);
+    if (params.following) this.followers.add(targets?.[0]);
+    else this.followers.delete(targets?.[0]);
+    if (params.following && !this.silent && (this.repeatSnapshots !== false || !prior)) this.snapshot();
   }
   snapshot(overrides = {}) {
     this.emit('frame', { type: 'broadcast', method: OWNER_METHODS.stream, version: 11,
@@ -60,6 +67,14 @@ async function fixture(t, options = {}) {
   await client.connect();
   return { client, pipes, pipe: pipes[0], options: { operationId: 'operation-0001', expectedOwner: 'owner-1', expectedTurnId: null } };
 }
+
+test('unverified stream versions fail before following a loaded owner', async t => {
+  for (const version of [12, 14]) {
+    const { client, pipe } = await fixture(t, { protocolVersions: { ...versions, [OWNER_METHODS.stream]: version } });
+    await assert.rejects(client.freshSnapshot(threadId), { code: 'UNSUPPORTED_METHOD' });
+    assert.equal(pipe.following.length, 0); assert.equal(client.supports(threadId, 'start'), false);
+  }
+});
 
 test('fresh owner snapshots and patches are isolated from callers and foreign sources', async t => {
   const { client, pipe } = await fixture(t);
@@ -94,6 +109,193 @@ test('overlapping fresh reads share one owner lookup without cancelling each oth
   assert.equal(values[1].value.state.cwd, '/test/workspace');
   assert.equal(pipe.following.filter(value => value.params.following).length, 1);
   assert.equal(pipe.writes.length, 0);
+});
+
+test('readiness retains the first needs_resume snapshot until a delayed resumed patch confirms the runtime', async t => {
+  const { client, pipe } = await fixture(t);
+  // The stream permits incremental updates after the initial full snapshot.
+  // A repeated follower notification need not be used to make this pass.
+  pipe.repeatSnapshots = false;
+  pipe.state = { ...idle(), resumeState: 'needs_resume' };
+  let settled = false;
+  const waiting = client.waitForReady(threadId, { timeoutMs: 1000 }).then(value => { settled = true; return value; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(client.snapshot(threadId).revision, 1);
+  assert.equal(settled, false);
+  pipe.patch(1, 2, [{ op: 'replace', path: ['resumeState'], value: 'resuming' }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  pipe.patch(2, 3, [{ op: 'replace', path: ['resumeState'], value: 'resumed' },
+    { op: 'replace', path: ['threadRuntimeStatus'], value: { type: 'unknown' } }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  pipe.patch(3, 4, [{ op: 'replace', path: ['threadRuntimeStatus'], value: { type: 'active', activeFlags: [] } }]);
+  const ready = await waiting;
+  assert.equal(ready.state.resumeState, 'resumed');
+  assert.equal(ready.state.threadRuntimeStatus.type, 'active');
+  assert.equal(ready.status.confirmed, true);
+  assert.equal(pipe.following.filter(value => value.params.following).length, 1);
+  ready.state.cwd = '/caller-only';
+  assert.equal(client.snapshot(threadId).state.cwd, '/test/workspace');
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('a competing fresh read retains a readiness patch base and still requires a later stream observation', async t => {
+  const { client, pipe } = await fixture(t);
+  pipe.repeatSnapshots = false;
+  pipe.state = { ...idle(), resumeState: 'needs_resume' };
+  const ready = client.waitForReady(threadId, { timeoutMs: 1000 });
+  await new Promise(resolve => setImmediate(resolve));
+  let freshSettled = false;
+  const fresh = client.freshSnapshot(threadId, { timeoutMs: 500 }).then(value => { freshSettled = true; return value; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(freshSettled, false, 'the earlier full snapshot is not a fresh response');
+  assert.equal(client.snapshot(threadId).revision, 1);
+  assert.equal(pipe.following.filter(value => value.params.following).length, 1);
+  pipe.patch(1, 2, [{ op: 'replace', path: ['resumeState'], value: 'resumed' }]);
+  const [loaded, observed] = await Promise.all([ready, fresh]);
+  assert.equal(loaded.revision, 2);
+  assert.equal(observed.revision, 2);
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('concurrent readiness consumers share a follower and one cancellation does not cancel the other', async t => {
+  const { client, pipe } = await fixture(t);
+  pipe.repeatSnapshots = false;
+  pipe.state = { ...idle(), resumeState: 'needs_resume' };
+  const controller = new AbortController();
+  const first = client.waitForReady(threadId, { signal: controller.signal, timeoutMs: 1000 });
+  const rejected = assert.rejects(first, error => error.code === 'SUBSCRIPTION_CANCELLED');
+  const second = client.waitForReady(threadId, { timeoutMs: 1000 });
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); await rejected;
+  pipe.patch(1, 2, [{ op: 'replace', path: ['resumeState'], value: 'resumed' }]);
+  assert.equal((await second).revision, 2);
+  assert.equal(pipe.following.filter(value => value.params.following).length, 1);
+  assert.equal(client.readinessWaits.size, 0);
+});
+
+test('a fresh read after readiness still clears the ready snapshot until a new observation arrives', async t => {
+  const { client, pipe } = await fixture(t);
+  await client.waitForReady(threadId);
+  pipe.silent = true;
+  const reading = client.freshSnapshot(threadId);
+  assert.equal(client.snapshot(threadId), null);
+  assert.equal(client.supports(threadId, 'start'), false);
+  await new Promise(resolve => setImmediate(resolve));
+  pipe.snapshot();
+  assert.equal((await reading).status.type, 'idle');
+  assert.equal(pipe.following.filter(value => value.params.following).length, 2);
+});
+
+test('a joined readiness consumer keeps its own shorter deadline', async t => {
+  const { client, pipe } = await fixture(t);
+  pipe.state = { ...idle(), resumeState: 'needs_resume' };
+  const first = client.waitForReady(threadId, { timeoutMs: 1000 });
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(client.waitForReady(threadId, { timeoutMs: 10 }), error => error.code === 'OWNER_READY_TIMEOUT');
+  pipe.patch(1, 2, [{ op: 'replace', path: ['resumeState'], value: 'resumed' }]);
+  assert.equal((await first).revision, 2);
+  assert.equal(pipe.following.filter(value => value.params.following).length, 1);
+});
+
+test('readiness retries an initial no-client-found only until owner discovery succeeds', async t => {
+  const { client, pipe } = await fixture(t);
+  const original = pipe.request.bind(pipe);
+  let lookups = 0;
+  pipe.request = async (...args) => {
+    if (args[0] === OWNER_METHODS.owner && ++lookups === 1) throw Error('no-client-found');
+    return original(...args);
+  };
+  const ready = await client.waitForReady(threadId, { timeoutMs: 1000 });
+  assert.equal(ready.status.type, 'idle');
+  assert.equal(lookups, 2);
+  assert.equal(pipe.following.filter(value => value.params.following).length, 1);
+});
+
+test('readiness discovery has a total deadline and cancellation stops future retries', async t => {
+  const { client, pipe } = await fixture(t);
+  let lookups = 0;
+  pipe.request = async () => { lookups++; throw Error('no-client-found'); };
+  await assert.rejects(client.waitForReady(threadId, { timeoutMs: 20 }), error => error.code === 'OWNER_READY_TIMEOUT');
+  assert.equal(lookups, 1);
+  const controller = new AbortController();
+  const waiting = client.waitForReady(threadId, { signal: controller.signal, timeoutMs: 1000 });
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(waiting, error => error.code === 'SUBSCRIPTION_CANCELLED');
+  const stopped = lookups;
+  await new Promise(resolve => setTimeout(resolve, 275));
+  assert.equal(lookups, stopped);
+});
+
+test('a changed owner or disconnected connection cannot complete an earlier readiness wait', async t => {
+  for (const change of ['owner', 'disconnect', 'unfollow']) {
+    const { client, pipe } = await fixture(t);
+    pipe.state = { ...idle(), resumeState: 'needs_resume' };
+    const waiting = client.waitForReady(threadId, { timeoutMs: 1000 });
+    const rejected = assert.rejects(waiting, error => ['SUBSCRIPTION_CANCELLED', 'CONNECTION_INTERRUPTED'].includes(error.code));
+    await new Promise(resolve => setImmediate(resolve));
+    if (change === 'owner') { pipe.owner = 'owner-2'; pipe.state = idle(); await client.follow(threadId); }
+    if (change === 'disconnect') pipe.emit('disconnected');
+    if (change === 'unfollow') client.unfollow(threadId);
+    await rejected;
+    pipe.patch(1, 2, [{ op: 'replace', path: ['resumeState'], value: 'resumed' }]);
+  }
+});
+
+test('a cancelled readiness lookup does not return a late successful owner response', async t => {
+  const { client, pipe } = await fixture(t);
+  let reply;
+  pipe.request = () => new Promise(resolve => { reply = resolve; });
+  const controller = new AbortController();
+  const waiting = client.waitForReady(threadId, { signal: controller.signal, timeoutMs: 1000 });
+  const rejected = assert.rejects(waiting, error => error.code === 'SUBSCRIPTION_CANCELLED');
+  controller.abort();
+  await rejected;
+  reply({ type: 'response', resultType: 'success', method: OWNER_METHODS.owner,
+    handledByClientId: pipe.owner, result: { supportsUntrustedAppInput: true } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(client.readinessWaits.size, 0);
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('readiness repairs a revision gap with one bounded full refresh before accepting new patches', async t => {
+  const { client, pipe } = await fixture(t);
+  pipe.state = { ...idle(), resumeState: 'needs_resume' };
+  const waiting = client.waitForReady(threadId, { timeoutMs: 1000 });
+  await new Promise(resolve => setImmediate(resolve));
+  pipe.revision = 3;
+  const repaired = new Promise(resolve => {
+    const unsubscribe = client.subscribe(event => {
+      if (event.type === 'snapshot' && event.snapshot.revision === 3) { unsubscribe(); resolve(); }
+    });
+  });
+  pipe.patch(0, 2, [{ op: 'replace', path: ['resumeState'], value: 'resumed' }]);
+  await repaired;
+  assert.equal(client.snapshot(threadId).revision, 3);
+  assert.equal(client.snapshot(threadId).state.resumeState, 'needs_resume');
+  assert.equal(pipe.following.filter(value => value.params.following).length, 2);
+  pipe.patch(3, 4, [{ op: 'replace', path: ['resumeState'], value: 'resumed' }]);
+  assert.equal((await waiting).revision, 4);
+});
+
+test('readiness repairs a missing initial snapshot but stops after a bounded number of full refreshes', async t => {
+  const { client, pipe } = await fixture(t, { timeoutMs: 10 });
+  pipe.silent = true;
+  await assert.rejects(client.waitForReady(threadId, { timeoutMs: 80 }), error => error.code === 'OWNER_READY_TIMEOUT');
+  assert.equal(pipe.following.filter(value => value.params.following).length, 3);
+  assert.equal(client.readinessWaits.size, 0);
+});
+
+test('a cold first snapshot can finish within the total budget after bounded repair reads expire', async t => {
+  const { client, pipe } = await fixture(t, { timeoutMs: 10 });
+  pipe.silent = true;
+  const waiting = client.waitForReady(threadId, { timeoutMs: 500 });
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(pipe.following.filter(value => value.params.following).length, 3);
+  pipe.snapshot();
+  assert.equal((await waiting).status.type, 'idle');
 });
 
 test('an unfollow retires a shared refresh before a later refresh can establish a new subscription', async t => {

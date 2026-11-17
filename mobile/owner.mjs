@@ -42,6 +42,7 @@ export class OwnerClient extends EventEmitter {
     this.waiters = new Set();
     this.followIntents = new Map();
     this.freshSnapshots = new Map();
+    this.readinessWaits = new Map();
     this.nativeSubscriptions = new Map();
     // A process restart cannot establish whether an earlier write reached
     // Desktop. Retain its fence and expose uncertainty instead of replaying it.
@@ -245,6 +246,111 @@ export class OwnerClient extends EventEmitter {
     const value = this.connected && this.snapshots.get(threadId);
     return value ? clone(value) : null;
   }
+  async waitForReady(threadId, { signal, timeoutMs = this.timeoutMs } = {}) {
+    if (!uuid(threadId)) throw failure('Invalid thread ID');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw failure('Invalid owner readiness timeout');
+    const cancelled = () => typeof signal?.reason?.code === 'string' ? signal.reason
+      : failure('Owner readiness wait cancelled', 'SUBSCRIPTION_CANCELLED');
+    if (signal?.aborted) throw cancelled();
+    const connection = this.currentConnection();
+    let record = this.readinessWaits.get(threadId);
+    if (!record || record.settled || record.controller.signal.aborted || record.generation !== connection.generation) {
+      record = { generation: connection.generation, controller: new AbortController(), consumers: new Set(), settled: false };
+      this.readinessWaits.set(threadId, record);
+      const current = record;
+      record.promise = this.#waitForReady(threadId, record, timeoutMs).finally(() => {
+        current.settled = true;
+        if (this.readinessWaits.get(threadId) === current) this.readinessWaits.delete(threadId);
+      });
+    }
+    const consumer = {}; record.consumers.add(consumer);
+    let abort, timer;
+    const interrupted = new Promise((_, reject) => {
+      abort = () => reject(cancelled());
+      // A short-lived caller must not inherit a longer joined caller's wait.
+      timer = setTimeout(() => reject(failure('Desktop owner readiness timed out', 'OWNER_READY_TIMEOUT')), timeoutMs);
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+    });
+    try { return clone(await Promise.race([record.promise, interrupted])); }
+    finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      record.consumers.delete(consumer);
+      if (!record.settled && !record.consumers.size) record.controller.abort();
+    }
+  }
+  #waitForReady(threadId, record, timeoutMs) {
+    const minimum = this.sequence, deadline = Date.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+      let finished = false, refreshing = false, pending = false, repairs = 0, retry;
+      const timeout = () => failure('Desktop owner readiness timed out', 'OWNER_READY_TIMEOUT');
+      const finish = (error, snapshot) => {
+        if (finished) return;
+        finished = true; clearTimeout(timer); clearTimeout(retry);
+        this.off('change', changed);
+        record.controller.signal.removeEventListener('abort', cancelled);
+        if (error) reject(error); else resolve(clone(snapshot));
+      };
+      const cancelled = () => finish(failure('Owner readiness wait cancelled', 'SUBSCRIPTION_CANCELLED'));
+      const current = () => {
+        if (finished) return false;
+        if (!this.connected || this.generation !== record.generation) {
+          finish(failure('Owner connection interrupted', 'CONNECTION_INTERRUPTED')); return false;
+        }
+        if (record.intent && this.followIntents.get(threadId) !== record.intent) {
+          finish(failure('Owner subscription changed or cancelled', 'SUBSCRIPTION_CANCELLED')); return false;
+        }
+        return true;
+      };
+      const inspect = () => {
+        if (!current()) return true;
+        const snapshot = this.snapshots.get(threadId), owner = this.owners.get(threadId);
+        if (!snapshot || snapshot.sequence <= minimum || snapshot.generation !== record.generation ||
+            snapshot.owner !== owner?.owner || !this.nativeSubscriptions.has(threadId)) return false;
+        if (ownerSnapshotReady(snapshot)) { finish(null, snapshot); return true; }
+        if (['failed', 'error'].includes(snapshot.state?.resumeState)) {
+          finish(failure('Desktop thread failed to resume', 'OWNER_RESUME_FAILED')); return true;
+        }
+        return false;
+      };
+      const schedule = (repair, delay = 0) => {
+        if (!current() || retry) return;
+        retry = setTimeout(() => { retry = null; refresh(repair); }, delay);
+      };
+      const refresh = repair => {
+        if (!current() || pending) return;
+        // A slow cold owner can still deliver its first full snapshot after
+        // the repair allowance. Stop refollowing, but retain the total budget.
+        if (repair && ++repairs > 2) return;
+        pending = true; refreshing = true;
+        // Establish one follower and keep its patch base while Desktop resumes.
+        // Only a missing base or stream gap justifies a bounded full refresh.
+        const read = this.freshSnapshot(threadId, { timeoutMs: Math.max(1, Math.min(this.timeoutMs, deadline - Date.now())) });
+        record.intent = this.followIntents.get(threadId);
+        refreshing = false;
+        read.then(() => {
+          pending = false;
+          if (!inspect() && !this.snapshots.has(threadId)) schedule(true);
+        }, error => {
+          pending = false;
+          if (!current()) return;
+          if (/^no-client-found$/i.test(error?.message ?? '')) schedule(false, 250);
+          else if (error?.code === 'OWNER_SNAPSHOT_TIMEOUT') schedule(true);
+          else finish(error);
+        });
+      };
+      const changed = event => {
+        if (refreshing || !current() || event.threadId !== threadId) return;
+        if (event.type === 'snapshot') inspect();
+        else if (event.type === 'unknown' && !event.refreshing && !pending) schedule(true);
+      };
+      const timer = setTimeout(() => finish(timeout()), timeoutMs);
+      this.on('change', changed);
+      record.controller.signal.addEventListener('abort', cancelled, { once: true });
+      refresh(false);
+    });
+  }
   async freshSnapshot(threadId, { timeoutMs = this.timeoutMs } = {}) {
     const connection = this.currentConnection(), current = this.freshSnapshots.get(threadId);
     // GET, SSE and an explicit action can all require the same fresh state.
@@ -260,9 +366,21 @@ export class OwnerClient extends EventEmitter {
     return clone(await promise);
   }
   async #freshSnapshot(threadId, timeoutMs) {
+    // Detect an official stream update before subscribing. Otherwise every
+    // snapshot is discarded and a loaded chat looks like an unloaded one.
+    this.version('stream');
     const minimum = this.sequence;
-    this.unknown(threadId, 'Waiting for a fresh owner snapshot', { refreshing: true });
-    const owner = await this.follow(threadId);
+    const readiness = this.readinessWaits.get(threadId), previous = this.snapshots.get(threadId);
+    // A concurrent GET must still observe a newer stream revision. While the
+    // thread is resuming, keep the first full snapshot so that revision's
+    // patches can be applied. Ready-state write refreshes keep their old fence.
+    const preserveBase = readiness && readiness.generation === this.generation && !readiness.settled &&
+      readiness.intent === this.followIntents.get(threadId) && previous && !ownerSnapshotReady(previous);
+    let owner = this.owners.get(threadId);
+    if (!preserveBase) {
+      this.unknown(threadId, 'Waiting for a fresh owner snapshot', { refreshing: true });
+      owner = await this.follow(threadId);
+    }
     this.currentConnection();
     if (this.owners.get(threadId)?.owner !== owner.owner || !this.nativeSubscriptions.has(threadId))
       throw failure('Owner subscription was cancelled', 'SUBSCRIPTION_CANCELLED');
@@ -272,7 +390,7 @@ export class OwnerClient extends EventEmitter {
       const waiter = { threadId, minimum, resolve, reject };
       const timer = setTimeout(() => {
         this.waiters.delete(waiter);
-        reject(failure('Fresh owner snapshot timed out'));
+        reject(failure('Fresh owner snapshot timed out', 'OWNER_SNAPSHOT_TIMEOUT'));
       }, timeoutMs);
       waiter.resolve = value => { clearTimeout(timer); this.waiters.delete(waiter); resolve(clone(value)); };
       waiter.reject = error => { clearTimeout(timer); this.waiters.delete(waiter); reject(error); };

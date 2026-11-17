@@ -144,6 +144,20 @@ test('an explicit HTTP rejection stays rejected instead of becoming an uncertain
   assert.deepEqual(await api.action({ action: 'send' }), { status: 'rejected', message: '原会话状态已变化，未发送' });
 });
 
+test('loading an original chat has its own end-to-end budget without extending or retrying writes', async t => {
+  const delays = [], calls = [];
+  const nativeTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (fn, delay, ...args) => {
+    delays.push(delay); return nativeTimeout(fn, delay, ...args);
+  });
+  const api = createMobileAPI({ fetchImpl: async (url, options) => {
+    calls.push(JSON.parse(options.body)); return { ok: true, json: async () => ({ status: 'confirmed' }) };
+  } });
+  await api.action({ action: 'load' }); await api.action({ action: 'send' });
+  assert.deepEqual(delays, [60000, 30000]);
+  assert.deepEqual(calls, [{ action: 'load' }, { action: 'send' }]);
+});
+
 test('SSE reconnect events only report transport and never replay an action', () => {
   let stream;
   class Events {
@@ -308,6 +322,18 @@ test('local history is visibly read-only even when inconsistent live capability 
 
 const unloadedThread = (overrides = {}) => thread({ connectionState: 'needs-load', canLoad: true, connected: false,
   ownerConfirmed: false, connectionId: null, ownerId: null, revision: null, ...overrides });
+
+test('a changed desktop protocol explains the cause without repeated loading or discarding a draft', async t => {
+  const timers = fakeClock(); let reads = 0, posts = 0;
+  const { root } = mount(t, { getThread: async () => { reads++; return unloadedThread({ connectionState: 'incompatible', canLoad: false, error: 'UNSUPPORTED_METHOD' }); },
+    action: async () => { posts++; } }, { timers, initialThreadId: thread().id });
+  await tick(); type(root, '协议升级期间保留的草稿');
+  assert.equal(one(root, 'connection-label').textContent, '电脑网关需要更新');
+  assert.equal(one(root, 'load-thread-button').hidden, true); assert.equal(one(root, 'send-button').disabled, true);
+  assert.match(one(root, 'load-thread-hint').textContent, /需要更新/);
+  await timers.advance(30000);
+  assert.equal(reads, 1); assert.equal(posts, 0); assert.equal(one(root, 'message-input').value, '协议升级期间保留的草稿');
+});
 
 test('an unloaded original chat offers an explicit load action without treating it as a network failure', async (t) => {
   const timers = fakeClock(); let reads = 0, posts = 0;
