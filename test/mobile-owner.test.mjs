@@ -23,7 +23,7 @@ const retryOptions = (client, options = {}) => ({ operationId: 'retry-operation'
   expectedGeneration: client.generation, expectedFailedTurnId: 'failed-turn', ...options });
 
 class FakePipe extends EventEmitter {
-  constructor() {
+  constructor({ streamVersion = 11 } = {}) {
     super();
     this.socket = { destroyed: false };
     this.writes = [];
@@ -32,6 +32,7 @@ class FakePipe extends EventEmitter {
     this.acceptsInput = true;
     this.state = idle();
     this.revision = 1;
+    this.streamVersion = streamVersion;
   }
   async connect() {}
   close() { this.socket.destroyed = true; this.emit('disconnected'); }
@@ -53,22 +54,22 @@ class FakePipe extends EventEmitter {
     if (params.following && !this.silent && (this.repeatSnapshots !== false || !prior)) this.snapshot();
   }
   snapshot(overrides = {}) {
-    this.emit('frame', { type: 'broadcast', method: OWNER_METHODS.stream, version: 11,
+    this.emit('frame', { type: 'broadcast', method: OWNER_METHODS.stream, version: this.streamVersion,
       sourceClientId: this.owner, params: { conversationId: threadId, hostId: 'local',
         change: { type: 'snapshot', revision: this.revision, conversationState: this.state } }, ...overrides });
   }
   patch(baseRevision, revision, patches) {
-    this.emit('frame', { type: 'broadcast', method: OWNER_METHODS.stream, version: 11,
+    this.emit('frame', { type: 'broadcast', method: OWNER_METHODS.stream, version: this.streamVersion,
       sourceClientId: this.owner, params: { conversationId: threadId, hostId: 'local',
         change: { type: 'patches', baseRevision, revision, patches } } });
   }
 }
-async function fixture(t, options = {}) {
+async function fixture(t, { streamVersion = 11, ...options } = {}) {
   const pipes = [];
   const client = new OwnerClient({ socketPath: '/synthetic/owner.sock',
     verifyEndpoint: async () => ({ verified: true, pid: 42, inode: 123 }),
-    pipeFactory: () => { const pipe = new FakePipe(); pipes.push(pipe); return pipe; },
-    protocolVersions: versions, timeoutMs: 100, ...options });
+    pipeFactory: () => { const pipe = new FakePipe({ streamVersion }); pipes.push(pipe); return pipe; },
+    protocolVersions: { ...versions, [OWNER_METHODS.stream]: streamVersion }, timeoutMs: 100, ...options });
   t.after(() => client.close());
   await client.connect();
   return { client, pipes, pipe: pipes[0], options: { operationId: 'operation-0001', expectedOwner: 'owner-1', expectedTurnId: null } };
@@ -80,6 +81,84 @@ test('unverified stream versions fail before following a loaded owner', async t 
     await assert.rejects(client.freshSnapshot(threadId), { code: 'UNSUPPORTED_METHOD' });
     assert.equal(pipe.following.length, 0); assert.equal(client.supports(threadId, 'start'), false);
   }
+});
+
+test('Windows stream 13 projects a scoped full snapshot and applies its next revision patch', async t => {
+  const { client, pipe } = await fixture(t, { streamVersion: 13 });
+  const first = await client.freshSnapshot(threadId);
+  assert.equal(first.source, 'official-desktop-owner-IPC-live');
+  assert.equal(first.owner, pipe.owner); assert.equal(first.state.id, threadId);
+  assert.equal(first.state.resumeState, 'resumed'); assert.equal(first.status.confirmed, true);
+  assert.equal(client.supports(threadId, 'start'), true);
+  first.state.cwd = '/caller-only';
+  pipe.patch(1, 2, [{ op: 'replace', path: ['cwd'], value: '/windows/fresh' },
+    { op: 'replace', path: ['turns'], value: running().turns },
+    { op: 'replace', path: ['threadRuntimeStatus'], value: running().threadRuntimeStatus }]);
+  const patched = client.snapshot(threadId);
+  assert.equal(patched.revision, 2); assert.equal(patched.state.cwd, '/windows/fresh');
+  assert.equal(patched.status.type, 'running'); assert.equal(patched.activeTurnId, 'turn-1');
+  assert.equal(client.supports(threadId, 'start'), false); assert.equal(client.supports(threadId, 'steer'), true);
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('Windows stream 13 fresh reads accept a later full observation with the same revision', async t => {
+  const { client, pipe } = await fixture(t, { streamVersion: 13 });
+  const first = await client.freshSnapshot(threadId);
+  pipe.state = { ...idle(), cwd: '/second-full-snapshot' };
+  const next = await client.freshSnapshot(threadId);
+  assert.equal(next.revision, first.revision);
+  assert.ok(next.sequence > first.sequence);
+  assert.equal(next.state.cwd, '/second-full-snapshot');
+  assert.equal(pipe.following.filter(value => value.params.following).length, 2);
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('Windows stream 13 owner changes retire the old follower and fence stale send intent', async t => {
+  const { client, pipe, options } = await fixture(t, { streamVersion: 13 });
+  const first = await client.freshSnapshot(threadId);
+  pipe.owner = 'owner-2';
+  const next = await client.freshSnapshot(threadId);
+  assert.equal(next.owner, 'owner-2'); assert.ok(next.sequence > first.sequence);
+  assert.equal(pipe.following.at(-2).params.following, false);
+  assert.deepEqual(pipe.following.at(-2).targets, ['owner-1']);
+  pipe.state = { ...idle(), cwd: '/foreign-owner' };
+  pipe.snapshot({ sourceClientId: 'owner-1' });
+  assert.equal(client.snapshot(threadId).state.cwd, '/test/workspace');
+  await assert.rejects(client.sendText(threadId, 'Must not send to the new owner', options), /owner.*changed|changed.*owner/i);
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('Windows stream 13 unsafe patches invalidate readiness without prototype mutation or dispatch', async t => {
+  const { client, pipe, options } = await fixture(t, { streamVersion: 13 });
+  await client.freshSnapshot(threadId);
+  pipe.patch(1, 2, [{ op: 'add', path: ['__proto__', 'protocol13Polluted'], value: true }]);
+  assert.equal(Object.prototype.protocol13Polluted, undefined);
+  assert.equal(client.snapshot(threadId), null); assert.equal(client.supports(threadId, 'start'), false);
+  await assert.rejects(client.sendText(threadId, 'Must not send after unsafe patch', options));
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('Windows stream 13 revision gaps require a fresh full observation before writes', async t => {
+  const { client, pipe, options } = await fixture(t, { streamVersion: 13 });
+  await client.freshSnapshot(threadId);
+  pipe.patch(99, 100, [{ op: 'replace', path: ['cwd'], value: '/missing-patch-base' }]);
+  assert.equal(client.snapshot(threadId), null); assert.equal(client.supports(threadId, 'start'), false);
+  await assert.rejects(client.sendText(threadId, 'Must not send across a gap', options));
+  assert.equal(pipe.writes.length, 0);
+  const recovered = await client.freshSnapshot(threadId);
+  assert.equal(recovered.revision, 1); assert.equal(recovered.state.cwd, '/test/workspace');
+  assert.equal(client.supports(threadId, 'start'), true);
+});
+
+test('Windows stream 13 rejects unknown 12 and 14 frames instead of treating them as current state', async t => {
+  const { client, pipe, options } = await fixture(t, { streamVersion: 13 });
+  for (const version of [12, 14]) {
+    await client.freshSnapshot(threadId);
+    pipe.snapshot({ version });
+    assert.equal(client.snapshot(threadId), null); assert.equal(client.supports(threadId, 'start'), false);
+    await assert.rejects(client.sendText(threadId, 'Must not dispatch for an unknown stream', options));
+  }
+  assert.equal(pipe.writes.length, 0);
 });
 
 test('fresh owner snapshots and patches are isolated from callers and foreign sources', async t => {

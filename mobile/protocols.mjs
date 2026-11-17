@@ -21,7 +21,7 @@ export const OWNER_METHODS = Object.freeze({
 
 // Observing a new version is not proof that our payload adapter understands it.
 export const OWNER_SUPPORTED_VERSIONS = Object.freeze({
-  initialize: [1], owner: [1], following: [1], stream: [11], start: [2], steer: [1],
+  initialize: [1], owner: [1], following: [1], stream: [11, 13], start: [2], steer: [1],
   userInput: [1], commandApproval: [1], fileApproval: [1], permissions: [1],
   mcpElicitation: [1], interrupt: [4], settings: [1, 2], queue: [3],
 });
