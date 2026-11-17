@@ -354,7 +354,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const composeFoot = node('div', 'composer-foot'), draftHint = node('span', 'draft-hint', '草稿只保存在本设备'), interrupt = button('停止运行', 'stop-button', () => stopTurn());
   interrupt.hidden = true; composeFoot.append(draftHint, interrupt); composer.append(loadPanel, runtimeErrorPanel, composerHint, composeRow, composeFoot);
   const backdrop = button('关闭对话列表', 'drawer-backdrop', () => setDrawer(false)); backdrop.hidden = true; backdrop.tabIndex = -1;
-  const drawer = node('aside', 'thread-drawer'); drawer.id = 'thread-drawer'; drawer.hidden = true; drawer.setAttribute('aria-label', '已有对话列表');
+  const drawer = node('aside', 'thread-drawer'); drawer.id = 'thread-drawer'; drawer.hidden = true; drawer.tabIndex = -1; drawer.setAttribute('aria-label', '已有对话列表');
   const drawerHeading = node('div', 'drawer-heading'); drawerHeading.append(node('h2', '', '聊天'), button('新建', 'drawer-new-chat', () => openCreation()), button('刷新', 'text-button drawer-refresh', () => loadThreads()), button('关闭', 'text-button', () => setDrawer(false)));
   const search = node('input', 'thread-search'); search.type = 'search'; search.placeholder = '搜索对话'; search.setAttribute('aria-label', '搜索已有对话');
   const filters = node('div', 'catalog-filters'), projectSelect = node('select', 'project-select'), rangeSelect = node('select', 'history-range');
@@ -433,7 +433,9 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function resize() { const metrics = viewportMetrics(win?.visualViewport, win?.innerHeight); app.style.setProperty('--app-height', metrics.height + 'px'); app.style.setProperty('--app-top', metrics.top + 'px'); autoSize(); }
   function setDrawer(open) {
     drawerOpen = open; drawer.hidden = !open; backdrop.hidden = !open; menu.setAttribute('aria-expanded', String(open)); syncOverlays();
-    if (open) { clearStatusConfirmations(); renderThreads(); search.focus(); } else menu.focus();
+    // Focus a non-editable target so opening the drawer never summons the
+    // phone keyboard. Editing begins only after the user taps an input.
+    if (open) { clearStatusConfirmations(); renderThreads(); drawer.focus({ preventScroll: true }); } else menu.focus({ preventScroll: true });
     void pollStatuses();
   }
   function syncOverlays() {
