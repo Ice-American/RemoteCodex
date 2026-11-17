@@ -17,9 +17,20 @@ const textTypes = new Set(['text', 'inputText', 'input_text', 'output_text']);
 const urlValue = value => typeof value === 'string' ? value : typeof value?.url === 'string' ? value.url : null;
 const contents = item => Array.isArray(item?.content) ? item.content : Array.isArray(item?.input) ? item.input : [];
 
+export function nativeImageContent(content) {
+  return content?.type === 'image' && typeof content.data === 'string' && typeof content.mimeType === 'string';
+}
 export function itemImageSource(content) {
   if (!content || typeof content !== 'object') return null;
   if (content.type === 'localImage') return typeof content.path === 'string' ? content.path : null;
+  if (nativeImageContent(content)) {
+    // MCP ImageContent has raw base64 and a MIME declaration, not a URL. Do
+    // not search arbitrary result fields or decode bytes during message reads.
+    const {data,mimeType} = content;
+    if (!['image/png','image/jpeg','image/webp','image/gif'].includes(mimeType) || !data.length ||
+        data.length > 4 * Math.ceil(sizeLimit(mimeType) / 3) || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null;
+    return 'data:' + mimeType + ';base64,' + data;
+  }
   if (['image', 'Image', 'inputImage', 'input_image', 'output_image'].includes(content.type))
     return urlValue(content.url) ?? urlValue(content.image_url) ?? urlValue(content.imageUrl);
   return null;
@@ -29,7 +40,7 @@ export function itemVisibleText(item) {
     .filter(content => textTypes.has(content?.type)).map(content => content.text ?? '').join('\n');
 }
 export function itemHasImages(item) {
-  return contents(item).some(content => !!itemImageSource(content)) ||
+  return contents(item).some(content => nativeImageContent(content) || !!itemImageSource(content)) ||
     item?.type === 'imageGeneration' && typeof (item.savedPath ?? item.result) === 'string' ||
     typeof itemVisibleText(item) === 'string' && /!\[[^\]]*\]\([^\n]+\)/.test(itemVisibleText(item)) ||
     /^\s*# Files (?:mentioned|pasted) by the user:/.test(itemVisibleText(item)) &&
@@ -64,6 +75,15 @@ export class MobileMedia {
     const decorated = this.media.decorate(threadId, {turns:[{id:null,items:[normalized]}]}, {externalImages:true})
       .turns[0].items[0].bridgeDisplay;
     const candidates = [...(decorated.images ?? [])];
+    // Official file citations and ordinary file links use the upstream file
+    // registry. Promote only its exact, message-backed local image paths;
+    // the original read authorization, pinned identity and size checks remain.
+    for (const file of decorated.files ?? []) {
+      const entry = this.media.attachments.get(threadId)?.get(file.id);
+      if (!entry || !/\.(png|jpe?g|webp|gif)$/i.test(entry.file)) continue;
+      const ref = this.media.add(threadId,entry.file,file.name,true,new Map(),JSON.stringify([null,item.id ?? null]));
+      if (ref) candidates.push(ref);
+    }
     // Upstream collects structured input images only for user messages. Newer
     // official assistant output can also contain output_image content blocks.
     if (item.type === 'agentMessage') for (const value of content) {

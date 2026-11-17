@@ -3,14 +3,30 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { itemVisibleText, itemImageSource, itemHasImages } from './media.mjs';
+import { itemVisibleText, itemImageSource, itemHasImages, nativeImageContent } from './media.mjs';
 
 export const validThreadId = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9-]{27}$/i.test(value);
 const stamp = value => typeof value === 'number' ? value : Date.parse(value ?? '') || 0;
 const digest = value => createHash('sha256').update(value).digest('hex').slice(0, 20);
 
 export function visibleItem(item, {media, threadId} = {}) {
-  if (!item || !['userMessage', 'steeringUserMessage', 'agentMessage', 'imageGeneration'].includes(item.type)) return null;
+  if (!item) return null;
+  if (['mcpToolCall','imageView'].includes(item.type)) {
+    if (item.phase === 'analysis' || item.channel === 'analysis' || item.delivery === 'async') return null;
+    if (item.type === 'mcpToolCall') {
+      if (item.status !== 'completed' || item.error != null || item.result?.isError === true || !Array.isArray(item.result?.content)) return null;
+      // The native desktop displays typed MCP ImageContent directly. Project
+      // just those exact blocks: tool text, arguments, metadata and arbitrary
+      // nested data never become phone messages or image authorization.
+      const content = item.result.content.filter(nativeImageContent).map(value=>({type:'image',data:value.data,mimeType:value.mimeType}));
+      if (!content.length) return null;
+      item = {type:'agentMessage',id:item.id,content};
+    } else {
+      if (!Number.isFinite(item.completedAtMs) || item.completedAtMs <= 0 || typeof item.path !== 'string') return null;
+      item = {type:'agentMessage',id:item.id,content:[{type:'localImage',path:item.path}]};
+    }
+  }
+  if (!['userMessage', 'steeringUserMessage', 'agentMessage', 'imageGeneration'].includes(item.type)) return null;
   if (item.type === 'steeringUserMessage' && item.status !== 'accepted') return null;
   if ((item.type === 'agentMessage' || item.type === 'imageGeneration') && (item.delivery === 'async' || item.phase === 'analysis' || item.channel === 'analysis')) return null;
   const role = ['agentMessage', 'imageGeneration'].includes(item.type) ? 'assistant' : 'user';
@@ -57,14 +73,36 @@ function eventImages(payload) {
       ...(value.startsWith('data:') || /^https?:/i.test(value) ? {url:value} : {path:value})}] : historyContent([value]));
 }
 export function parseVisibleHistory(text, limit = 80, options = {}) {
-  const events = [], fallback = [];
+  const events = [], fallback = [], toolImages = new Map();
+  const addToolImages = (callId, content, order) => {
+    if (typeof callId !== 'string' || !callId || callId.length > 512) return;
+    for (const value of content) {
+      const source = itemImageSource(value);
+      if (!source?.startsWith('data:image/')) continue;
+      if (!toolImages.has(callId)) toolImages.set(callId,{order,item:{type:'agentMessage',id:callId,content:[]},sources:new Set()});
+      const row = toolImages.get(callId);
+      // A completed MCP event and its response output record can contain the
+      // same native image. Deduplicate within that exact call only; separate
+      // calls or messages retain their own visible image occurrences.
+      const sourceId = digest(source); if (row.sources.has(sourceId)) continue;
+      row.sources.add(sourceId); row.item.content.push({type:'image',url:source});
+    }
+  };
   let order = 0;
   for (const line of text.split('\n')) {
     order++;
     let row;
     try { row = JSON.parse(line); } catch { continue; }
     const p = row.payload;
-    if (row.type === 'event_msg' && ['user_message', 'agent_message'].includes(p?.type)) {
+    if (p?.phase === 'analysis' || p?.channel === 'analysis') continue;
+    if (row.type === 'event_msg' && p?.type === 'item_completed' && p.item?.type === 'McpToolCall') {
+      const item = p.item;
+      if (item.status === 'completed' && item.error == null && item.phase !== 'analysis' && item.channel !== 'analysis' &&
+          item.result?.isError !== true && Array.isArray(item.result?.content))
+        addToolImages(item.id,item.result.content.filter(nativeImageContent),order);
+    } else if (row.type === 'response_item' && ['function_call_output','custom_tool_call_output'].includes(p?.type)) {
+      if (Array.isArray(p.output)) addToolImages(p.call_id,p.output.filter(value=>value?.type === 'input_image' && typeof value.image_url === 'string'),order);
+    } else if (row.type === 'event_msg' && ['user_message', 'agent_message'].includes(p?.type)) {
       if (p.phase === 'analysis' || p.channel === 'analysis' || typeof p.message !== 'string') continue;
       const item = {type:p.type === 'user_message' ? 'userMessage' : 'agentMessage',id:digest(line),
         text:p.message,phase:p.phase,content:[{type:'text',text:p.message},...eventImages(p)]};
@@ -112,6 +150,7 @@ export function parseVisibleHistory(text, limit = 80, options = {}) {
     const item = signatures.has(signature(row.item)) ? {...row.item,text:'',content:(row.item.content ?? []).filter(value=>!!itemImageSource(value))} : row.item;
     rows.push({...row,item});
   }
+  rows.push(...toolImages.values());
   return latestVisibleItems(rows.sort((a,b)=>a.order-b.order).map(row=>row.item),limit,options);
 }
 

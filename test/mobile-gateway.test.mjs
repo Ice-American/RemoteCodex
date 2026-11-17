@@ -231,6 +231,24 @@ async function ownerRig(t, options = {}) {
   return { ...f, gateway, control };
 }
 
+test('a running desktop chat exposes only completed tool image blocks to the paired phone', async t => {
+  const f = await ownerRig(t), png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJ4sAAAAASUVORK5CYII=', 'base64');
+  f.control.ready = true; f.control.runtimeType = 'active';
+  f.control.turns = [{ items: [{ type: 'mcpToolCall', id: 'public-tool-screenshot', status: 'completed', tool: 'js',
+    arguments: { hidden: 'private-tool-arguments' }, result: { content: [
+      { type: 'text', text: 'private-tool-text' },
+      { type: 'image', data: png.toString('base64'), mimeType: 'image/png', _meta: { hidden: 'private-image-meta' } },
+    ], structuredContent: { private: 'private-structured-content' } } }] }];
+  const thread = await request(f.gateway, { route: '/api/thread?id=' + threadId, headers: auth });
+  assert.equal(thread.status, 200); assert.equal(thread.data.status, 'running');
+  assert.equal(thread.data.messages.length, 1); const message = thread.data.messages[0];
+  assert.equal(message.role, 'assistant'); assert.equal(message.text, ''); assert.equal(message.images.length, 1);
+  for (const hidden of ['private-tool-', 'private-image-meta', 'private-structured-content', png.toString('base64')]) assert.ok(!thread.text.includes(hidden));
+  const image = message.images[0], result = await request(f.gateway, { headers: auth,
+    route: '/api/image?threadId=' + threadId + '&id=' + image.id + '&key=' + image.contentKey });
+  assert.equal(result.status, 200); assert.deepEqual(result.bytes, png); assert.equal(f.control.mutations, 0);
+});
+
 function localStream(gateway) {
   const ready = deferred(), closed = deferred(); let response;
   const observe = (req, res) => { if (req.url.startsWith('/api/events')) { gateway.server.off('request', observe); res.once('close', closed.resolve); } };

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { ThreadCatalog, canonicalDirectory, parseVisibleHistory, visibleItem, validThreadId } from '../mobile/history.mjs';
+import { ThreadCatalog, canonicalDirectory, parseVisibleHistory, visibleItem, visibleTurns, validThreadId } from '../mobile/history.mjs';
 
 const NOW = Date.parse('2026-11-16T10:00:00Z'), DAY = 86400000;
 const id = n => '00000000-0000-4000-8000-' + n.toString(16).padStart(12, '0');
@@ -200,4 +200,17 @@ test('media outside the visible message limit is not registered or read for live
   calls.length=0;
   const rows=[{type:'event_msg',payload:{type:'agent_message',message:'old'}},{type:'event_msg',payload:{type:'agent_message',message:'new'}}];
   assert.deepEqual(parseVisibleHistory(rows.map(JSON.stringify).join('\n'),1,{media,threadId:id(1)}).map(m=>m.text),['new']);assert.equal(calls.length,1);
+});
+
+test('running conversation projects only confirmed native tool images and excludes tool text and analysis', () => {
+  const captured=[];const data='aW1hZ2U=';
+  const media={decorateItem:(_thread,item)=>{captured.push(item);return {text:item.text??'',images:[{id:'opaque-image',contentKey:'opaque-key',name:'图片'}]};}};
+  const state={threadRuntimeStatus:{type:'active'},turns:[{items:[
+    {type:'mcpToolCall',id:'photo-tool',status:'completed',arguments:{private:'arguments'},result:{content:[{type:'text',text:'private tool output'},{type:'image',data,mimeType:'image/png',_meta:{private:'metadata'}}],structuredContent:{private:'structure'}}},
+    {type:'mcpToolCall',id:'running-tool',status:'inProgress',result:{content:[{type:'image',data,mimeType:'image/png'}]}},
+    {type:'mcpToolCall',id:'reasoning-tool',phase:'analysis',status:'completed',result:{content:[{type:'image',data,mimeType:'image/png'}]}},
+  ]}]};
+  const messages=visibleTurns(state,100,{media,threadId:id(1)});assert.equal(messages.length,1);assert.equal(messages[0].role,'assistant');assert.equal(messages[0].text,'');assert.equal(messages[0].images.length,1);
+  assert.equal(captured.length,1);assert.deepEqual(Object.keys(captured[0]).sort(),['content','id','type']);assert.deepEqual(Object.keys(captured[0].content[0]).sort(),['data','mimeType','type']);
+  for(const secret of ['arguments','private tool output','metadata','structure',data])assert.equal(JSON.stringify(messages).includes(secret),false);
 });

@@ -158,3 +158,62 @@ test('closing during a delayed open rejects immediately and closes the eventual 
   for(let i=0;i<100&&media.activeReads;i++)await new Promise(resolve=>setTimeout(resolve,5));
   assert.equal(media.activeReads,0);assert.equal(closed,1);
 });
+
+test('native MCP ImageContent data and mimeType projects from public assistant content',async t=>{
+  const {media}=await fixture(t),data=png.toString('base64');
+  const message=visibleItem({type:'agentMessage',id:'mcp-content',content:[{type:'image',data,mimeType:'image/png',_meta:{private:'hidden'}}]},{media,threadId:thread});
+  assert.equal(message?.images?.length,1);const ref=message.images[0];assert.deepEqual((await media.read(thread,ref.id,ref.contentKey)).bytes,png);
+  assert.equal(JSON.stringify(message).includes(data),false);assert.equal(JSON.stringify(message).includes('hidden'),false);
+});
+test('completed MCP tool images are public image-only messages without raw tool content',async t=>{
+  const {media}=await fixture(t),data=png.toString('base64');
+  const item={type:'mcpToolCall',id:'native-tool-picture',status:'completed',tool:'js',arguments:{secret:'private args'},text:'private body',result:{content:[{type:'text',text:'private tool text'},{type:'image',data,mimeType:'image/png',_meta:{secret:'private meta'}}],structuredContent:{secret:'private structure'}}};
+  const message=visibleItem(item,{media,threadId:thread});assert.equal(message?.role,'assistant');assert.equal(message.text,'');assert.equal(message.images.length,1);
+  const ref=message.images[0];assert.deepEqual((await media.read(thread,ref.id,ref.contentKey)).bytes,png);
+  for(const secret of [data,'private args','private body','private tool text','private meta','private structure'])assert.equal(JSON.stringify(message).includes(secret),false);
+  for(const changed of [{...item,status:'inProgress'},{...item,phase:'analysis'},{...item,result:{content:[{type:'text',text:data}],structuredContent:{type:'image',data,mimeType:'image/png'}}}])assert.equal(visibleItem(changed,{media,threadId:thread}),null);
+});
+test('official image file citations and ordinary image file links become visible images',async t=>{
+  const {file,media}=await fixture(t);
+  const messages=[
+    visibleItem({type:'agentMessage',id:'citation-picture',text:':codex-file-citation{path="'+file+'"}'},{media,threadId:thread}),
+    visibleItem({type:'agentMessage',id:'linked-picture',text:'[查看截图](<'+file+'>)'},{media,threadId:thread}),
+  ];
+  for(const message of messages){assert.equal(message.images?.length,1);const ref=message.images[0];assert.deepEqual((await media.read(thread,ref.id,ref.contentKey)).bytes,png);assert.equal(message.text.includes(file),false);}
+});
+test('ImageContent validates MIME and base64 shape without accepting SVG or arbitrary nested tool data',async t=>{
+  const {media}=await fixture(t);
+  for(const content of [{type:'image',data:'PHN2Zz4=',mimeType:'image/svg+xml'},{type:'image',data:'not base64',mimeType:'image/png'}]){
+    const message=visibleItem({type:'agentMessage',content:[content]},{media,threadId:thread});assert.equal(message?.imageUnavailable,true);assert.deepEqual(message.images,[]);
+  }
+});
+
+test('completed native imageView projects only its exact local image path through the guarded reader',async t=>{
+  const {file,media}=await fixture(t);const item={type:'imageView',id:'view-picture',path:file,startedAtMs:1000,completedAtMs:2000};
+  const message=visibleItem(item,{media,threadId:thread});assert.equal(message?.role,'assistant');assert.equal(message.text,'');assert.equal(message.images.length,1);
+  const ref=message.images[0];assert.deepEqual((await media.read(thread,ref.id,ref.contentKey)).bytes,png);assert.equal(JSON.stringify(message).includes(file),false);
+  for(const change of [{...item,completedAtMs:null},{...item,phase:'analysis'},{...item,channel:'analysis'}])assert.equal(visibleItem(change,{media,threadId:thread}),null);
+});
+
+test('confirmed rollout tool image formats merge only duplicate images from the same call',async t=>{
+  const {media}=await fixture(t),data=png.toString('base64'),source='data:image/png;base64,'+data;
+  const lines=[
+    {type:'response_item',payload:{type:'function_call_output',call_id:'same-call',output:[{type:'input_image',image_url:source,detail:'original'},{type:'text',text:'private tool body'}]}},
+    {type:'event_msg',payload:{type:'item_completed',item:{type:'McpToolCall',id:'same-call',status:'completed',arguments:{secret:'private arguments'},result:{content:[{type:'image',data,mimeType:'image/png',_meta:{secret:'private metadata'}}]}}}},
+    {type:'response_item',payload:{type:'custom_tool_call_output',call_id:'different-call',output:[{type:'input_image',image_url:source}]}},
+  ];
+  const messages=parseVisibleHistory(lines.map(JSON.stringify).join('\n'),80,{media,threadId:thread});
+  assert.equal(messages.length,2);assert.deepEqual(messages.map(message=>message.id),['same-call','different-call']);
+  for(const message of messages){assert.equal(message.role,'assistant');assert.equal(message.text,'');assert.equal(message.images.length,1);const ref=message.images[0];assert.deepEqual((await media.read(thread,ref.id,ref.contentKey)).bytes,png);}
+  for(const secret of [data,'private tool body','private arguments','private metadata'])assert.equal(JSON.stringify(messages).includes(secret),false);
+});
+test('rollout tool images do not expose text outputs or parse stringified or arbitrary nested payloads',async t=>{
+  const {media}=await fixture(t),data=png.toString('base64'),source='data:image/png;base64,'+data;
+  const lines=[
+    {type:'response_item',payload:{type:'function_call_output',call_id:'text',output:[{type:'text',text:'private '+source}]}},
+    {type:'response_item',payload:{type:'function_call_output',call_id:'string',output:JSON.stringify([{type:'input_image',image_url:source}])}},
+    {type:'response_item',payload:{type:'custom_tool_call_output',call_id:'nested',output:{content:[{type:'input_image',image_url:source}]}}},
+    {type:'event_msg',payload:{type:'item_completed',item:{type:'McpToolCall',id:'unfinished',status:'inProgress',result:{content:[{type:'image',data,mimeType:'image/png'}]}}}},
+  ];
+  assert.deepEqual(parseVisibleHistory(lines.map(JSON.stringify).join('\n'),80,{media,threadId:thread}),[]);
+});
