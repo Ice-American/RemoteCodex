@@ -147,6 +147,7 @@ export function createMobileAPI({ apiBase = '', fetchImpl = globalThis.fetch, Ev
       finally { clearTimeout(timer); }
     },
     getThread: (host, id, { signal } = {}) => json(path('/api/thread', { host, id }), { signal }),
+    getTodayImages: (host, id, { signal } = {}) => json(path('/api/thread', { host, id, view: 'today-images' }), { signal }),
     async action(body) {
       const controller = new AbortController();
       // A handover can leave an HTTP reply pending indefinitely. Stop waiting,
@@ -281,6 +282,8 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   let cardsSignature = '', messageScope = '', hostSignature = '', threadSignature = '', noticeText = '';
   const drafts = new Map(), answers = new Map(), gate = new ActionGate({ storage: draftStorage }), messageNodes = new Map();
   let previewRecord = null;
+  let galleryOpen = false, galleryGeneration = 0, galleryRead = null;
+  const galleryRecords = new Map();
   const node = (tag, cls, text) => element(doc, tag, cls, text);
   const button = (text, cls, fn) => { const b = node('button', cls, text); b.type = 'button'; if (fn) b.addEventListener('click', fn); return b; };
   const app = node('div', 'mobile-app'); app.setAttribute('lang', 'zh-CN');
@@ -289,7 +292,9 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const heading = node('div', 'heading-group'), title = node('h1', 'thread-title', 'Codex 随行'), subtitle = node('p', 'thread-subtitle', '选择一个已有对话');
   const titleLine = node('div', 'title-line'), titleRunning = node('span', 'running-indicator title-running');
   titleRunning.setAttribute('role', 'img'); titleRunning.setAttribute('aria-label', '进行中'); titleRunning.hidden = true;
-  titleLine.append(title, titleRunning); heading.append(titleLine, subtitle);
+  const headingDetails = node('div', 'heading-details'), todayImagesButton = button('今日图片', 'today-images-button', () => openTodayImages());
+  todayImagesButton.disabled = true; headingDetails.append(subtitle, todayImagesButton);
+  titleLine.append(title, titleRunning); heading.append(titleLine, headingDetails);
   const newChat = button('＋ 新建', 'new-chat-button', () => openCreation()); newChat.setAttribute('aria-label', '新建聊天');
   const hostSwitch = node('div', 'host-switch'); hostSwitch.setAttribute('role', 'group'); hostSwitch.setAttribute('aria-label', '目标电脑');
   header.append(menu, heading, newChat, hostSwitch);
@@ -382,7 +387,13 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const previewOriginal = node('a', 'image-preview-original', '在新标签页查看原图');
   previewOriginal.setAttribute('target', '_blank'); previewOriginal.setAttribute('rel', 'noopener noreferrer');
   previewActions.append(previewZoom, previewOriginal); imagePreview.append(previewHeading, previewStatus, previewViewport, previewActions);
-  app.append(header, connection, notice, main, latest, composer, backdrop, drawer, creationBackdrop, creationDialog, imagePreview); root.replaceChildren(app);
+  const galleryDialog = node('section', 'today-images-dialog'); galleryDialog.hidden = true;
+  galleryDialog.setAttribute('role', 'dialog'); galleryDialog.setAttribute('aria-modal', 'true'); galleryDialog.setAttribute('aria-label', '今日图片');
+  const galleryHeading = node('div', 'today-images-heading'); galleryHeading.append(node('h2', '', '今日图片'), button('关闭', 'today-images-close', () => closeTodayImages()));
+  const galleryState = node('p', 'today-images-state'); galleryState.setAttribute('role', 'status'); galleryState.setAttribute('aria-live', 'polite');
+  const galleryList = node('div', 'today-images-list'), galleryRetry = button('重新读取今日图片', 'today-images-retry', () => readTodayImages()); galleryRetry.hidden = true;
+  galleryDialog.append(galleryHeading, galleryState, galleryRetry, galleryList);
+  app.append(header, connection, notice, main, latest, composer, backdrop, drawer, creationBackdrop, creationDialog, galleryDialog, imagePreview); root.replaceChildren(app);
 
   function storageKey(scope) { return 'codex-mobile-draft:' + scope; }
   function draft(scope) {
@@ -626,6 +637,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function sendKey(text) { return JSON.stringify([currentScope(), 'send', fingerprint(text)]); }
   function retryKey(snapshot = state) { return JSON.stringify([scopeOf(snapshot), 'retry', failedTurnId(snapshot)]); }
   function renderStatus() {
+    todayImagesButton.disabled = !selectedId;
     title.textContent = state?.title || (selectedId ? '正在读取对话…' : 'Codex 随行');
     subtitle.textContent = state ? (hosts.find((host) => host.id === selectedHost)?.name || selectedHost) + (isHistoryOnly(state) ? ' · 只读历史' : ' · 原桌面会话') : '选择一个已有对话';
     connectionLabel.textContent = incompatible(state) ? '电脑网关需要更新' : !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : isRuntimeError(state) ? '上一轮运行失败' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
@@ -658,8 +670,56 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     draftHint.textContent = attempt?.status === 'unknown' ? '结果未确认，此内容已禁止重复发送' : attempt?.status === 'submitted' ? '已提交，保留草稿并等待确认' : '草稿只保存在本设备';
   }
   function imageCurrent(record) {
-    return !destroyed && state && record.scope === currentScope() && record.scope === scopeOf(state) &&
-      messageNodes.get(record.messageKey)?.images.get(record.key) === record;
+    if (destroyed || record.scope !== currentScope()) return false;
+    if (record.gallery) return galleryOpen && galleryRecords.get(record.messageKey)?.images.get(record.key) === record;
+    return state && record.scope === scopeOf(state) && messageNodes.get(record.messageKey)?.images.get(record.key) === record;
+  }
+  function closeTodayImages({ restoreFocus = true } = {}) {
+    galleryOpen = false; galleryGeneration++;
+    if (galleryRead) { cancel(galleryRead.timeout); galleryRead.controller.abort(); galleryRead.cancel?.(Error('今日图片读取已取消')); galleryRead = null; }
+    if (previewRecord?.gallery) closePreview({ restoreFocus: false });
+    galleryRecords.clear(); galleryList.replaceChildren(); galleryDialog.hidden = true;
+    if (restoreFocus && !destroyed && selectedId) todayImagesButton.focus();
+  }
+  function openTodayImages() {
+    if (destroyed || !selectedId || galleryOpen) return;
+    galleryOpen = true; galleryGeneration++; galleryDialog.hidden = false; galleryList.replaceChildren(); galleryRecords.clear();
+    void readTodayImages();
+  }
+  async function readTodayImages() {
+    if (destroyed || !galleryOpen || !selectedId || galleryRead) return;
+    if (typeof api.getTodayImages !== 'function') {
+      galleryState.textContent = '请更新电脑网关后查看今日图片。'; galleryRetry.hidden = true; return;
+    }
+    const host = selectedHost, id = selectedId, scope = currentScope(), stamp = galleryGeneration;
+    const attempt = { controller: new AbortController(), timeout: null, cancel: null }; galleryRead = attempt;
+    const current = () => !destroyed && galleryOpen && stamp === galleryGeneration && scope === currentScope() && galleryRead === attempt;
+    galleryState.textContent = '正在读取今日图片…'; galleryRetry.hidden = true;
+    const cancelled = new Promise((_, reject) => { attempt.cancel = reject; });
+    const timeout = new Promise((_, reject) => { attempt.timeout = later(() => { attempt.controller.abort(); reject(Error('今日图片读取超时，请重试。')); }, readTimeoutMs); });
+    try {
+      const result = await Promise.race([api.getTodayImages(host, id, { signal: attempt.controller.signal }), timeout, cancelled]);
+      if (!current()) return;
+      if (result?.host !== host || result?.id !== id || !Array.isArray(result.images)) throw Error('电脑返回的今日图片与当前聊天不匹配。');
+      if (previewRecord?.gallery) closePreview({ restoreFocus: false });
+      galleryRecords.clear(); const children = [];
+      result.images.forEach((image, index) => {
+        // Occurrences remain distinct even when two messages reference equal
+        // image bytes. The original message relationship is not a global hash.
+        const key = JSON.stringify([image?.messageId ?? null, image?.at ?? null, image?.id ?? null, index]);
+        const el = node('article', 'today-image-entry'), time = node('p', 'today-image-time'), media = node('div', 'message-images');
+        const instant = typeof image?.at === 'number' && image.at < 1e11 ? image.at * 1000 : image?.at;
+        const date = typeof instant === 'number' || typeof instant === 'string' ? new Date(instant) : null;
+        time.textContent = date && Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(date) : '时间未记录';
+        el.append(time, media); const item = { el, media, images: new Map() }; galleryRecords.set(key, item);
+        renderImages(item, [image], key, scope, false, true); children.push(el);
+      });
+      reconcile(galleryList, children);
+      const date = typeof result.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(result.date) ? result.date : '今日';
+      galleryState.textContent = date + ' · ' + result.images.length + ' 张图片' + (result.complete === true ? result.images.length ? '' : '，暂未找到图片。' : '。部分图片尚未取得，当前列表不完整。');
+      galleryRetry.hidden = false;
+    } catch (error) { if (current()) { galleryState.textContent = error?.message?.includes('不匹配') || error?.message?.includes('超时') ? error.message : '暂时无法读取今日图片，请重试。'; galleryRetry.hidden = false; } }
+    finally { cancel(attempt.timeout); if (galleryRead === attempt) galleryRead = null; }
   }
   function closePreview({ restoreFocus = true } = {}) {
     const previous = previewRecord; previewRecord = null; imagePreview.hidden = true; previewViewport.replaceChildren();
@@ -695,11 +755,11 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     // image element and URL, so they never download the image again.
     image.setAttribute('src', record.url + (retry ? '&retry=' + ++record.retries : ''));
   }
-  function renderImages(item, imageRefs, messageKey, scope, imageUnavailable = false) {
+  function renderImages(item, imageRefs, messageKey, scope, imageUnavailable = false, gallery = false) {
     const refs = Array.isArray(imageRefs) ? imageRefs : [], keep = new Set(), children = [];
     let unavailable = imageUnavailable === true;
     for (const image of refs) {
-      const url = imageSource(state.host, state.id, image); if (!url) { unavailable = true; continue; }
+      const url = imageSource(gallery ? selectedHost : state.host, gallery ? selectedId : state.id, image); if (!url) { unavailable = true; continue; }
       const key = JSON.stringify([image.id, image.contentKey]); if (keep.has(key)) continue; keep.add(key);
       const name = typeof image.name === 'string' ? image.name.replace(/[\0-\x1f\x7f]/g, '').slice(0, 512) || '图片' : '图片';
       let record = item.images.get(key);
@@ -710,7 +770,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
         error.append(node('p', '', '图片加载失败。原图可能已移动、删除，或电脑正在等待文件访问授权。'),
           button('重试图片', 'message-image-retry', () => { if (imageCurrent(record)) loadImage(record, true); }));
         figure.append(open, caption, error);
-        record = { key, messageKey, scope, url, name, figure, open, caption, error, retries: 0, image: null };
+        record = { key, messageKey, scope, gallery, url, name, figure, open, caption, error, retries: 0, image: null };
         item.images.set(key, record); loadImage(record);
       } else {
         record.name = name; record.caption.textContent = name; record.image.setAttribute('alt', name);
@@ -849,6 +909,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (destroyed || host === selectedHost && (selectedId || threads.length)) return;
     if (selectedId) saveDraft(currentScope(), input.value);
     if (creationOpen) closeCreation({ restore: false });
+    closeTodayImages({ restoreFocus: false });
     cancel(searchTimer); searchTimer = null; stopStatuses();
     generation++; hostGeneration++; const stamp = hostGeneration;
     stopReadAndStream(); clearRecovery(); state = null; selectedHost = host; selectedId = ''; connected = false; loading = false;
@@ -859,6 +920,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   }
   async function selectThread(id) {
     if (destroyed) return;
+    closeTodayImages({ restoreFocus: false });
     if (selectedId) saveDraft(currentScope(), input.value);
     generation++; const host = selectedHost; stopReadAndStream(); clearRecovery();
     state = null; selectedId = id; connected = false; loading = true; input.value = draft(currentScope()); cardsSignature = ''; showNotice(''); autoSize(); setDrawer(false); render({ navigation: true }); onNavigate({ host, id });
@@ -1045,7 +1107,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   projectSelect.addEventListener('change', () => { selectedProject = projectSelect.value; changeCatalog(); });
   rangeSelect.addEventListener('change', () => { selectedRange = rangeSelect.value === 'all' ? 'all' : 'week'; changeCatalog(); });
   main.addEventListener('scroll', () => { latest.hidden = main.scrollHeight - main.scrollTop - main.clientHeight < 160; });
-  const escape = (event) => { if (event.key === 'Escape') { if (previewRecord) closePreview(); else if (creationOpen && creationProjectsOpen) { creationProjectsOpen = false; renderCreation(); createProject.focus(); } else if (creationOpen) closeCreation(); else if (drawerOpen) setDrawer(false); } };
+  const escape = (event) => { if (event.key === 'Escape') { if (previewRecord) closePreview(); else if (galleryOpen) closeTodayImages(); else if (creationOpen && creationProjectsOpen) { creationProjectsOpen = false; renderCreation(); createProject.focus(); } else if (creationOpen) closeCreation(); else if (drawerOpen) setDrawer(false); } };
   const wake = () => {
     if (destroyed || !selectedId || doc.visibilityState === 'hidden' || readAttempt) return;
     const delay = 500 - (now() - lastWakeAt);
@@ -1084,7 +1146,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
   } else if (api.getHosts) void loadHosts();
   return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts, openCreation,
-    destroy() { destroyed = true; closePreview({ restoreFocus: false }); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses(); creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
+    destroy() { destroyed = true; closeTodayImages({ restoreFocus: false }); closePreview({ restoreFocus: false }); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses(); creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
   };
 }
 

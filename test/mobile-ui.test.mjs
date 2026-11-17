@@ -57,6 +57,19 @@ const descendants = (node) => [node, ...node.childNodes.flatMap(descendants)];
 const byClass = (root, cls) => descendants(root).filter((node) => node.classList.contains(cls));
 const one = (root, cls) => { const found = byClass(root, cls); assert.equal(found.length, 1, cls); return found[0]; };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test('today images use the existing authenticated thread GET and preserve request cancellation', async () => {
+  const calls = [], controller = new AbortController();
+  const api = createMobileAPI({ fetchImpl: async (url, options) => {
+    calls.push({ url, options }); return { ok: true, json: async () => ({ host: 'mac', id: 'picture-chat', images: [] }) };
+  } });
+  await api.getTodayImages('mac', 'picture-chat', { signal: controller.signal });
+  assert.equal(calls.length, 1); const url = new URL(calls[0].url, 'http://fixture');
+  assert.equal(url.pathname, '/api/thread'); assert.equal(url.searchParams.get('view'), 'today-images');
+  assert.equal(url.searchParams.get('host'), 'mac'); assert.equal(url.searchParams.get('id'), 'picture-chat');
+  assert.equal(calls[0].options.credentials, 'same-origin'); assert.equal(calls[0].options.signal, controller.signal);
+  assert.equal(calls[0].options.method, undefined); assert.equal(calls[0].options.body, undefined);
+});
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
 function fakeClock() {
   let now = 0, nextId = 0; const jobs = new Map();
@@ -172,6 +185,50 @@ test('navigation closes image preview and retired image events cannot change the
   const current = one(root, 'message-image-thumbnail'); assert.ok(current.getAttribute('src').includes('host=windows'));
   old.fire('error'); assert.equal(one(root, 'message-image-error').hidden, true);
   assert.notEqual(current, old);
+});
+
+test('today gallery reads the selected chat, preserves repeated occurrences and returns from preview without losing drafts', async t => {
+  const result = deferred(), calls = [];
+  const { root, view } = mount(t, { getTodayImages: (host, id, options) => { calls.push({ host, id, signal: options.signal }); return result.promise; } });
+  assert.equal(one(root, 'today-images-button').disabled, true); view.update(thread()); type(root, '今日图片查看期间的草稿');
+  one(root, 'today-images-button').click(); assert.equal(one(root, 'today-images-dialog').hidden, false); assert.match(one(root, 'today-images-state').textContent, /读取/);
+  assert.equal(calls.length, 1); assert.equal(calls[0].host, 'mac'); assert.equal(calls[0].id, thread().id);
+  result.resolve({ host: 'mac', id: thread().id, date: '2026-11-17', complete: true, issues: [], images: [
+    { ...phoneImage(), messageId: 'call-private-first', at: '2026-11-17T01:02:03Z' },
+    { ...phoneImage(), messageId: 'call-private-second', at: '2026-11-17T01:04:05Z' },
+  ] }); await tick();
+  assert.equal(byClass(root, 'today-image-entry').length, 2); assert.equal(byClass(root, 'message-image-thumbnail').length, 2);
+  assert.match(one(root, 'today-images-state').textContent, /2026-11-17.*2/); assert.ok(!one(root, 'today-images-dialog').textContent.includes('call-private'));
+  assert.deepEqual(byClass(root, 'today-image-time').map(n => n.textContent), ['09:02:03', '09:04:05']);
+  byClass(root, 'message-image-open')[0].click(); assert.equal(one(root, 'image-preview').hidden, false);
+  one(root, 'image-preview-close').click(); assert.equal(one(root, 'today-images-dialog').hidden, false);
+  assert.equal(one(root, 'message-input').value, '今日图片查看期间的草稿'); assert.equal(one(root, 'thread-title').textContent, '手机适配');
+});
+
+test('today gallery explains incomplete results and explicit read failures without business writes', async t => {
+  let reads = 0, writes = 0;
+  const { root, view } = mount(t, { getTodayImages: async () => { reads++; if (reads === 1) throw Error('temporary'); return { host: 'mac', id: thread().id, date: '2026-11-17', complete: false, issues: [{ privatePath: '/secret' }], images: [phoneImage()] }; }, action: async () => { writes++; } });
+  view.update(thread()); one(root, 'today-images-button').click(); await tick(); assert.match(one(root, 'today-images-state').textContent, /无法读取|读取失败/);
+  one(root, 'today-images-retry').click(); await tick(); assert.equal(reads, 2); assert.match(one(root, 'today-images-state').textContent, /部分.*未.*|不完整/);
+  assert.ok(!one(root, 'today-images-dialog').textContent.includes('/secret')); assert.equal(writes, 0);
+});
+
+test('closing or navigating cancels today-gallery reads and ignores late data for the old chat', async t => {
+  const first = deferred(), calls = [];
+  const { root, view } = mount(t, { getThreads: async () => ({ threads: [] }), getTodayImages: (host, id, { signal }) => { calls.push({ host, id, signal }); return first.promise; } });
+  view.update(thread()); one(root, 'today-images-button').click(); one(root, 'today-images-close').click();
+  assert.equal(calls[0].signal.aborted, true); assert.equal(one(root, 'today-images-dialog').hidden, true);
+  one(root, 'today-images-button').click(); await view.selectHost('windows'); assert.equal(calls[1].signal.aborted, true);
+  first.resolve({ host: 'mac', id: thread().id, date: '2026-11-17', complete: true, images: [phoneImage()] }); await tick();
+  assert.equal(one(root, 'today-images-dialog').hidden, true); assert.equal(byClass(root, 'today-image-entry').length, 0);
+});
+
+test('today gallery refuses host-mismatched results and safely explains missing support', async t => {
+  const unsupported = mount(t); unsupported.view.update(thread()); one(unsupported.root, 'today-images-button').click();
+  assert.match(one(unsupported.root, 'today-images-state').textContent, /更新电脑网关/);
+  const { root, view } = mount(t, { getTodayImages: async () => ({ host: 'windows', id: thread().id, date: '2026-11-17', complete: true, images: [phoneImage()] }) });
+  view.update(thread()); one(root, 'today-images-button').click(); await tick(); assert.match(one(root, 'today-images-state').textContent, /不匹配/);
+  assert.equal(byClass(root, 'message-image-thumbnail').length, 0);
 });
 
 test('all user text and the minimal Markdown subset stay inert DOM text', () => {

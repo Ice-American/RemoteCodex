@@ -17,6 +17,7 @@ import { questionViews, approvalViews, buildQuestionReply, buildApprovalReply, r
 import { Secrets, Journal, secretEqual, dataDirectory, writePrivate } from './store.mjs';
 import { NativeTools } from './native-tools.mjs';
 import { CreationManager } from './creation.mjs';
+import { readTodayGallery } from './today-gallery.mjs';
 import { MobileMedia } from './media.mjs';
 
 const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
@@ -423,7 +424,24 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
           return sendJson(res, 404, { error: '原图暂时不可用，文件可能已移动或删除，请刷新后重试。' });
         }
       }
-      if (url.pathname === '/api/thread' && req.method === 'GET') return sendJson(res, 200, await state(url.searchParams.get('id'), { refresh: true }));
+      if (url.pathname === '/api/thread' && req.method === 'GET') {
+        if (url.searchParams.get('view') === 'today-images') {
+          const id = url.searchParams.get('id');
+          if (!validThreadId(id)) return sendJson(res, 400, { error: '图片聊天标识无效' });
+          const controller = new AbortController(), gone = () => controller.abort(Error('图片目录读取已取消'));
+          res.once('close', gone);
+          try {
+            // Gallery reads only saved public pictures. A cold or incompatible
+            // runtime must not prevent a paired phone from viewing them.
+            const gallery = await readTodayGallery({ catalog, media, hostId, threadId: id, signal: controller.signal });
+            if (!res.destroyed) return sendJson(res, 200, gallery);
+          } catch {
+            if (!res.destroyed) return sendJson(res, 503, { error: '今日图片暂时无法读取，请稍后重试。' });
+          } finally { res.off('close', gone); }
+          return;
+        }
+        return sendJson(res, 200, await state(url.searchParams.get('id'), { refresh: true }));
+      }
       if (url.pathname === '/api/action' && req.method === 'POST') {
         const controller = new AbortController();
         const gone = () => controller.abort(loadError('加载已取消。', 'LOAD_CANCELLED'));

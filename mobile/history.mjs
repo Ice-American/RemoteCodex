@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { TodayImagesReader, shanghaiDate } from './today-images.mjs';
 import { itemVisibleText, itemImageSource, itemHasImages, nativeImageContent } from './media.mjs';
 
 export const validThreadId = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9-]{27}$/i.test(value);
@@ -73,6 +74,9 @@ function eventImages(payload) {
       ...(value.startsWith('data:') || /^https?:/i.test(value) ? {url:value} : {path:value})}] : historyContent([value]));
 }
 export function parseVisibleHistory(text, limit = 80, options = {}) {
+  return parseVisibleHistoryRecords(text.split('\n').map(line=>({line})),limit,options);
+}
+export function parseVisibleHistoryRecords(records, limit = 80, options = {}) {
   const events = [], fallback = [], toolImages = new Map();
   const addToolImages = (callId, content, order) => {
     if (typeof callId !== 'string' || !callId || callId.length > 512) return;
@@ -89,10 +93,10 @@ export function parseVisibleHistory(text, limit = 80, options = {}) {
     }
   };
   let order = 0;
-  for (const line of text.split('\n')) {
+  for (const record of records) {
     order++;
-    let row;
-    try { row = JSON.parse(line); } catch { continue; }
+    let row, lineId;
+    try { row = record.row ?? JSON.parse(record.line); lineId = record.lineId ?? digest(record.line ?? JSON.stringify(row)); } catch { continue; }
     const p = row.payload;
     if (p?.phase === 'analysis' || p?.channel === 'analysis') continue;
     if (row.type === 'event_msg' && p?.type === 'item_completed' && p.item?.type === 'McpToolCall') {
@@ -104,13 +108,13 @@ export function parseVisibleHistory(text, limit = 80, options = {}) {
       if (Array.isArray(p.output)) addToolImages(p.call_id,p.output.filter(value=>value?.type === 'input_image' && typeof value.image_url === 'string'),order);
     } else if (row.type === 'event_msg' && ['user_message', 'agent_message'].includes(p?.type)) {
       if (p.phase === 'analysis' || p.channel === 'analysis' || typeof p.message !== 'string') continue;
-      const item = {type:p.type === 'user_message' ? 'userMessage' : 'agentMessage',id:digest(line),
+      const item = {type:p.type === 'user_message' ? 'userMessage' : 'agentMessage',id:lineId,
         text:p.message,phase:p.phase,content:[{type:'text',text:p.message},...eventImages(p)]};
       events.push({order,item});
     } else if (row.type === 'response_item' && p?.type === 'message' && ['user', 'assistant'].includes(p.role)) {
       if (p.role === 'assistant' && !['final', 'commentary', 'final_answer'].includes(p.channel ?? p.phase)) continue;
       const content = historyContent(p.content ?? []);
-      const item = {type:p.role === 'user' ? 'userMessage' : 'agentMessage',id:p.id ?? digest(line),content,phase:p.phase};
+      const item = {type:p.role === 'user' ? 'userMessage' : 'agentMessage',id:p.id ?? lineId,content,phase:p.phase};
       if (itemVisibleText(item) || itemHasImages(item)) fallback.push({order,item});
     }
   }
@@ -211,7 +215,10 @@ function projectMetadata(state) {
 }
 
 export class ThreadCatalog {
-  constructor(home, { now = () => Date.now() } = {}) { this.home = home; this.now = now; this.paths = new Map(); this.pathsAt = 0; }
+  constructor(home, { now = () => Date.now(), todayImages = {} } = {}) {
+    this.home = home; this.now = now; this.paths = new Map(); this.pathsAt = 0;
+    this.todayImages = new TodayImagesReader({project:parseVisibleHistoryRecords,...todayImages});
+  }
   async snapshot() {
     let state = {}, stateAvailable = false, indexAvailable = false;
     try { const value = await metadataJson(path.join(this.home, '.codex-global-state.json')); if (value && typeof value === 'object' && !Array.isArray(value)) { state = value; stateAvailable = true; } } catch {}
@@ -336,6 +343,12 @@ export class ThreadCatalog {
     };
     await walk(path.join(this.home, 'sessions'));
     this.paths = found; this.pathsAt = Date.now();
+  }
+  async readTodayImages(id, {media, date = shanghaiDate(this.now()), signal} = {}) {
+    if (!validThreadId(id)) throw Error('无效聊天标识');
+    if (signal?.aborted) throw signal.reason ?? Error('读取已取消');
+    await this.refreshPaths();
+    return this.todayImages.read(this.paths.get(id),id,{media,date,signal});
   }
   async read(id, limit = 80, {media} = {}) {
     if (!validThreadId(id)) throw Error('无效聊天标识');

@@ -126,6 +126,101 @@ test('phone history projects an inline original to an authenticated image refere
   assert.equal((await request(gateway, { route: route + '&retry=1', headers: auth })).status, 200);
 });
 
+const todayGalleryRoute = '/api/thread?view=today-images&id=' + threadId;
+const galleryFixture = () => ({ date: '2026-11-17', complete: true, issues: [], images: [{
+  id: 'a'.repeat(64), contentKey: 'b'.repeat(64), name: 'fixture.png', messageId: 'gallery-message', at: 1794870000000,
+}] });
+
+test('today gallery authenticates before catalog access and validates the chat ID', async t => {
+  const f = await rig(t); let reads = 0;
+  const catalog = { async readTodayImages() { reads++; return galleryFixture(); } };
+  const gateway = await f.start({ catalog });
+  assert.equal((await request(gateway, { route: todayGalleryRoute })).status, 401);
+  assert.equal(reads, 0); assert.equal(f.calls.discover, 0);
+  const invalid = await request(gateway, { route: todayGalleryRoute.replace(threadId, 'not-a-chat-id'), headers: auth });
+  assert.equal(invalid.status, 400); assert.equal(reads, 0); assert.equal(f.calls.discover, 0);
+});
+
+test('today gallery reads saved pictures with no owner discovery and exposes only opaque metadata', async t => {
+  const f = await rig(t); let reads = 0;
+  const catalog = { async readTodayImages(id) {
+    reads++; assert.equal(id, threadId);
+    const data = galleryFixture(); data.images[0].path = '/private/source.png'; data.images[0].data = 'private-base64';
+    return data;
+  } };
+  const gateway = await f.start({ catalog });
+  const result = await request(gateway, { route: todayGalleryRoute, headers: auth });
+  assert.equal(result.status, 200); assert.equal(result.data.host, 'mac'); assert.equal(result.data.id, threadId);
+  assert.equal(result.data.complete, true); assert.equal(reads, 1); assert.equal(f.calls.discover, 0);
+  assert.ok(!result.text.includes('/private/') && !result.text.includes('private-base64'));
+});
+
+test('today gallery source failures keep private paths out of the HTTP response', async t => {
+  const f = await rig(t), gateway = await f.start({ catalog: {
+    async readTodayImages() { throw Error('cannot read /private/secret/history.jsonl with private-payload'); },
+  } });
+  const result = await request(gateway, { route: todayGalleryRoute, headers: auth });
+  assert.equal(result.status, 503); assert.match(result.data.error, /今日图片暂时无法读取/);
+  assert.ok(!result.text.includes('/private/') && !result.text.includes('private-payload'));
+  assert.equal(f.calls.discover, 0);
+});
+
+test('cancelling one gallery HTTP client aborts its read without cancelling another client', async t => {
+  const f = await rig(t), signals = [], bothEntered = deferred(), firstCancelled = deferred(), resultGate = deferred();
+  const gateway = await f.start({ catalog: { async readTodayImages(_id, { signal }) {
+    const index = signals.push(signal) - 1; if (signals.length === 2) bothEntered.resolve();
+    return await new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => { if (index === 0) firstCancelled.resolve(); reject(signal.reason); }, { once: true });
+      resultGate.promise.then(resolve, reject);
+    });
+  } } });
+  const first = http.request({ host: '127.0.0.1', port: gateway.port, path: todayGalleryRoute, headers: auth });
+  first.on('error', () => {}); first.end();
+  const second = request(gateway, { route: todayGalleryRoute, headers: auth });
+  await within(bothEntered.promise, 'Gallery HTTP reads did not start'); first.destroy();
+  await within(firstCancelled.promise, 'Cancelled HTTP read did not receive abort');
+  assert.equal(signals[0].aborted, true); assert.equal(signals[1].aborted, false);
+  assert.equal((await request(gateway, { route: '/health' })).status, 200);
+  resultGate.resolve(galleryFixture()); assert.equal((await second).status, 200);
+  assert.equal(f.calls.discover, 0);
+});
+
+test('Windows phone front door preserves the gallery query and uses only the paired Mac peer', async t => {
+  const calls = [], data = { ...galleryFixture(), host: 'mac', id: threadId };
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls.push({ url: String(url), options });
+    return Response.json(data);
+  });
+  const f = await rig(t, { peers: [{ id: 'mac', url: 'https://mac-fixture.tailfixture.ts.net' }] });
+  f.keys.set('peer-mac', peerKey);
+  const gateway = await f.start({ hostId: 'windows', hostName: 'Windows fixture' });
+  const route = todayGalleryRoute + '&host=mac';
+  assert.equal((await request(gateway, { route })).status, 401); assert.equal(calls.length, 0);
+  const result = await request(gateway, { route, headers: auth });
+  assert.equal(result.status, 200); assert.deepEqual(result.data, data); assert.equal(calls.length, 1);
+  const forwarded = new URL(calls[0].url);
+  assert.equal(forwarded.hostname, 'mac-fixture.tailfixture.ts.net');
+  assert.equal(forwarded.searchParams.get('view'), 'today-images'); assert.equal(forwarded.searchParams.get('id'), threadId);
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer ' + peerKey); assert.equal(f.calls.discover, 0);
+});
+
+test('a new gallery inline reference is readable only in its authenticated chat and content identity', async t => {
+  const f = await rig(t), source = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJ4sAAAAASUVORK5CYII=';
+  const gateway = await f.start({ catalog: { async readTodayImages(id, { media }) {
+    const message = visibleItem({ type: 'userMessage', id: 'saved-gallery-picture', content: [{ type: 'image', url: source }] }, { media, threadId: id });
+    return { date: '2026-11-17', complete: true, issues: [], images: message.images.map(image => ({ ...image, messageId: message.id, at: 1794870000000 })) };
+  } } });
+  const gallery = await request(gateway, { route: todayGalleryRoute, headers: auth });
+  assert.equal(gallery.status, 200); assert.equal(gallery.data.images.length, 1);
+  const image = gallery.data.images[0], route = '/api/image?threadId=' + threadId + '&id=' + image.id + '&key=' + image.contentKey;
+  assert.equal((await request(gateway, { route })).status, 401);
+  const original = await request(gateway, { route, headers: auth });
+  assert.equal(original.status, 200); assert.deepEqual(original.bytes, Buffer.from(source.split(',')[1], 'base64'));
+  assert.equal((await request(gateway, { route: route.replace(threadId, '22222222-2222-4222-8222-222222222222'), headers: auth })).status, 404);
+  assert.equal((await request(gateway, { route: route.replace(image.contentKey, 'c'.repeat(64)), headers: auth })).status, 404);
+  assert.equal(f.calls.discover, 0);
+});
+
 test('phone image peer forwarding preserves image headers and uses only the paired peer credential', async t => {
   const calls = [], bytes = Buffer.from('fixture original image bytes');
   t.mock.method(globalThis, 'fetch', async (url, options) => {
