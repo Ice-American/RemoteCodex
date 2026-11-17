@@ -159,3 +159,45 @@ test('metadata fallback remains searchable, marks incompleteness and preserves n
   assert.equal(result.threads[0].title, '旧 UI 还原');
   assert.equal((await catalog.query({ projectId: 'red' })).projects.find(row => row.id === 'red').count, 0);
 });
+
+test('image-only public items survive projection and use opaque media descriptors', () => {
+  const media = { decorateItem: (_threadId, item) => ({text: '', images: [{id: 'opaque', contentKey: 'revision', name: '图片'}]}) };
+  const message = visibleItem({type:'userMessage',id:'photo',content:[{type:'localImage',path:'/private/photo.png'}]}, {media,threadId:id(1)});
+  assert.deepEqual(message?.images,[{id:'opaque',contentKey:'revision',name:'图片'}]);
+  assert.equal(message.text,'');
+  assert.equal(JSON.stringify(message).includes('/private'),false);
+});
+test('history event text is enriched by its response image instead of losing or duplicating the message', () => {
+  const rows = [
+    {type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:'看这张图'},{type:'input_image',image_url:'data:image/png;base64,aGVsbG8='}]}},
+    {type:'event_msg',payload:{type:'user_message',message:'看这张图'}},
+    {type:'event_msg',payload:{type:'agent_message',message:'收到'}},
+  ];
+  const media = {decorateItem: (_threadId,item) => ({text:item.text ?? (item.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n'),images:(item.content??[]).some(c=>c.type==='image')?[{id:'photo',contentKey:'revision',name:'图片'}]:[]})};
+  const messages=parseVisibleHistory(rows.map(JSON.stringify).join('\n'),80,{media,threadId:id(1)});
+  assert.deepEqual(messages.map(m=>m.text),['看这张图','收到']);
+  assert.equal(messages[0].images?.length,1);
+});
+test('native image generation projects as assistant media while private channels remain hidden', () => {
+  const media={decorateItem:()=>({text:'',images:[{id:'generated',contentKey:'revision',name:'生成图片'}]})};
+  assert.equal(visibleItem({type:'imageGeneration',id:'gen',savedPath:'/tmp/generated.png'},{media,threadId:id(1)})?.role,'assistant');
+  assert.equal(visibleItem({type:'agentMessage',phase:'analysis',text:'![private](/tmp/private.png)'},{media,threadId:id(1)}),null);
+});
+
+test('default projections retain an image-only row without leaking its private source', () => {
+  const source='data:image/png;base64,cHJpdmF0ZQ==';
+  const live=visibleItem({type:'userMessage',content:[{type:'image',url:source}]});
+  assert.ok(live);assert.equal(live.text,'');assert.deepEqual(live.images,[]);assert.equal(JSON.stringify(live).includes(source),false);
+  const history=parseVisibleHistory(JSON.stringify({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_image',image_url:source}]}}));
+  assert.equal(history.length,1);assert.equal(JSON.stringify(history).includes(source),false);
+});
+
+test('media outside the visible message limit is not registered or read for live and history views', async () => {
+  const calls=[];const media={decorateItem:(_thread,item)=>{calls.push(item.id);return {text:item.text??item.content?.[0]?.text??'',images:[]};}};
+  const state={turns:[{items:[{type:'agentMessage',id:'old',text:'old'},{type:'agentMessage',id:'new',text:'new'},{type:'agentMessage',phase:'analysis',id:'hidden',text:'hidden'}]}]};
+  const {visibleTurns}=await import('../mobile/history.mjs');
+  assert.deepEqual(visibleTurns(state,1,{media,threadId:id(1)}).map(m=>m.text),['new']);assert.deepEqual(calls,['new']);
+  calls.length=0;
+  const rows=[{type:'event_msg',payload:{type:'agent_message',message:'old'}},{type:'event_msg',payload:{type:'agent_message',message:'new'}}];
+  assert.deepEqual(parseVisibleHistory(rows.map(JSON.stringify).join('\n'),1,{media,threadId:id(1)}).map(m=>m.text),['new']);assert.equal(calls.length,1);
+});

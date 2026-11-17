@@ -17,10 +17,11 @@ const fingerprint = (text) => { let hash = 14695981039346656037n; for (let i = 0
 export function dedupeMessages(messages = []) {
   const result = [], positions = new Map();
   for (const message of messages) {
-    if (!message || typeof message.text !== 'string') continue;
-    const key = message.id == null ? null : JSON.stringify([message.role, message.id]);
-    if (key != null && positions.has(key)) result[positions.get(key)] = message;
-    else { if (key != null) positions.set(key, result.length); result.push(message); }
+    if (!message || typeof message.text !== 'string' && !Array.isArray(message.images)) continue;
+    const row = typeof message.text === 'string' ? message : { ...message, text: '' };
+    const key = row.id == null ? null : JSON.stringify([row.role, row.id]);
+    if (key != null && positions.has(key)) result[positions.get(key)] = row;
+    else { if (key != null) positions.set(key, result.length); result.push(row); }
   }
   return result;
 }
@@ -180,6 +181,16 @@ function inlineText(container, text) {
   }
 }
 
+function imageSource(host, threadId, image) {
+  const token = value => typeof value === 'string' && value.length === 64 && /^[a-f0-9]{64}$/i.test(value);
+  if (!['mac', 'windows'].includes(host) || typeof threadId !== 'string' || threadId.length !== 36 ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(threadId) ||
+      !token(image?.id) || !token(image?.contentKey)) return null;
+  // Only server-issued handles can become image requests. A message's src,
+  // path or URL is never a browser navigation or an authentication bypass.
+  return '/api/image?' + new URLSearchParams({ host, threadId, id: image.id, key: image.contentKey });
+}
+
 export function renderSafeText(container, text, { markdown = false } = {}) {
   container.replaceChildren();
   const doc = container.ownerDocument;
@@ -261,6 +272,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   let failureSince = null, retryStep = 0, recoveryNotice = false, lastWakeAt = -Infinity, wakeTimer = null;
   let cardsSignature = '', messageScope = '', hostSignature = '', threadSignature = '', noticeText = '';
   const drafts = new Map(), answers = new Map(), gate = new ActionGate({ storage: draftStorage }), messageNodes = new Map();
+  let previewRecord = null;
   const node = (tag, cls, text) => element(doc, tag, cls, text);
   const button = (text, cls, fn) => { const b = node('button', cls, text); b.type = 'button'; if (fn) b.addEventListener('click', fn); return b; };
   const app = node('div', 'mobile-app'); app.setAttribute('lang', 'zh-CN');
@@ -343,7 +355,20 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   }); createBack.hidden = true;
   createForm.append(field('项目', createProjectPicker), field('标题（可选）', createTitle), field('第一条消息', createPrompt), createSubmit);
   creationDialog.append(creationHeading, creationHostField, creationState, createForm, createRetry, createdOpen, createBack);
-  app.append(header, connection, notice, main, latest, composer, backdrop, drawer, creationBackdrop, creationDialog); root.replaceChildren(app);
+  const imagePreview = node('section', 'image-preview'); imagePreview.hidden = true;
+  imagePreview.setAttribute('role', 'dialog'); imagePreview.setAttribute('aria-modal', 'true'); imagePreview.setAttribute('aria-label', '查看图片');
+  const previewHeading = node('div', 'image-preview-heading'), previewTitle = node('h2', 'image-preview-title', '图片');
+  const previewClose = button('关闭', 'image-preview-close', () => closePreview()); previewHeading.append(previewTitle, previewClose);
+  const previewStatus = node('p', 'image-preview-status'); previewStatus.hidden = true; previewStatus.setAttribute('role', 'status');
+  const previewViewport = node('div', 'image-preview-viewport'), previewActions = node('div', 'image-preview-actions');
+  const previewZoom = button('放大', 'image-preview-zoom', () => {
+    const enlarged = previewViewport.classList.toggle('zoomed'); previewZoom.textContent = enlarged ? '适应屏幕' : '放大';
+    previewZoom.setAttribute('aria-pressed', String(enlarged));
+  }); previewZoom.setAttribute('aria-pressed', 'false');
+  const previewOriginal = node('a', 'image-preview-original', '在新标签页查看原图');
+  previewOriginal.setAttribute('target', '_blank'); previewOriginal.setAttribute('rel', 'noopener noreferrer');
+  previewActions.append(previewZoom, previewOriginal); imagePreview.append(previewHeading, previewStatus, previewViewport, previewActions);
+  app.append(header, connection, notice, main, latest, composer, backdrop, drawer, creationBackdrop, creationDialog, imagePreview); root.replaceChildren(app);
 
   function storageKey(scope) { return 'codex-mobile-draft:' + scope; }
   function draft(scope) {
@@ -611,9 +636,78 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     composerHint.textContent = !selectedId ? '先选择对话' : incompatible(state) ? '电脑网关更新后才能发送，草稿会保留' : loadAttempt?.pending ? '正在连接原聊天，草稿会保留' : needsLoad(state) ? '先在电脑上加载原聊天，草稿会保留' : isHistoryOnly(state) ? '只读历史，原会话未连接；草稿会保留' : !connected ? '连接恢复后才能发送，草稿会保留' : !state?.ownerConfirmed ? '等待原会话确认，草稿会保留' : !writeAllowed('send') ? (isRunning(state) ? '运行中，当前连接暂不支持补充方向' : '当前状态只读，不能发送') : isRunning(state) ? '运行中发送会补充当前方向' : '继续这个对话';
     draftHint.textContent = attempt?.status === 'unknown' ? '结果未确认，此内容已禁止重复发送' : attempt?.status === 'submitted' ? '已提交，保留草稿并等待确认' : '草稿只保存在本设备';
   }
+  function imageCurrent(record) {
+    return !destroyed && state && record.scope === currentScope() && record.scope === scopeOf(state) &&
+      messageNodes.get(record.messageKey)?.images.get(record.key) === record;
+  }
+  function closePreview({ restoreFocus = true } = {}) {
+    const previous = previewRecord; previewRecord = null; imagePreview.hidden = true; previewViewport.replaceChildren();
+    previewViewport.classList.toggle('zoomed', false); previewZoom.textContent = '放大'; previewZoom.setAttribute('aria-pressed', 'false');
+    previewStatus.hidden = true; previewOriginal.setAttribute('href', '#');
+    if (restoreFocus && previous && imageCurrent(previous)) previous.open.focus();
+  }
+  function openPreview(record) {
+    if (!imageCurrent(record)) return;
+    closePreview({ restoreFocus: false }); previewRecord = record; imagePreview.hidden = false;
+    previewTitle.textContent = record.name; previewOriginal.setAttribute('href', record.url);
+    const image = node('img', 'image-preview-image'); image.setAttribute('alt', record.name); image.setAttribute('decoding', 'async');
+    image.addEventListener('error', () => {
+      if (previewRecord !== record || !imageCurrent(record) || previewViewport.childNodes[0] !== image) return;
+      previewStatus.textContent = '图片加载失败。原图可能已移动、删除，或电脑正在等待文件访问授权。请关闭后重试图片。'; previewStatus.hidden = false;
+    });
+    previewViewport.append(image); image.setAttribute('src', record.url); previewClose.focus();
+  }
+  function loadImage(record, retry = false) {
+    const image = node('img', 'message-image-thumbnail'); record.image = image;
+    image.setAttribute('alt', record.name); image.setAttribute('loading', 'lazy'); image.setAttribute('decoding', 'async');
+    record.error.hidden = true; record.open.disabled = false;
+    image.addEventListener('load', () => {
+      if (!imageCurrent(record) || record.image !== image) return;
+      record.error.hidden = true; record.open.disabled = false;
+    });
+    image.addEventListener('error', () => {
+      if (!imageCurrent(record) || record.image !== image) return;
+      record.error.hidden = false; record.open.disabled = true;
+    });
+    record.open.replaceChildren(image);
+    // An explicit retry gets a fresh GET. Streaming text updates keep the same
+    // image element and URL, so they never download the image again.
+    image.setAttribute('src', record.url + (retry ? '&retry=' + ++record.retries : ''));
+  }
+  function renderImages(item, imageRefs, messageKey, scope, imageUnavailable = false) {
+    const refs = Array.isArray(imageRefs) ? imageRefs : [], keep = new Set(), children = [];
+    let unavailable = imageUnavailable === true;
+    for (const image of refs) {
+      const url = imageSource(state.host, state.id, image); if (!url) { unavailable = true; continue; }
+      const key = JSON.stringify([image.id, image.contentKey]); if (keep.has(key)) continue; keep.add(key);
+      const name = typeof image.name === 'string' ? image.name.replace(/[\0-\x1f\x7f]/g, '').slice(0, 512) || '图片' : '图片';
+      let record = item.images.get(key);
+      if (!record) {
+        const figure = node('figure', 'message-image'), open = button('', 'message-image-open', () => openPreview(record));
+        const caption = node('figcaption', 'message-image-name', name), error = node('div', 'message-image-error');
+        error.setAttribute('role', 'status'); error.hidden = true;
+        error.append(node('p', '', '图片加载失败。原图可能已移动、删除，或电脑正在等待文件访问授权。'),
+          button('重试图片', 'message-image-retry', () => { if (imageCurrent(record)) loadImage(record, true); }));
+        figure.append(open, caption, error);
+        record = { key, messageKey, scope, url, name, figure, open, caption, error, retries: 0, image: null };
+        item.images.set(key, record); loadImage(record);
+      } else {
+        record.name = name; record.caption.textContent = name; record.image.setAttribute('alt', name);
+        if (previewRecord === record) previewTitle.textContent = name;
+      }
+      record.open.setAttribute('aria-label', '放大查看：' + name); children.push(record.figure);
+    }
+    for (const [key, record] of item.images) if (!keep.has(key)) {
+      if (previewRecord === record) closePreview({ restoreFocus: false }); item.images.delete(key);
+    }
+    if (unavailable) {
+      item.unavailable ??= node('p', 'message-image-unavailable', '此图片暂不可用，请刷新会话后重试。'); children.push(item.unavailable);
+    }
+    reconcile(item.media, children); item.media.hidden = !children.length;
+  }
   function renderMessages() {
-    if (!state) { messages.replaceChildren(); requests.replaceChildren(); empty.hidden = false; return; }
-    const scope = scopeOf(state); if (scope !== messageScope) { messageNodes.clear(); messageScope = scope; }
+    if (!state) { closePreview({ restoreFocus: false }); messageNodes.clear(); messages.replaceChildren(); requests.replaceChildren(); empty.hidden = false; return; }
+    const scope = scopeOf(state); if (scope !== messageScope) { closePreview({ restoreFocus: false }); messageNodes.clear(); messageScope = scope; }
     const rows = dedupeMessages(state.messages), children = [];
     rows.forEach((message, index) => {
       const key = JSON.stringify([message.role, message.id ?? ['position', index]]);
@@ -621,12 +715,16 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
       if (!item) {
         const el = node('article', 'message ' + (message.role === 'user' ? 'message-user' : 'message-assistant'));
         const who = node('p', 'message-role', message.role === 'user' ? '你' : message.role === 'assistant' ? 'Codex' : '系统');
-        const body = node('div', 'message-body'); el.append(who, body); item = { el, body, text: null }; messageNodes.set(key, item);
+        const body = node('div', 'message-body'), text = node('div', 'message-text'), media = node('div', 'message-images');
+        body.append(text, media); el.append(who, body); item = { el, body, textBody: text, media, images: new Map(), text: null }; messageNodes.set(key, item);
       }
-      if (item.text !== message.text) { renderSafeText(item.body, message.text, { markdown: message.role === 'assistant' }); item.text = message.text; }
+      if (item.text !== message.text) { renderSafeText(item.textBody, message.text, { markdown: message.role === 'assistant' }); item.text = message.text; item.textBody.hidden = !message.text; }
+      renderImages(item, message.images, key, scope, message.imageUnavailable);
       children.push(item.el);
     });
-    for (const [key, item] of messageNodes) if (!children.includes(item.el)) messageNodes.delete(key);
+    for (const [key, item] of messageNodes) if (!children.includes(item.el)) {
+      if ([...item.images.values()].includes(previewRecord)) closePreview({ restoreFocus: false }); messageNodes.delete(key);
+    }
     reconcile(messages, children);
     empty.hidden = !!rows.length || !!state.questions?.length || !!state.approvals?.length;
     empty.textContent = connected ? '这个对话暂未返回消息。' : '暂未取得对话内容，连接恢复后可刷新。';
@@ -919,7 +1017,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   projectSelect.addEventListener('change', () => { selectedProject = projectSelect.value; changeCatalog(); });
   rangeSelect.addEventListener('change', () => { selectedRange = rangeSelect.value === 'all' ? 'all' : 'week'; changeCatalog(); });
   main.addEventListener('scroll', () => { latest.hidden = main.scrollHeight - main.scrollTop - main.clientHeight < 160; });
-  const escape = (event) => { if (event.key === 'Escape') { if (creationOpen && creationProjectsOpen) { creationProjectsOpen = false; renderCreation(); createProject.focus(); } else if (creationOpen) closeCreation(); else if (drawerOpen) setDrawer(false); } };
+  const escape = (event) => { if (event.key === 'Escape') { if (previewRecord) closePreview(); else if (creationOpen && creationProjectsOpen) { creationProjectsOpen = false; renderCreation(); createProject.focus(); } else if (creationOpen) closeCreation(); else if (drawerOpen) setDrawer(false); } };
   const wake = () => {
     if (destroyed || !selectedId || doc.visibilityState === 'hidden' || readAttempt) return;
     const delay = 500 - (now() - lastWakeAt);
@@ -958,7 +1056,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
   } else if (api.getHosts) void loadHosts();
   return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts, openCreation,
-    destroy() { destroyed = true; generation++; cancel(searchTimer); searchTimer = null; stopStatuses(); creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
+    destroy() { destroyed = true; closePreview({ restoreFocus: false }); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses(); creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
   };
 }
 

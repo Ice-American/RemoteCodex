@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events';
 import { createGateway } from '../mobile/gateway.mjs';
 import { Journal, writePrivate } from '../mobile/store.mjs';
 import { requestFingerprint } from '../mobile/requests.mjs';
-import { ThreadCatalog } from '../mobile/history.mjs';
+import { ThreadCatalog, visibleItem } from '../mobile/history.mjs';
 import { OwnerClient, ownerSnapshotReady } from '../mobile/owner.mjs';
 import { OWNER_METHODS, OWNER_SUPPORTED_VERSIONS } from '../mobile/protocols.mjs';
 import { runtimeStatus } from '../src/state.mjs';
@@ -67,6 +67,97 @@ async function pair(gateway, headers = {}) {
   assert.equal(result.status, 200); const full = result.headers['set-cookie']?.[0]; assert.ok(full);
   return { result, full, cookie: full.split(';')[0], value: full.split(';')[0].slice('cmc_session='.length) };
 }
+
+test('phone image GET uses pairing and exact thread-scoped opaque references without desktop discovery', async t => {
+  const f = await rig(t), imageId = 'a'.repeat(64), contentKey = 'b'.repeat(64);
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJ4sAAAAASUVORK5CYII=', 'base64');
+  const reads = [];
+  const media = { read(id, image, key) {
+    reads.push({ id, image, key });
+    if (id !== threadId || image !== imageId || key !== contentKey) throw Error('/private/not-for-response.png');
+    return { bytes, type: 'image/png', name: '截图.png' };
+  } };
+  const gateway = await f.start({ media });
+  const route = '/api/image?threadId=' + threadId + '&id=' + imageId + '&key=' + contentKey;
+  assert.equal((await request(gateway, { route })).status, 401);
+  assert.equal(reads.length, 0);
+  const paired = await pair(gateway);
+  const image = await request(gateway, { route, headers: { Cookie: paired.cookie } });
+  assert.equal(image.status, 200);
+  assert.deepEqual(image.bytes, bytes);
+  assert.equal(image.headers['content-type'], 'image/png');
+  assert.equal(image.headers['x-content-type-options'], 'nosniff');
+  assert.match(image.headers['cache-control'], /private/);
+  assert.match(image.headers['content-security-policy'], /default-src 'none'/);
+  const other = await request(gateway, { route: route.replace(threadId, '22222222-2222-4222-8222-222222222222'), headers: auth });
+  assert.equal(other.status, 404); assert.ok(!other.text.includes('/private/'));
+  assert.equal((await request(gateway, { route: route.replace(contentKey, 'c'.repeat(64)), headers: auth })).status, 404);
+  assert.equal(f.calls.discover, 0);
+});
+
+test('phone image route rejects paths, arbitrary URLs, ambiguous keys and non-GET requests', async t => {
+  const f = await rig(t), reads = [];
+  const gateway = await f.start({ media: { read(...args) { reads.push(args); throw Error('Must not read'); } } });
+  const route = '/api/image?threadId=' + threadId + '&id=' + 'a'.repeat(64) + '&key=' + 'b'.repeat(64);
+  for (const invalid of [route + '&path=/etc/passwd', route + '&url=https://example.com/a.png', route + '&id=' + 'a'.repeat(64),
+    route.replace('id=' + 'a'.repeat(64), 'id=../../a.png'), route.replace('key=' + 'b'.repeat(64), 'key=')]) {
+    assert.equal((await request(gateway, { route: invalid, headers: auth })).status, 400);
+  }
+  assert.equal((await request(gateway, { route, method: 'POST', headers: auth, body: {} })).status, 405);
+  assert.deepEqual(reads, []);
+});
+
+test('phone history projects an inline original to an authenticated image reference instead of a large JSON payload', async t => {
+  const f = await rig(t);
+  const source = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJ4sAAAAASUVORK5CYII=';
+  const catalog = { get: async () => ({ id: threadId, title: '图片-only历史' }),
+    read: async (id, _limit, { media }) => ({ messages: [visibleItem({ type: 'userMessage', id: 'photo-only',
+      content: [{ type: 'image', url: source }] }, { media, threadId: id })] }) };
+  const gateway = await f.start({ catalog });
+  const thread = await request(gateway, { route: '/api/thread?id=' + threadId, headers: auth });
+  assert.equal(thread.status, 200); assert.equal(thread.data.messages.length, 1);
+  const image = thread.data.messages[0].images[0];
+  assert.match(image.id, /^[a-f0-9]{64}$/); assert.match(image.contentKey, /^[a-f0-9]{64}$/);
+  assert.ok(!thread.text.includes('base64')); assert.ok(thread.bytes.length < 2048);
+  const route = '/api/image?threadId=' + threadId + '&id=' + image.id + '&key=' + image.contentKey;
+  const original = await request(gateway, { route, headers: auth });
+  assert.equal(original.status, 200); assert.equal(original.headers['content-type'], 'image/png');
+  assert.deepEqual(original.bytes, Buffer.from(source.split(',')[1], 'base64'));
+  assert.equal((await request(gateway, { route: route + '&retry=1', headers: auth })).status, 200);
+});
+
+test('phone image peer forwarding preserves image headers and uses only the paired peer credential', async t => {
+  const calls = [], bytes = Buffer.from('fixture original image bytes');
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls.push({ url: String(url), options });
+    return new Response(bytes, { headers: { 'content-type': 'image/png', 'content-length': String(bytes.length),
+      'cache-control': 'private, max-age=300', 'content-disposition': 'inline; filename="image.png"',
+      'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'", etag: '"fixture"' } });
+  });
+  const f = await rig(t, { peers: [{ id: 'windows', url: 'https://windows-fixture.tailfixture.ts.net' }] });
+  const gateway = await f.start(), paired = await pair(gateway);
+  const route = '/api/image?host=windows&threadId=' + threadId + '&id=' + 'a'.repeat(64) + '&key=' + 'b'.repeat(64);
+  const image = await request(gateway, { route, headers: { Cookie: paired.cookie } });
+  assert.equal(image.status, 200); assert.deepEqual(image.bytes, bytes);
+  assert.equal(image.headers['content-type'], 'image/png'); assert.equal(image.headers['content-length'], String(bytes.length));
+  assert.equal(image.headers['cache-control'], 'private, max-age=300'); assert.equal(image.headers['x-content-type-options'], 'nosniff');
+  assert.equal(calls.length, 1); assert.equal(calls[0].options.method, 'GET');
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer ' + peerKey); assert.equal(calls[0].options.headers.Cookie, undefined);
+  assert.equal(f.calls.discover, 0);
+});
+
+test('waiting for image permission leaves health responsive and bounded image failures do not disclose paths', async t => {
+  const f = await rig(t), pending = deferred(), entered = deferred();
+  const bytes = Buffer.from('isolated image bytes'), route = '/api/image?threadId=' + threadId + '&id=' + 'a'.repeat(64) + '&key=' + 'b'.repeat(64);
+  const gateway = await f.start({ media: { async read() { entered.resolve(); return pending.promise; } } });
+  const image = request(gateway, { route, headers: auth }); await entered.promise;
+  assert.equal((await within(request(gateway, { route: '/health' }), 'Image read blocked health')).status, 200);
+  pending.resolve({ bytes, type: 'image/png' });
+  assert.equal((await image).status, 200);
+  const timeout = await f.start({ media: { async read() { throw Object.assign(Error('/private/permissions.png'), { code: 'MEDIA_TIMEOUT' }); } } });
+  const failed = await request(timeout, { route, headers: auth });
+  assert.equal(failed.status, 504); assert.match(failed.data.error, /访问授权/); assert.ok(!failed.text.includes('/private/'));
+});
 function openPeerStream(gateway) {
   const ready = deferred(), closed = deferred(); let response;
   const req = http.get({ host: '127.0.0.1', port: gateway.port,

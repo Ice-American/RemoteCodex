@@ -47,7 +47,7 @@ function fixtureDOM() {
   const eventTarget = (target) => {
     const listeners = new Map();
     return Object.assign(target, { addEventListener(type, callback) { if (!listeners.has(type)) listeners.set(type, new Set()); listeners.get(type).add(callback); },
-      removeEventListener(type, callback) { listeners.get(type)?.delete(callback); }, fire(type) { for (const callback of [...listeners.get(type) ?? []]) callback({ type }); } });
+      removeEventListener(type, callback) { listeners.get(type)?.delete(callback); }, fire(type, values = {}) { for (const callback of [...listeners.get(type) ?? []]) callback({ type, ...values }); } });
   };
   const doc = eventTarget({ visibilityState: 'visible', createElement: (tag) => new FixtureNode(tag, doc), createTextNode: (text) => { const n = new FixtureNode('#text', doc); n._text = text; return n; } });
   doc.defaultView = eventTarget({ innerHeight: 844, visualViewport: { height: 844, offsetTop: 0, addEventListener() {}, removeEventListener() {} }, sessionStorage: storage });
@@ -82,6 +82,94 @@ function chooseCreationProject(root, projectId) {
   const option = byClass(root, 'create-project-option').find(item => item.value === projectId);
   assert.ok(option, 'official project option: ' + projectId); option.click();
 }
+
+const phoneImage = (values = {}) => ({ id: 'a'.repeat(64), contentKey: 'b'.repeat(64), name: '页面截图.png', ...values });
+
+test('image-only messages use lazy same-origin opaque image references without accepting supplied URLs', t => {
+  const { root, view } = mount(t);
+  view.update(thread({ messages: [{ id: 'image-only', role: 'user', images: [phoneImage({ name: '<img onerror=steal()>.png', url: 'https://evil.invalid/image' })] }] }));
+  const image = one(root, 'message-image-thumbnail');
+  const url = new URL(image.getAttribute('src'), 'https://paired.example');
+  assert.equal(url.origin, 'https://paired.example'); assert.equal(url.pathname, '/api/image');
+  assert.deepEqual([...url.searchParams], [['host', 'mac'], ['threadId', thread().id], ['id', 'a'.repeat(64)], ['key', 'b'.repeat(64)]]);
+  assert.equal(image.getAttribute('loading'), 'lazy'); assert.equal(image.getAttribute('decoding'), 'async');
+  assert.equal(one(root, 'message-image-name').textContent, '<img onerror=steal()>.png');
+  assert.equal(byClass(root, 'message-user').length, 1); assert.equal(one(root, 'empty-state').hidden, true);
+});
+
+test('streaming text preserves image nodes while same-text media patches update their references', t => {
+  const { root, view } = mount(t), first = phoneImage();
+  const messages = images => [{ id: 'a1', role: 'assistant', text: '结果', images }];
+  view.update(thread({ messages: messages([first]) }));
+  const original = one(root, 'message-image-thumbnail'), src = original.getAttribute('src');
+  view.update(thread({ revision: 2, messages: [{ ...messages([first])[0], text: '结果继续更新' }] }));
+  assert.equal(one(root, 'message-image-thumbnail'), original); assert.equal(original.getAttribute('src'), src);
+  view.update(thread({ revision: 3, messages: [{ ...messages([first, phoneImage({ id: 'c'.repeat(64) })])[0], text: '结果继续更新' }] }));
+  assert.equal(byClass(root, 'message-image-thumbnail').length, 2); assert.equal(byClass(root, 'message-image-thumbnail')[0], original);
+  view.update(thread({ revision: 4, messages: messages([phoneImage({ contentKey: 'd'.repeat(64) })]) }));
+  assert.notEqual(one(root, 'message-image-thumbnail'), original); assert.ok(one(root, 'message-image-thumbnail').getAttribute('src').includes('key=' + 'd'.repeat(64)));
+});
+
+test('invalid image references remain an explicit placeholder and cannot load paths or external URLs', t => {
+  const { root, view } = mount(t);
+  view.update(thread({ messages: [{ id: 'bad-images', role: 'assistant', text: '', images: [
+    phoneImage({ id: '../../secret.png' }), phoneImage({ contentKey: 'javascript:steal()' }),
+    { src: 'https://evil.invalid/image', name: '外链' }, phoneImage({ id: 'a'.repeat(64) + '\n' }),
+  ] }] }));
+  assert.equal(byClass(root, 'message-image-thumbnail').length, 0);
+  assert.match(one(root, 'message-image-unavailable').textContent, /图片.*不可用/);
+  assert.equal(descendants(root).filter(n => n.tagName === 'A').length, 1); // Only the empty, hidden preview original link exists.
+});
+
+test('a known image without a readable reference stays visible as an unavailable-image message', t => {
+  const { root, view } = mount(t);
+  view.update(thread({ messages: [{ id: 'unsupported-image', role: 'user', text: '', images: [], imageUnavailable: true }] }));
+  assert.equal(byClass(root, 'message-user').length, 1); assert.equal(byClass(root, 'message-image-thumbnail').length, 0);
+  assert.match(one(root, 'message-image-unavailable').textContent, /图片.*不可用/); assert.equal(one(root, 'empty-state').hidden, true);
+});
+
+test('image retry replaces only its GET image, keeps the draft and ignores prior attempt callbacks', t => {
+  let actions = 0;
+  const { root, view } = mount(t, { action: async () => { actions++; } });
+  view.update(thread({ messages: [{ id: 'a1', role: 'assistant', text: '', images: [phoneImage()] }] }));
+  type(root, '保留我的草稿');
+  const old = one(root, 'message-image-thumbnail'); old.fire('error');
+  assert.equal(one(root, 'message-image-error').hidden, false);
+  assert.match(one(root, 'message-image-error').textContent, /原图.*不可用|图片.*加载失败/);
+  assert.match(one(root, 'message-image-error').textContent, /电脑正在等待文件访问授权/);
+  one(root, 'message-image-retry').click();
+  const retried = one(root, 'message-image-thumbnail'); assert.notEqual(retried, old);
+  assert.ok(retried.getAttribute('src').includes('&retry=1')); assert.equal(one(root, 'message-image-error').hidden, true);
+  old.fire('error'); assert.equal(one(root, 'message-image-error').hidden, true);
+  retried.fire('error'); assert.equal(one(root, 'message-image-error').hidden, false);
+  assert.equal(one(root, 'message-input').value, '保留我的草稿'); assert.equal(actions, 0);
+});
+
+test('image preview opens safely, can zoom and close, and preserves conversation state', t => {
+  const { root, view, doc } = mount(t);
+  view.update(thread({ messages: [{ id: 'a1', role: 'assistant', text: '图', images: [phoneImage()] }] }));
+  type(root, '不发送的草稿'); const opener = one(root, 'message-image-open'); opener.click();
+  const preview = one(root, 'image-preview'); assert.equal(preview.hidden, false); assert.equal(preview.getAttribute('role'), 'dialog');
+  one(root, 'image-preview-image').fire('error'); assert.match(one(root, 'image-preview-status').textContent, /电脑正在等待文件访问授权/);
+  const full = one(root, 'image-preview-original'); assert.ok(full.getAttribute('href').startsWith('/api/image?host=mac&'));
+  assert.equal(full.getAttribute('target'), '_blank'); assert.equal(full.getAttribute('rel'), 'noopener noreferrer');
+  one(root, 'image-preview-zoom').click(); assert.equal(one(root, 'image-preview-viewport').classList.contains('zoomed'), true);
+  one(root, 'image-preview-close').click(); assert.equal(preview.hidden, true); assert.equal(doc.activeElement, opener);
+  assert.equal(one(root, 'message-input').value, '不发送的草稿');
+  opener.click(); doc.fire('keydown', { key: 'Escape' }); assert.equal(preview.hidden, true);
+});
+
+test('navigation closes image preview and retired image events cannot change the next chat', async t => {
+  const { root, view } = mount(t, { getThreads: async () => ({ threads: [] }) });
+  view.update(thread({ messages: [{ id: 'a1', role: 'assistant', text: '', images: [phoneImage()] }] }));
+  const old = one(root, 'message-image-thumbnail'); one(root, 'message-image-open').click();
+  await view.selectHost('windows');
+  view.update(thread({ host: 'windows', messages: [{ id: 'a1', role: 'assistant', text: '', images: [phoneImage()] }] }));
+  assert.equal(one(root, 'image-preview').hidden, true);
+  const current = one(root, 'message-image-thumbnail'); assert.ok(current.getAttribute('src').includes('host=windows'));
+  old.fire('error'); assert.equal(one(root, 'message-image-error').hidden, true);
+  assert.notEqual(current, old);
+});
 
 test('all user text and the minimal Markdown subset stay inert DOM text', () => {
   const { root } = fixtureDOM();

@@ -16,6 +16,7 @@ import { questionViews, approvalViews, buildQuestionReply, buildApprovalReply, r
 import { Secrets, Journal, secretEqual, dataDirectory, writePrivate } from './store.mjs';
 import { NativeTools } from './native-tools.mjs';
 import { CreationManager } from './creation.mjs';
+import { MobileMedia } from './media.mjs';
 
 const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
 const mime = { '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -47,7 +48,7 @@ async function body(req) {
 export async function createGateway({ port = 43128, hostId = process.platform === 'win32' ? 'windows' : 'mac',
   hostName = hostId === 'mac' ? 'Mac' : 'Windows', peers = [], dir = dataDirectory(),
   discover = discoverNativeDesktop, secrets = new Secrets(dir), journal = new Journal(dir),
-  catalog = new ThreadCatalog(codexHome()), nativeTools = new NativeTools({ discover }),
+  catalog = new ThreadCatalog(codexHome()), nativeTools = new NativeTools({ discover }), media = new MobileMedia(),
   loadTimeoutMs = 45000,
 } = {}) {
   const key = await secrets.get('self', { create: true });
@@ -126,7 +127,7 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
     const ready = ownerSnapshotReady(live) && client?.connected === true && live.generation === client.generation &&
       client.owners.get(id)?.owner === live.owner;
     const metadata = knownMetadata === undefined ? ready && live?.state?.title ? null : await catalog.get(id) : knownMetadata;
-    const messages = live ? visibleTurns(live.state) : (await catalog.read(id)).messages;
+    const messages = live ? visibleTurns(live.state, 100, { media, threadId: id }) : (await catalog.read(id, 80, { media })).messages;
     const status = live?.status?.type ?? 'unknown';
     const incompatible = error === 'UNSUPPORTED_METHOD';
     const canLoad = !ready && !incompatible && client?.connected === true && !client.pipe?.socket?.destroyed && metadata?.id === id &&
@@ -273,7 +274,7 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
     const controller = new AbortController();
     // A cold-load POST needs room for the remote 45s deadline and transport.
     // Message/approval writes retain their existing timeout and are never retried.
-    const timer = setTimeout(() => controller.abort(), url.pathname === '/api/events' ? 86400000 :
+    const timer = setTimeout(() => controller.abort(), url.pathname === '/api/events' ? 86400000 : url.pathname === '/api/image' ? 60000 :
       url.pathname === '/api/action' && input?.action === 'load' ? 55000 : 20000);
     // The phone can disappear while a streamed upstream body is still active.
     // pipeline handles both sides' errors so a network change cannot crash us.
@@ -288,8 +289,17 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       // Address-pinned HTTPS returns raw bytes, so preserve their encoding for
       // the phone. The native-fetch fallback has already decoded its body.
       const encoding = peer.address && upstream.headers.get('content-encoding');
+      const imageHeaders = {};
+      if (url.pathname === '/api/image') {
+        // Keep paired image bytes on the same pinned peer path as chat data.
+        // No Range support is advertised: each bounded image is read in full.
+        for (const header of ['content-length', 'content-disposition', 'etag', 'x-content-type-options', 'content-security-policy']) {
+          const value = upstream.headers.get(header); if (value) imageHeaders[header] = value;
+        }
+      }
       res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') ?? 'application/json',
-        'Cache-Control': 'no-store', Vary: 'Accept-Encoding', ...(encoding ? { 'Content-Encoding': encoding } : {}) });
+        'Cache-Control': url.pathname === '/api/image' ? upstream.headers.get('cache-control') ?? 'no-store' : 'no-store',
+        Vary: 'Accept-Encoding', ...(encoding ? { 'Content-Encoding': encoding } : {}), ...imageHeaders });
       if (upstream.body) await pipeline(Readable.fromWeb(upstream.body), res); else res.end();
     } catch {
       if (!res.headersSent && !res.destroyed) sendJson(res, 502, { error: '目标电脑暂时无法连接，请稍后重试' });
@@ -354,6 +364,36 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       }
       if (url.pathname === '/api/creation' && req.method === 'GET') return sendJson(res, 200, await creation.capability());
       if (url.pathname === '/api/create' && req.method === 'POST') return sendJson(res, 200, await creation.create(input));
+      if (url.pathname === '/api/image') {
+        if (req.method !== 'GET') return sendJson(res, 405, { error: '图片仅支持只读请求' });
+        const params = url.searchParams, allowed = new Set(['host', 'threadId', 'id', 'key', 'retry']);
+        if ([...params.keys()].some(key => !allowed.has(key) || params.getAll(key).length !== 1))
+          return sendJson(res, 400, { error: '图片请求参数无效' });
+        const id = params.get('threadId'), imageId = params.get('id'), key = params.get('key');
+        if (!validThreadId(id) || !/^[a-f0-9]{64}$/.test(imageId ?? '') || !/^[a-f0-9]{64}$/.test(key ?? '') ||
+            params.has('retry') && !/^\d{1,9}$/.test(params.get('retry')))
+          return sendJson(res, 400, { error: '图片标识无效，请刷新会话' });
+        try {
+          // Only references registered while projecting this exact chat are
+          // readable. The browser cannot select a path or fetch an external URL.
+          const image = await media.read(id, imageId, key);
+          const extension = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }[image.type];
+          if (!extension || !Buffer.isBuffer(image.bytes)) throw Error('Invalid registered image');
+          res.writeHead(200, { 'Content-Type': image.type, 'Content-Length': image.bytes.length,
+            'Cache-Control': 'private, max-age=300', ETag: '"' + key + '"',
+            'X-Content-Type-Options': 'nosniff', 'Content-Disposition': 'inline; filename="image.' + extension + '"',
+            'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; sandbox" });
+          return res.end(image.bytes);
+        } catch (error) {
+          // Filesystem errors can contain private paths. Keep them off the
+          // phone while still making a missing original visible and retryable.
+          if (['MEDIA_TIMEOUT', 'MEDIA_BUSY'].includes(error?.code)) return sendJson(res, 504, {
+            error: '原图读取超时或正在等待，请在电脑上确认文件访问授权后重试。' });
+          if (error?.code === 'MEDIA_PERMISSION') return sendJson(res, 403, {
+            error: '电脑尚未允许读取原图，请在电脑上确认文件访问授权后重试。' });
+          return sendJson(res, 404, { error: '原图暂时不可用，文件可能已移动或删除，请刷新后重试。' });
+        }
+      }
       if (url.pathname === '/api/thread' && req.method === 'GET') return sendJson(res, 200, await state(url.searchParams.get('id'), { refresh: true }));
       if (url.pathname === '/api/action' && req.method === 'POST') {
         const controller = new AbortController();
@@ -408,6 +448,6 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   return { server, port: server.address().port, hostId, state, action, secrets,
     async close() { closed = true; clearInterval(recovery);
       for (const record of loads.values()) record.controller.abort(loadError('加载已取消。', 'LOAD_CANCELLED'));
-      client?.close(); nativeTools.close?.(); for (const listener of clients) listener.schedule = () => {};
+      client?.close(); nativeTools.close?.(); media.close?.(); for (const listener of clients) listener.schedule = () => {};
       server.closeAllConnections(); await new Promise(r => server.close(r)); } };
 }

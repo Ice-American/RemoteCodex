@@ -3,49 +3,116 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { itemVisibleText, itemImageSource, itemHasImages } from './media.mjs';
 
 export const validThreadId = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9-]{27}$/i.test(value);
 const stamp = value => typeof value === 'number' ? value : Date.parse(value ?? '') || 0;
 const digest = value => createHash('sha256').update(value).digest('hex').slice(0, 20);
 
-export function visibleItem(item) {
-  if (!item || !['userMessage', 'steeringUserMessage', 'agentMessage'].includes(item.type)) return null;
+export function visibleItem(item, {media, threadId} = {}) {
+  if (!item || !['userMessage', 'steeringUserMessage', 'agentMessage', 'imageGeneration'].includes(item.type)) return null;
   if (item.type === 'steeringUserMessage' && item.status !== 'accepted') return null;
-  if (item.type === 'agentMessage' && (item.delivery === 'async' || item.phase === 'analysis' || item.channel === 'analysis')) return null;
-  const role = item.type === 'agentMessage' ? 'assistant' : 'user';
-  const text = typeof item.text === 'string' ? item.text : (item.content ?? item.input ?? [])
-    .filter(v => ['text', 'inputText', 'input_text', 'output_text'].includes(v.type)).map(v => v.text ?? '').join('\n');
-  if (!text.trim()) return null;
-  // Only the public user/assistant projection crosses to the phone. Reasoning,
-  // developer messages and raw tool payloads stay in the official application.
-  return { id: item.id ?? digest(role + text), role, text, phase: item.phase ?? null };
+  if ((item.type === 'agentMessage' || item.type === 'imageGeneration') && (item.delivery === 'async' || item.phase === 'analysis' || item.channel === 'analysis')) return null;
+  const role = ['agentMessage', 'imageGeneration'].includes(item.type) ? 'assistant' : 'user';
+  const original = itemVisibleText(item), hasImages = itemHasImages(item);
+  const display = media ? media.decorateItem(threadId,item) : {text:original,images:[]};
+  const text = display.text, images = display.images ?? [];
+  if (!text.trim() && !hasImages && !images.length) return null;
+  // Media is registered on the target computer before projection. Neither
+  // local paths nor inline image bytes become part of a phone snapshot.
+  return { id: item.id ?? digest(role + original + (hasImages ? JSON.stringify(item.content ?? item.input ?? [item.savedPath ?? item.result]) : '')),
+    role, text, phase: item.phase ?? null, ...(hasImages || images.length ? {images} : {}),
+    ...(hasImages && !images.length ? {imageUnavailable:true} : {}) };
 }
 
-export function visibleTurns(state, limit = 100) {
+export function visibleTurns(state, limit = 100, options = {}) {
   const history = state?.turnHistory?.history;
   const turns = history?.entitiesByKey ? Object.values(history.entitiesByKey) : state?.turns ?? [];
-  return turns.filter(Boolean).sort((a, b) => (a.turnStartedAtMs ?? 0) - (b.turnStartedAtMs ?? 0))
-    .flatMap(turn => (turn.items ?? []).map(visibleItem).filter(Boolean)).slice(-limit);
+  const items = turns.filter(Boolean).sort((a, b) => (a.turnStartedAtMs ?? 0) - (b.turnStartedAtMs ?? 0))
+    .flatMap(turn => turn.items ?? []);
+  return latestVisibleItems(items,limit,options);
+}
+function latestVisibleItems(items, limit, options) {
+  const requested = Math.trunc(Number(limit)), maximum = requested > 0 ? requested : Infinity;
+  const rows = [];
+  // Project backwards until the visible page is full. This preserves filtering
+  // and slice semantics without hashing/statting images outside the phone page.
+  for (let index = items.length - 1; index >= 0 && rows.length < maximum; index--) {
+    const row = visibleItem(items[index],options); if (row) rows.push(row);
+  }
+  return rows.reverse().slice(-limit);
 }
 
-export function parseVisibleHistory(text, limit = 80) {
+function historyContent(content = []) {
+  return (Array.isArray(content) ? content : []).flatMap(value => {
+    if (['text','inputText','input_text','output_text'].includes(value?.type)) return [{type:'text',text:value.text ?? ''}];
+    const source = itemImageSource(value);
+    if (!source) return [];
+    return source.startsWith('data:') || /^https?:/i.test(source) ? [{type:'image',url:source}] : [{type:'localImage',path:source}];
+  });
+}
+function eventImages(payload) {
+  return [...(Array.isArray(payload.images) ? payload.images : []), ...(Array.isArray(payload.local_images) ? payload.local_images : [])]
+    .flatMap(value => typeof value === 'string' ? [{type:value.startsWith('data:') || /^https?:/i.test(value) ? 'image' : 'localImage',
+      ...(value.startsWith('data:') || /^https?:/i.test(value) ? {url:value} : {path:value})}] : historyContent([value]));
+}
+export function parseVisibleHistory(text, limit = 80, options = {}) {
   const events = [], fallback = [];
+  let order = 0;
   for (const line of text.split('\n')) {
+    order++;
     let row;
     try { row = JSON.parse(line); } catch { continue; }
     const p = row.payload;
     if (row.type === 'event_msg' && ['user_message', 'agent_message'].includes(p?.type)) {
       if (p.phase === 'analysis' || p.channel === 'analysis' || typeof p.message !== 'string') continue;
-      events.push({ id: digest(line), role: p.type === 'user_message' ? 'user' : 'assistant', text: p.message });
+      const item = {type:p.type === 'user_message' ? 'userMessage' : 'agentMessage',id:digest(line),
+        text:p.message,phase:p.phase,content:[{type:'text',text:p.message},...eventImages(p)]};
+      events.push({order,item});
     } else if (row.type === 'response_item' && p?.type === 'message' && ['user', 'assistant'].includes(p.role)) {
       if (p.role === 'assistant' && !['final', 'commentary', 'final_answer'].includes(p.channel ?? p.phase)) continue;
-      const content = (p.content ?? []).filter(c => ['input_text', 'output_text', 'text'].includes(c.type)).map(c => c.text ?? '').join('\n');
-      if (content) fallback.push({ id: p.id ?? digest(line), role: p.role, text: content });
+      const content = historyContent(p.content ?? []);
+      const item = {type:p.role === 'user' ? 'userMessage' : 'agentMessage',id:p.id ?? digest(line),content,phase:p.phase};
+      if (itemVisibleText(item) || itemHasImages(item)) fallback.push({order,item});
     }
   }
-  // Native event messages and response items can describe the same message.
-  // Pick one representation instead of doubling conversation text on the phone.
-  return (events.length ? events : fallback).slice(-limit);
+  // Event rows remain authoritative for displayed text. Their response row
+  // can contain the only copy of an image, so pair by role, exact text and
+  // chronological occurrence order rather than dropping all response media.
+  const used = new Set(), paired = new Map();
+  const signature = item => JSON.stringify([item.type,itemVisibleText(item)]);
+  const groups = new Map();
+  for (const [kind,rows] of [['events',events],['responses',fallback]]) for (const row of rows) {
+    const key = signature(row.item);
+    if (!groups.has(key)) groups.set(key,{events:[],responses:[]});
+    groups.get(key)[kind].push(row);
+  }
+  const signatures = new Set();
+  for (const [key,group] of groups) {
+    if (group.events.length) signatures.add(key);
+    // Repeated identical prompts must pair in chronological order. A nearest
+    // match can steal the next message's photo across intervening tool rows.
+    // Unequal counts are ambiguous: preserve orphan media separately below.
+    if (group.events.length !== group.responses.length) continue;
+    group.events.forEach((event,index)=>paired.set(event,group.responses[index]));
+  }
+  const rows = events.length ? events.map(event => {
+    const match = paired.get(event);
+    if (!match) return event;
+    used.add(match);
+    const sources = new Map();
+    for (const value of [...(event.item.content ?? []),...(match.item.content ?? [])]) {
+      const source = itemImageSource(value); if (source) sources.set(source,value);
+    }
+    return sources.size ? {...event,item:{...event.item,content:[{type:'text',text:itemVisibleText(event.item)},...sources.values()]}} : event;
+  }) : fallback;
+  if (events.length) for (const row of fallback) if (!used.has(row) && itemHasImages(row.item)) {
+    // Keep the original response media when legacy event rows are incomplete,
+    // without printing its body twice beside an identical event message.
+    const item = signatures.has(signature(row.item)) ? {...row.item,text:'',content:(row.item.content ?? []).filter(value=>!!itemImageSource(value))} : row.item;
+    rows.push({...row,item});
+  }
+  return latestVisibleItems(rows.sort((a,b)=>a.order-b.order).map(row=>row.item),limit,options);
 }
 
 const DAY = 86400000;
@@ -231,7 +298,7 @@ export class ThreadCatalog {
     await walk(path.join(this.home, 'sessions'));
     this.paths = found; this.pathsAt = Date.now();
   }
-  async read(id, limit = 80) {
+  async read(id, limit = 80, {media} = {}) {
     if (!validThreadId(id)) throw Error('无效聊天标识');
     await this.refreshPaths();
     const file = this.paths.get(id);
@@ -244,7 +311,7 @@ export class ThreadCatalog {
       const count = Math.min(size, 2 * 1024 * 1024), b = Buffer.alloc(count);
       await fd.read(b, 0, count, size - count);
       const text = b.toString('utf8');
-      return { messages: parseVisibleHistory(count < size ? text.slice(text.indexOf('\n') + 1) : text, limit),
+      return { messages: parseVisibleHistory(count < size ? text.slice(text.indexOf('\n') + 1) : text, limit, {media,threadId:id}),
         source: 'local-history', limited: count < size };
     } finally { await fd.close(); }
   }
