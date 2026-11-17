@@ -298,6 +298,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   let failureSince = null, retryStep = 0, recoveryNotice = false, lastWakeAt = -Infinity, wakeTimer = null;
   let cardsSignature = '', messageScope = '', hostSignature = '', threadSignature = '', noticeText = '';
   const drafts = new Map(), answers = new Map(), gate = new ActionGate({ storage: draftStorage }), messageNodes = new Map();
+  const requestPresentation=new Map();
   let previewRecord = null;
   let galleryOpen = false, galleryGeneration = 0, galleryRead = null;
   let history = {messages:[],loaded:false,hasMore:true,nextCursor:null,complete:true,issues:[],error:'',reset:false}, historyRead=null;
@@ -937,6 +938,40 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function requestKey(type, request) { return JSON.stringify([currentScope(), type, request.id, fingerprint(stringify(request))]); }
   function currentRequest(type, request) { const list = type === 'answer' ? state?.questions : state?.approvals; return list?.some((item) => item.id === request.id && stringify(item) === stringify(request)); }
   function requestStatus(card, key) { const attempt = gate.get(key); if (attempt) { const p = node('p', 'request-status', attempt.message); p.setAttribute('role', 'status'); card.append(p); } }
+  function setRequestPresentation(key,status,expanded) {
+    // This is only local display state. In particular, hiding an uncertain
+    // request must never erase its durable ActionGate receipt or allow a retry.
+    requestPresentation.delete(key);requestPresentation.set(key,{status,expanded});
+    while(requestPresentation.size>200)requestPresentation.delete(requestPresentation.keys().next().value);
+    cardsSignature='';renderRequests();
+  }
+  function renderRequest(type,request) {
+    const key=requestKey(type,request),attempt=gate.get(key),status=attempt?.status??null;
+    const compactByDefault=['submitted','confirmed','unknown'].includes(status);
+    const saved=requestPresentation.get(key),expanded=saved?.status===status?saved.expanded:!compactByDefault;
+    const label=type==='answer'?'回答':'审批';
+    const collapse=()=>{if(currentRequest(type,request))setRequestPresentation(key,status,false);};
+    if(expanded) {
+      const card=type==='answer'?renderQuestion(request):renderApproval(request);
+      card.append(button('收起'+(type==='answer'?'问题':'审批'),'request-collapse',collapse));
+      return card;
+    }
+    const card=node('section','request-card request-receipt');card.dataset.requestId=String(request.id);
+    card.dataset.requestType=type;card.dataset.status=status??'unanswered';
+    const text=status==='confirmed'?label+'已提交 · 回执已确认':status==='submitted'?label+'已提交 · 等待电脑同步':
+      status==='unknown'?label+'结果未确认 · 不会自动重发':status==='pending'?'正在提交'+label+' · 请勿重复操作':
+      (type==='answer'?'问题已收起 · 仍待回答':'审批已收起 · 仍待处理');
+    const summary=node('p','request-receipt-status',text);summary.setAttribute('role','status');summary.setAttribute('aria-live','polite');
+    const description=type==='answer'?(request.title||request.questions?.[0]?.question||'原问题'):(request.reason||'原审批');
+    const title=node('p','request-receipt-title',description);
+    const controls=node('div','request-receipt-actions');
+    const details=button(compactByDefault||status==='pending'?'查看详情':'展开处理','request-expand',()=>{
+      if(currentRequest(type,request))setRequestPresentation(key,status,true);
+    });details.setAttribute('aria-expanded','false');
+    const refresh=button('刷新状态','request-refresh',()=>{if(currentRequest(type,request))void refreshCurrent();});
+    refresh.disabled=typeof api.getThread!=='function';controls.append(details,refresh);card.append(summary,title,controls);
+    return card;
+  }
   function renderQuestion(request) {
     const key = requestKey('answer', request), card = node('section', 'request-card question-card'); card.dataset.requestId = String(request.id);
     card.append(node('p', 'card-eyebrow', 'Codex 需要你的回答'), node('h2', '', request.title || '请回答以下问题'));
@@ -990,9 +1025,9 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     requestStatus(card, key); return card;
   }
   function renderRequests() {
-    const signature = JSON.stringify([currentScope(), state?.questions, state?.approvals, writeAllowed('answer'), writeAllowed('approval'), [...gate.attempts]]);
+    const signature = JSON.stringify([currentScope(), state?.questions, state?.approvals, writeAllowed('answer'), writeAllowed('approval'), [...gate.attempts], [...requestPresentation]]);
     if (signature === cardsSignature) return; cardsSignature = signature;
-    requests.replaceChildren(...(state?.questions ?? []).map(renderQuestion), ...(state?.approvals ?? []).map(renderApproval));
+    requests.replaceChildren(...(state?.questions ?? []).map(request=>renderRequest('answer',request)), ...(state?.approvals ?? []).map(request=>renderRequest('approval',request)));
   }
   // Streaming messages do not change navigation. Keep large, usually hidden lists off this hot path.
   function render({ navigation = false } = {}) { if (navigation) { renderHosts(); renderThreads(); } renderStatus(); renderMessages(); renderRequests(); }

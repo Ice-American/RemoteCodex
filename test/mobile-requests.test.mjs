@@ -141,3 +141,22 @@ test('relative file ranges require the same live working directory and display t
   s.cwd = '/work/different-project';
   assert.throws(() => buildApprovalReply(s, card.id, 'once'), /内容已变化/);
 });
+
+import {answeredQuestionKey} from '../mobile/requests.mjs';
+const asyncState=()=>({id,requests:[],turns:[{items:[{type:'agentMessage',delivery:'async',id:'call-stale',questions:[{title:'Allow Documents?',options:['Yes','Later']}]}]}]});
+const replyText=()=>'<send_user_message_question_reply>\n'+JSON.stringify([{questionItemId:JSON.stringify(['request_user_input_async','call-stale',0]),question:'Allow Documents?',answer:'Later'}])+'\n</send_user_message_question_reply>';
+test('accepted user text variants resolve only their exact async question',()=>{
+ for(const type of ['text','inputText','input_text','output_text']){const s=asyncState();s.turns[0].items.push({type:'userMessage',content:[{type,text:replyText()}]});assert.equal(questionViews(s).length,0);}
+ const s=asyncState();s.turns[0].items.push({type:'steeringUserMessage',status:'accepted',text:replyText()});assert.equal(questionViews(s).length,0);
+});
+test('quotes, tools and unaccepted steering messages never mark a question answered',()=>{
+ for(const item of [{type:'agentMessage',text:replyText()},{type:'functionCallOutput',text:replyText()},{type:'steeringUserMessage',status:'pending',text:replyText()},{type:'userMessage',text:'Example:\n'+replyText()}]){const s=asyncState();s.turns[0].items.push(item);assert.equal(questionViews(s).length,1);}
+});
+test('saved exact answer evidence affects both display and stale request dispatch',()=>{
+ const s=asyncState(),card=questionViews(s)[0],options={resolvedKeys:[answeredQuestionKey(card.id,'Allow Documents?')]};
+ assert.equal(questionViews(s,options).length,0);assert.throws(()=>buildQuestionReply(s,card.id,{[card.id]:['Yes']},options),/已结束/);
+ s.turns[0].items[0].questions[0].title='A different permission?';assert.equal(questionViews(s,options).length,1);
+});
+test('same question text with a different async request ID stays actionable',()=>{
+ const s=asyncState(),card=questionViews(s)[0],options={resolvedKeys:[answeredQuestionKey(card.id,'Allow Documents?')]};s.turns[0].items[0].id='call-new';assert.equal(questionViews(s,options).length,1);
+});

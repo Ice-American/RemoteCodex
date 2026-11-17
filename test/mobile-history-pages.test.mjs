@@ -1,6 +1,6 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';import path from 'node:path';import os from 'node:os';
-import {ThreadCatalog,parseVisibleHistory} from '../mobile/history.mjs';
+import {ThreadCatalog,parseVisibleHistory,parseVisibleHistoryRecords} from '../mobile/history.mjs';
 import {HistoryPagesReader} from '../mobile/history-pages.mjs';
 import {MobileMedia} from '../mobile/media.mjs';
 const id='00000000-0000-4000-8000-000000000001',other='00000000-0000-4000-8000-000000000002';
@@ -127,4 +127,22 @@ test('rewrite hidden by a concurrent append invalidates the initial source epoch
  const {catalog,media,file}=await fixture(t,[response(0),response(1)]);const reader=catalog.historyPages,open=reader.openFile;let modified=false;
  reader.openFile=async(...args)=>{const h=await open(...args);return{stat:(...a)=>h.stat(...a),close:()=>h.close(),read:async(...a)=>{const value=await h.read(...a);if(!modified){modified=true;await fs.writeFile(file,[response(0,'changed'),response(1),response(2)].map(JSON.stringify).join('\n')+'\n');}return value;}};};
  const result=await catalog.readPage(id,{media});assert.equal(result.complete,false);assert.deepEqual(result.issues,['source_changed']);assert.equal(result.messages.length,0);assert.equal(reader.cache.size,0);
+});
+
+test('answer proof index scans old accepted user replies without loading page images',async t=>{
+ const {answeredQuestionKey}=await import('../mobile/requests.mjs');
+ const home=await fs.mkdtemp(path.join(os.tmpdir(),'answer-index-'));t.after(()=>fs.rm(home,{recursive:true,force:true}));
+ const target='["request_user_input_async","old-call",0]',text='<send_user_message_question_reply>\n'+JSON.stringify([{questionItemId:target,question:'Old question',answer:'Already answered'}])+'\n</send_user_message_question_reply>';
+ const file=path.join(home,'source.jsonl');const rows=[{type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text}]}},...Array.from({length:100},(_,i)=>({type:'event_msg',payload:{type:'agent_message',message:'later '+i}})),{type:'response_item',payload:{type:'message',role:'assistant',channel:'final',content:[{type:'text',text:text.replace('old-call','forged-call')}]}}];
+ await fs.writeFile(file,rows.map(JSON.stringify).join('\n')+'\n');
+ const reader=new HistoryPagesReader({project:parseVisibleHistoryRecords});const result=await reader.read(file,id,{resolvedOnly:true});assert.equal(result.complete,true);assert.deepEqual(result.resolvedKeys,[answeredQuestionKey(target,'Old question')]);assert.equal(result.messages,undefined);
+});
+
+test('answer evidence is chat scoped, cached off the SSE path and explicitly refreshed for dispatch',async t=>{
+ const target='["request_user_input_async","first-call",0]',wrap=call=>'<send_user_message_question_reply>'+JSON.stringify([{questionItemId:call,question:'Question',answer:'Yes'}])+'</send_user_message_question_reply>';
+ const row=call=>({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:wrap(call)}]}});
+ const {catalog,file}=await fixture(t,[row(target)]);let scans=0;const original=catalog.historyPages.scan.bind(catalog.historyPages);catalog.historyPages.scan=(...args)=>{scans++;return original(...args);};
+ const first=await catalog.readAnsweredQuestions(id);assert.equal(first.resolvedKeys.length,1);for(let n=0;n<10;n++)await catalog.readAnsweredQuestions(id);assert.equal(scans,1);
+ await fs.appendFile(file,JSON.stringify(row('["request_user_input_async","second-call",0]'))+'\n');assert.equal((await catalog.readAnsweredQuestions(id)).resolvedKeys.length,1);assert.equal((await catalog.readAnsweredQuestions(id,{fresh:true})).resolvedKeys.length,2);assert.equal(scans,2);
+ assert.deepEqual((await catalog.readAnsweredQuestions(other)).resolvedKeys,[]);
 });

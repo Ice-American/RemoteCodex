@@ -1,12 +1,16 @@
 // Projects native questions/approvals and builds only responses the user selected.
 import { createHash } from 'node:crypto';
-import { asyncQuestions, questionReply, itemText } from '../public/message-content.mjs';
+import { asyncQuestions, questionReply } from '../public/message-content.mjs';
+import { itemVisibleText } from './media.mjs';
 import { liveTurns } from '../src/state.mjs';
 import { browserApproval, commandApproval } from '../public/approval-content.mjs';
 
 const canonical = v => Array.isArray(v) ? '[' + v.map(canonical).join(',') + ']' : v && typeof v === 'object'
   ? '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}' : JSON.stringify(v);
 export const requestFingerprint = v => createHash('sha256').update(canonical(v)).digest('hex');
+export const answeredQuestionKey = (id, question) => requestFingerprint([id, question]);
+export const answeredQuestionKeys = text => (questionReply(text) ?? [])
+  .filter(reply => reply.answer.trim()).map(reply => answeredQuestionKey(reply.questionItemId, reply.question));
 const nativeId = r => 'native-' + requestFingerprint(r);
 const items = state => liveTurns(state).flatMap(t => t.items ?? []);
 const pending = state => (state.requests ?? []).filter(r => r && r.completed !== true &&
@@ -71,10 +75,14 @@ function approvalCardId(state, request, scope) {
     : nativeId(request);
 }
 
-export function questionViews(state) {
+export function questionViews(state, { resolvedKeys = [] } = {}) {
   const all = items(state), answered = new Set(all.filter(i => i.type === 'userMessage' || i.type === 'steeringUserMessage' && i.status === 'accepted')
-    .flatMap(i => questionReply(itemText(i)) ?? []).map(r => r.questionItemId));
-  const async = all.flatMap(asyncQuestions).filter(q => !answered.has(q.id)).map(q => ({
+    .flatMap(i => answeredQuestionKeys(itemVisibleText(i))));
+  // A loaded Desktop island may retain an old async question after its user
+  // reply has left the live state. Saved accepted replies close only that exact
+  // ID and original question; they never grant a permission or approve an action.
+  for (const key of resolvedKeys) if (/^[a-f0-9]{64}$/.test(key)) answered.add(key);
+  const async = all.flatMap(asyncQuestions).filter(q => !answered.has(answeredQuestionKey(q.id, q.title))).map(q => ({
     id: q.id, type: 'async', title: '需要你的回答', questions: [{ id: q.id, question: q.title,
       options: q.options.map(option), allowOther: true }],
   }));
@@ -125,8 +133,8 @@ export function approvalViews(state) {
   }).filter(Boolean);
 }
 
-export function buildQuestionReply(state, cardId, answers) {
-  const view = questionViews(state).find(q => q.id === cardId);
+export function buildQuestionReply(state, cardId, answers, options) {
+  const view = questionViews(state, options).find(q => q.id === cardId);
   if (!view) throw Error('这个问题已结束或已在其他设备回答');
   if (view.type === 'async') {
     const q = view.questions[0], answer = oneAnswer(answers, q.id).join('\n');

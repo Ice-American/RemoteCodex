@@ -121,6 +121,14 @@ pre { margin: 10px 0; padding: 13px; white-space: pre-wrap; word-break: break-wo
 .secondary-button { background: #fff; border-color: #d5dfd1; color: #5d6859; }
 .question-card > .primary-button { width: 100%; }
 .request-status { margin: 12px 0 0; font-size: 12px; line-height: 1.7; color: #856323; white-space: pre-wrap; overflow-wrap: anywhere; }
+.request-collapse { display: block; min-height: 40px; margin: 8px 0 0 auto; padding: 7px 10px; border: 0; border-radius: 8px; background: transparent; color: #657769; font-size: 12px; }
+.request-receipt { padding: 11px 13px; border-radius: 12px; background: #f0f5ef; }
+.request-receipt-status { margin: 0; color: #38684e; font-size: 13px; line-height: 1.6; font-weight: 600; }
+.request-receipt[data-status="unknown"], .request-receipt[data-status="pending"] { background: #fff8e9; }
+.request-receipt[data-status="unknown"] .request-receipt-status, .request-receipt[data-status="pending"] .request-receipt-status { color: #805c20; }
+.request-receipt-title { margin: 3px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #758173; font-size: 12px; line-height: 1.6; }
+.request-receipt-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.request-expand, .request-refresh { min-height: 40px; padding: 7px 10px; border: 1px solid #d4dfcf; border-radius: 8px; background: #fff; color: #376b48; font-size: 12px; }
 .approval-card { border-color: #e7d9bb; }
 .approval-card .card-eyebrow { color: #9d7935; }
 .approval-reason { font-size: 14px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }

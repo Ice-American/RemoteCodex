@@ -1111,3 +1111,12 @@ test('opt-in event streams start with a snapshot then send a smaller visible del
  const snapshot=control.owner.snapshots.get(threadId);snapshot.state.turns[0].items[99].text+=' update';control.owner.publish('snapshot',{threadId});
  await within(second.promise,'delta missing');assert.equal(frames[1].event,'delta');assert.equal(frames[1].data.base,1);assert.equal(frames[1].data.messages.upsert.length,1);assert.ok(JSON.stringify(frames[1]).length<JSON.stringify(frames[0]).length/10);assert.equal(control.mutations,0);
 });
+
+test('saved answers remove a stale async card and reject direct replay of that card',async t=>{
+ const {answeredQuestionKey}=await import('../mobile/requests.mjs');const cardId=JSON.stringify(['request_user_input_async','old-answered-call',0]),calls=[];
+ const catalog={get:async()=>({id:threadId,title:'fixture'}),read:async()=>({messages:[]}),readAnsweredQuestions:async(id,options)=>{calls.push({id,fresh:options?.fresh});return{resolvedKeys:[answeredQuestionKey(cardId,'Old question')],complete:true};}};
+ const {gateway,control}=await ownerRig(t,{catalog});control.ready=true;control.turns=[{items:[{type:'agentMessage',delivery:'async',id:'old-answered-call',questions:[{title:'Old question',options:['Yes']}]}]}];
+ const snapshot=await request(gateway,{route:'/api/thread?id='+threadId,headers:auth});assert.equal(snapshot.status,200);assert.equal(snapshot.data.connected,true);assert.deepEqual(snapshot.data.questions,[]);
+ const answer=await request(gateway,{route:'/api/action',method:'POST',headers:auth,body:{host:'mac',threadId,operationId:'do-not-replay-old-answer',action:'answer',requestId:cardId,answers:{[cardId]:['Yes']},ownerId:snapshot.data.ownerId,connectionId:snapshot.data.connectionId,activeTurnId:snapshot.data.activeTurnId}});
+ assert.equal(answer.data.status,'rejected');assert.match(answer.data.message,/已结束/);assert.equal(control.mutations,0);assert.ok(calls.some(c=>c.fresh===true));
+});

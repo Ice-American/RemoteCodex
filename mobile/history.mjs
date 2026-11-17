@@ -358,6 +358,30 @@ export class ThreadCatalog {
     await this.refreshPaths();
     return this.historyPages.read(this.paths.get(id),id,options);
   }
+  async readAnsweredQuestions(id, { fresh = false } = {}) {
+    if (!validThreadId(id)) throw Error('无效聊天标识');
+    this.answeredCache ??= new Map(); this.answeredPending ??= new Map();
+    const cached=this.answeredCache.get(id);
+    // SSE may update on every token. Keep this small proof index off that hot
+    // path; an explicit answer validates against a fresh source scan instead.
+    if(!fresh&&cached&&Date.now()-cached.at<30000)return cached.value;
+    if(this.answeredPending.has(id)){
+      const pending=this.answeredPending.get(id);
+      if(!fresh)return pending;
+      await pending;
+      return this.readAnsweredQuestions(id,{fresh:true});
+    }
+    const pending=(async()=>{
+      await this.refreshPaths();
+      const result=await this.historyPages.read(this.paths.get(id),id,{resolvedOnly:true});
+      const value={resolvedKeys:result.resolvedKeys??[],complete:result.complete===true};
+      this.answeredCache.delete(id);this.answeredCache.set(id,{at:Date.now(),value});
+      while(this.answeredCache.size>32)this.answeredCache.delete(this.answeredCache.keys().next().value);
+      return value;
+    })();
+    this.answeredPending.set(id,pending);
+    try{return await pending;}finally{if(this.answeredPending.get(id)===pending)this.answeredPending.delete(id);}
+  }
   async read(id, limit = 80, {media} = {}) {
     if (!validThreadId(id)) throw Error('无效聊天标识');
     await this.refreshPaths();

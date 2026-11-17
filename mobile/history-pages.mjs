@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import {createHash,randomBytes} from 'node:crypto';
 import {setImmediate as yieldNow} from 'node:timers/promises';
 import {itemImageSource,itemVisibleText,nativeImageContent} from './media.mjs';
+import {answeredQuestionKeys} from './requests.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const stamp=s=>[s.dev,s.ino,s.size,s.mtimeNs,s.ctimeNs].join(':');
@@ -90,7 +91,7 @@ export class HistoryPagesReader {
       return value;
     }catch{throw invalid();}
   }
-  async read(file,threadId,{cursor,limit=40,media,signal}={}) {
+  async read(file,threadId,{cursor,limit=40,media,signal,resolvedOnly=false}={}) {
     if(!validId(threadId))throw invalid();
     if(!Number.isInteger(limit)||limit<1||limit>100)throw failure('HISTORY_PAGE_INVALID','每页消息数量无效');
     const position=cursor?this.decodeCursor(cursor,threadId):null;
@@ -124,6 +125,7 @@ export class HistoryPagesReader {
       if(entry.failure){if(position)throw failure('HISTORY_READ_TIMEOUT','历史页暂时无法读取，请重试当前页。');return empty(entry.failure);}
       if(position&&(position.b>entry.index.length||entry.index[position.b]?.id!==position.a))throw invalid();
       this.touch(entry);
+      if(resolvedOnly)return{resolvedKeys:entry.resolvedKeys,complete:entry.complete};
       return await this.page(entry,threadId,{position,limit,media,signal,deadline});
     }finally{record.consumers--;if(!record.consumers&&!record.settled)record.controller.abort();}
   }
@@ -189,9 +191,16 @@ export class HistoryPagesReader {
     }finally{if(handle)await handle.close().catch(()=>{});}
   }
   async index(data,threadId,record) {
-    const groups=new Map(),index=[],issues=data.issues;
+    const groups=new Map(),index=[],issues=data.issues,resolvedKeys=new Set();
     const anyEvents=data.records.some(r=>['user_message','agent_message'].includes(r.row.payload.type));
     for(const row of data.records) {
+      const p=row.row.payload;
+      // Only accepted public user records are evidence of an answer. Tool
+      // output, assistant examples and quoted text cannot resolve a question.
+      const userText=p.type==='user_message'?p.message:p.type==='message'&&p.role==='user'?itemVisibleText(p):null;
+      if(typeof userText==='string')for(const key of answeredQuestionKeys(userText)){
+        if(resolvedKeys.size<2048)resolvedKeys.add(key);else issues.add('answer_index_budget');
+      }
       this.check(record);const key=groupKey(row);let group=groups.get(key);
       if(!group){group={records:[],bytes:0,sourceBytes:0,items:0,overflow:false};groups.set(key,group);}
       const items=candidateItems(row,this.maxGroupItems);
@@ -215,7 +224,7 @@ export class HistoryPagesReader {
       });
     }
     index.sort((a,b)=>a.order-b.order);
-    return{...data,index,complete:issues.size===0,issues:[...issues]};
+    return{...data,bytes:data.bytes+resolvedKeys.size*128,index,resolvedKeys:[...resolvedKeys],complete:issues.size===0,issues:[...issues]};
   }
   async hashPrefix(handle,size,signal,expected,deadline=Infinity) {
     const buffer=Buffer.alloc(64*1024),digest=createHash('sha256');let offset=0;

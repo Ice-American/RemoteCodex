@@ -145,11 +145,15 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
     const incompatible = error === 'UNSUPPORTED_METHOD';
     const canLoad = !connected && !incompatible && client?.connected === true && !client.pipe?.socket?.destroyed && metadata?.id === id &&
       typeof nativeTools.openExistingThread === 'function';
+    let questions=ready?questionViews(live.state):[];
+    if(questions.some(question=>question.type==='async')&&typeof catalog.readAnsweredQuestions==='function') {
+      try { questions=questionViews(live.state,await catalog.readAnsweredQuestions(id)); } catch { /* Keep unresolved cards on a failed history read. */ }
+    }
     return { host: hostId, id, title: live?.state?.title ?? metadata?.title ?? '原聊天', connected,
       connectionState: ready ? 'ready' : runtimeFailed ? 'runtime-error' : incompatible ? 'incompatible' : canLoad ? 'needs-load' : 'unavailable', canLoad: !!canLoad,
       ownerConfirmed: connected, revision: connected ? live.revision : null, connectionId: connected ? String(live.generation) + ':' + live.owner : null,
       ownerId: connected ? live.owner : null, activeTurnId: ready ? live.activeTurnId : null, status, messages, runtimeError,
-      questions: ready ? questionViews(live.state) : [], approvals: ready ? approvalViews(live.state) : [],
+      questions, approvals: ready ? approvalViews(live.state) : [],
       capabilities: { send: ready && status === 'idle' && client.supports(id, 'start'),
         steer: ready && status === 'running' && client.supports(id, 'steer'),
         answer: ready && (client.supports(id, 'userInput') || client.supports(id, status === 'idle' ? 'start' : 'steer')),
@@ -279,7 +283,10 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
         expectedGeneration: snapshot.generation, expectedFailedTurnId: input.failedTurnId });
     } else if (input.action === 'send') result = await owner.sendText(id, input.text, { ...options, mode: snapshot.status.type === 'idle' ? 'start' : 'steer' });
     else if (input.action === 'answer' || input.action === 'approval') {
-      const reply = input.action === 'answer' ? buildQuestionReply(snapshot.state, input.requestId, input.answers) :
+      let resolution;
+      if(input.action==='answer'&&questionViews(snapshot.state).some(q=>q.id===input.requestId&&q.type==='async')&&typeof catalog.readAnsweredQuestions==='function')
+        resolution=await catalog.readAnsweredQuestions(id,{fresh:true});
+      const reply = input.action === 'answer' ? buildQuestionReply(snapshot.state, input.requestId, input.answers, resolution) :
         buildApprovalReply(snapshot.state, input.requestId, input.choice);
       fence = requestFingerprint([hostId, id, reply.fence]);
       if ([...journal.records.values()].some(r => r.semanticFence === fence && ['dispatched', 'unknown', 'submitted'].includes(r.status)))

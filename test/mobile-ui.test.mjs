@@ -770,7 +770,7 @@ test('confirmed sends clear only the unchanged draft; an edit during sending is 
   pending.resolve({ status: 'confirmed' }); await tick(); await tick(); assert.equal(one(root, 'message-input').value, '下一条尚未发送');
 });
 
-test('questions submit selected labels and free text arrays; ACK cannot remove their cards', async (t) => {
+test('questions submit selected labels and free text arrays; ACK collapses the form but keeps a receipt', async (t) => {
   const calls = [], request = { id: 'question-request', type: 'sync', title: '选择方案', questions: [{ id: 'route', question: '<script>选择路线</script>', allowOther: true, options: [{ id: 'one', label: '现有原会话', description: '保留上下文' }, { id: 'two', label: '手机输入', description: '触屏界面' }] }] };
   const state = thread({ questions: [request] });
   const { root, view } = mount(t, { action: async (body) => { calls.push(body); return { status: 'submitted' }; }, getThread: async () => state });
@@ -780,8 +780,9 @@ test('questions submit selected labels and free text arrays; ACK cannot remove t
   one(root, 'primary-button').click(); await tick(); await tick();
   assert.equal(calls.length, 1); assert.equal(calls[0].action, 'answer'); assert.equal(calls[0].requestId, 'question-request');
   assert.deepEqual(calls[0].answers.route, ['现有原会话', '手机输入', '还要支持中文输入']);
-  assert.equal(byClass(root, 'question-card').length, 1); assert.equal(one(root, 'primary-button').disabled, true);
-  view.update(thread({ revision: 2, questions: [] })); assert.equal(byClass(root, 'question-card').length, 0);
+  assert.equal(byClass(root, 'question-card').length, 0); assert.equal(byClass(root, 'request-receipt').length, 1);
+  one(root,'request-expand').click(); assert.equal(one(root,'primary-button').disabled,true);
+  view.update(thread({ revision: 2, questions: [] })); assert.equal(byClass(root, 'request-receipt').length, 0);assert.equal(byClass(root,'question-card').length,0);
 });
 
 test('approval cards show full reason, command and files; one choice locks all choices', async (t) => {
@@ -792,7 +793,8 @@ test('approval cards show full reason, command and files; one choice locks all c
   view.update(state);
   assert.ok(root.textContent.includes(command)); assert.ok(root.textContent.includes('完整原因\n第二行')); assert.ok(root.textContent.includes('C:\\work\\file.ts'));
   one(root, 'primary-button').click(); one(root, 'secondary-button').click(); await tick(); await tick();
-  assert.equal(calls.length, 1); assert.equal(calls[0].choice, 'allow'); assert.equal(one(root, 'secondary-button').disabled, true);
+  assert.equal(calls.length, 1); assert.equal(calls[0].choice, 'allow'); assert.equal(one(root,'request-receipt').dataset.status,'confirmed');
+  one(root,'request-expand').click();assert.equal(one(root,'secondary-button').disabled,true);
   assert.equal(byClass(root, 'approval-card').length, 1);
   assert.ok(!descendants(root).some((node) => ['SCRIPT', 'IMG'].includes(node.tagName)));
 });
@@ -1454,4 +1456,53 @@ test('the first older-page click advances past the hundred-message live window',
  }});
  await view.selectThread(thread().id);await tick();assert.equal(byClass(root,'message').length,100);
  one(root,'history-more').click();await tick();assert.ok(byClass(root,'message').length>100);assert.deepEqual(limits,[40,80]);
+});
+
+const receiptQuestion=(question='仍需回答的普通问题')=>({id:'receipt-question',type:'sync',title:'请求确认',questions:[{id:'answer',question,options:[]}]});
+function answerReceiptQuestion(root,value='测试回答') {const input=one(root,'answer-input');input.value=value;input.fire('input');one(root,'primary-button').click();}
+
+for(const status of ['submitted','confirmed'])test(status+' answers become compact receipts with GET-only refresh and disabled expanded details',async t=>{
+ const request=receiptQuestion(),snapshot=thread({questions:[request]});let posts=0,reads=0;
+ const {root,view}=mount(t,{getThread:async()=>{reads++;return snapshot;},action:async()=>{posts++;return{status};}});view.update(snapshot);type(root,'普通会话草稿');
+ answerReceiptQuestion(root);await tick();await tick();assert.equal(posts,1);assert.equal(byClass(root,'question-card').length,0);assert.equal(one(root,'request-receipt').dataset.status,status);assert.equal(byClass(root,'answer-input').length,0);
+ assert.match(one(root,'request-receipt-status').textContent,status==='submitted'?/已提交.*等待电脑同步/:/已提交.*回执已确认/);
+ const before=reads;one(root,'request-refresh').click();await tick();assert.equal(reads,before+1);assert.equal(posts,1);assert.equal(one(root,'message-input').value,'普通会话草稿');
+ one(root,'request-expand').click();assert.equal(one(root,'answer-input').disabled,true);assert.equal(one(root,'primary-button').disabled,true);one(root,'primary-button').fire('click');await tick();assert.equal(posts,1);
+ one(root,'request-collapse').click();assert.equal(byClass(root,'question-card').length,0);view.update(thread({revision:2,questions:[]}));assert.equal(byClass(root,'request-receipt').length,0);
+});
+
+test('unknown answer receipts stay fenced through collapse, refresh and page rebuild without a new POST',async t=>{
+ const request=receiptQuestion(),snapshot=thread({questions:[request]});let posts=0;
+ const api={getThread:async()=>snapshot,action:async()=>{posts++;throw Error('handover');}};
+ const {root,view,storage}=mount(t,api);view.update(snapshot);answerReceiptQuestion(root);await tick();await tick();
+ assert.equal(one(root,'request-receipt').dataset.status,'unknown');assert.match(one(root,'request-receipt-status').textContent,/结果未确认.*不会自动重发/);
+ one(root,'request-expand').click();assert.equal(one(root,'primary-button').disabled,true);one(root,'primary-button').fire('click');one(root,'request-collapse').click();one(root,'request-refresh').click();await tick();assert.equal(posts,1);
+ view.destroy();const reopened=mountMobileUI(root,{api,storage});t.after(()=>reopened.destroy());reopened.update(snapshot);assert.equal(one(root,'request-receipt').dataset.status,'unknown');assert.equal(byClass(root,'question-card').length,0);
+ one(root,'request-expand').click();one(root,'primary-button').fire('click');await tick();assert.equal(posts,1);
+});
+
+test('an in-flight answer can be collapsed without claiming a result or enabling another submission',async t=>{
+ const pending=deferred(),request=receiptQuestion(),snapshot=thread({questions:[request]});let posts=0;
+ const {root,view}=mount(t,{getThread:async()=>snapshot,action:()=>{posts++;return pending.promise;}});view.update(snapshot);answerReceiptQuestion(root);
+ assert.equal(one(root,'primary-button').disabled,true);one(root,'request-collapse').click();assert.equal(one(root,'request-receipt').dataset.status,'pending');assert.match(one(root,'request-receipt-status').textContent,/正在提交.*请勿重复/);
+ one(root,'request-expand').click();one(root,'primary-button').fire('click');assert.equal(posts,1);
+ pending.resolve({status:'submitted'});await tick();await tick();assert.equal(one(root,'request-receipt').dataset.status,'submitted');assert.equal(byClass(root,'question-card').length,0);
+});
+
+test('local request collapse is scoped to its exact chat and fingerprint and never resolves a new question',async t=>{
+ const request=receiptQuestion(),id=thread().id,other='22222222-2222-4222-8222-222222222222';let posts=0;
+ const {root,view}=mount(t,{getThread:async(host,id)=>thread({host,id,questions:[request]}),action:async()=>{posts++;return{status:'submitted'};}});
+ await view.selectThread(id);const answer=one(root,'answer-input');answer.value='未提交的回答草稿';answer.fire('input');one(root,'request-collapse').click();assert.equal(one(root,'request-receipt').dataset.status,'unanswered');assert.match(one(root,'request-receipt-status').textContent,/仍待回答/);assert.equal(posts,0);
+ await view.selectThread(other);assert.equal(byClass(root,'question-card').length,1);assert.equal(byClass(root,'request-receipt').length,0);
+ await view.selectThread(id);assert.equal(byClass(root,'request-receipt').length,1);one(root,'request-expand').click();assert.equal(one(root,'answer-input').value,'未提交的回答草稿');one(root,'request-collapse').click();
+ view.update(thread({revision:2,questions:[receiptQuestion('同一个ID但内容已变化的新问题')]}));assert.equal(byClass(root,'question-card').length,1);assert.equal(byClass(root,'request-receipt').length,0);assert.equal(one(root,'answer-input').value,'');assert.equal(posts,0);
+ await view.selectHost('windows');await view.selectThread(id);assert.equal(byClass(root,'question-card').length,1);assert.equal(byClass(root,'request-receipt').length,0);
+});
+
+test('a genuinely changed question reappears normally after an old submitted receipt without reusing its answer or guard',async t=>{
+ const old=receiptQuestion('旧问题'),fresh=receiptQuestion('新的问题内容'),calls=[];let snapshot=thread({questions:[old]});
+ const {root,view}=mount(t,{getThread:async()=>snapshot,action:async body=>{calls.push(body);return{status:'submitted'};}});view.update(snapshot);const obsoleteSubmit=one(root,'primary-button');
+ answerReceiptQuestion(root,'旧回答');await tick();await tick();assert.equal(byClass(root,'request-receipt').length,1);
+ snapshot=thread({revision:2,questions:[fresh]});view.update(snapshot);assert.equal(byClass(root,'request-receipt').length,0);assert.equal(one(root,'answer-input').value,'');assert.equal(one(root,'primary-button').disabled,true);
+ obsoleteSubmit.fire('click');assert.equal(calls.length,1);answerReceiptQuestion(root,'新回答');await tick();await tick();assert.equal(calls.length,2);assert.deepEqual(calls[1].answers.answer,['新回答']);
 });
