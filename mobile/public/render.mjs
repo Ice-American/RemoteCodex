@@ -630,12 +630,19 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
       const page=await Promise.race([api.getThreadHistory(host,id,{cursor,limit:older?80:40,signal:attempt.controller.signal}),deadline,cancelled]);
       if(!current())return;
       if(page?.host!==host||page?.id!==id||!Array.isArray(page.messages))throw Error('返回的历史与当前聊天不匹配。');
-      const saved=dedupeMessages(older?[...page.messages,...history.messages]:page.messages);
-      const complete=page.complete===true&&(!older||history.complete);
-      history={messages:saved,loaded:true,nextCursor:page.nextCursor??null,hasMore:page.hasMore===true,complete,
+      // Busy/failed first-page reads may return an empty partial result. They
+      // do not prove the displayed records disappeared. Keep that preview,
+      // but retire its old epoch cursor so only a fresh retry can follow it.
+      const retainPrevious=!older&&page.complete!==true&&!page.messages.length&&history.messages.length>0;
+      const saved=dedupeMessages(older?[...page.messages,...history.messages]:retainPrevious?history.messages:page.messages);
+      const nextCursor=!retainPrevious&&typeof page.nextCursor==='string'&&page.nextCursor? page.nextCursor:null;
+      // A claimed older page without a cursor cannot advance. Keep a visible
+      // first-page retry instead of repeatedly requesting the same suffix.
+      const complete=page.complete===true&&(!page.hasMore||nextCursor!==null)&&(!older||history.complete);
+      history={messages:saved,loaded:true,nextCursor,hasMore:!retainPrevious&&page.hasMore===true,complete,
         issues:[...new Set([...(older?history.issues:[]),...page.issues??[]])],error:'',reset:!complete};
-      if(!older)previewCache.set(host,id,page);
-      showHistoryPreview(page);renderMessages();
+      if(!older)previewCache.set(host,id,history);
+      showHistoryPreview(history);renderMessages();
       if(older)main.scrollTop=top+Math.max(0,main.scrollHeight-height);
       else if(!connected)main.scrollTop=main.scrollHeight;
     }catch(error){if(current()){history.error=error.message||'历史读取失败，请重试。';if(['HISTORY_CURSOR_EXPIRED','HISTORY_CURSOR_INVALID'].includes(error.code)){history.reset=true;history.error='历史已更新，请重新读取历史。';}}}
@@ -1107,7 +1114,10 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (selectedId) saveDraft(currentScope(), input.value);
     generation++; const host = selectedHost; stopReadAndStream(); clearRecovery();stopPrefetch();cancelHistory();
     const cached=previewCache.get(host,id);
-    history=cached?{...cached,loaded:true,error:'',reset:false}:{messages:[],loaded:false,hasMore:true,nextCursor:null,complete:true,issues:[],error:'',reset:false};
+    // A preview remembers partial reads too. Returning to that chat must not
+    // turn its recovery action into a no-op older-page request.
+    const cachedComplete=cached?.complete===true&&(!cached.hasMore||!!cached.nextCursor);
+    history=cached?{...cached,complete:cachedComplete,loaded:true,error:'',reset:!cachedComplete}:{messages:[],loaded:false,hasMore:true,nextCursor:null,complete:true,issues:[],error:'',reset:false};
     state = null; selectedId = id; connected = false; loading = true; input.value = draft(currentScope()); cardsSignature = ''; showNotice(''); autoSize(); setDrawer(false); render({ navigation: true }); onNavigate({ host, id });
     if(cached)showHistoryPreview(cached);else void loadHistory();
     startPrefetch();scheduleSelectedSync();

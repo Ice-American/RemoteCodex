@@ -1585,6 +1585,59 @@ test('partial history remains explicit and its retry re-reads the first page ins
  one(root,'history-more').click();await tick();assert.deepEqual(calls,[null,null]);assert.equal(one(root,'history-more').hidden,true);
 });
 
+for(const partial of [
+ {name:'without an older page',hasMore:false,nextCursor:null},
+ {name:'with a usable older cursor',hasMore:true,nextCursor:'partial-older'},
+])test(`a partial cached history ${partial.name} remains retryable after leaving and returning`,async t=>{
+ const calls=[],id='cached-partial';let posts=0;
+ const {root,view}=mount(t,{getThread:async(host,id)=>thread({host,id}),action:async()=>{posts++;},
+  getThreadHistory:async(_host,chat,{cursor})=>{calls.push({id:chat,cursor});return historyPage(chat,[savedMessage(chat==='other'?'other':'saved')],chat===id&&calls.filter(c=>c.id===id).length===1?{...partial,complete:false,issues:['history_busy']}:{});}});
+ await view.selectThread(id);await tick();type(root,'未完成历史的草稿');await view.selectThread('other');await tick();await view.selectThread(id);await tick();
+ assert.equal(one(root,'message-input').value,'未完成历史的草稿');assert.match(one(root,'history-hint').textContent,/不完整/);assert.equal(one(root,'history-more').textContent,'重新读取历史');
+ assert.deepEqual(calls.filter(c=>c.id===id).map(c=>c.cursor),[null]);one(root,'history-more').click();await tick();
+ assert.deepEqual(calls.filter(c=>c.id===id).map(c=>c.cursor),[null,null]);assert.equal(one(root,'history-more').hidden,true);assert.equal(one(root,'message-input').value,'未完成历史的草稿');assert.equal(posts,0);
+});
+
+test('a partial first page with an older cursor retries the first page explicitly',async t=>{
+ const calls=[];
+ const {root,view}=mount(t,{getThread:async()=>thread(),getThreadHistory:async(_host,id,{cursor})=>{calls.push(cursor);return historyPage(id,[savedMessage('saved')],calls.length===1?{complete:false,hasMore:true,nextCursor:'partial-older',issues:['projection_budget']}:{});}});
+ await view.selectThread(thread().id);await tick();assert.equal(one(root,'history-more').textContent,'重新读取历史');one(root,'history-more').click();await tick();
+ assert.deepEqual(calls,[null,null]);assert.equal(one(root,'history-more').hidden,true);
+});
+
+test('a missing older cursor is incomplete and retryable both initially and from cached history',async t=>{
+ const calls=[],id='missing-cursor';
+ const {root,view}=mount(t,{getThread:async(host,id)=>thread({host,id}),getThreadHistory:async(_host,chat,{cursor})=>{calls.push({id:chat,cursor});return historyPage(chat,[savedMessage('saved')],chat===id&&calls.filter(c=>c.id===id).length===1?{complete:true,hasMore:true,nextCursor:null}:{});}});
+ await view.selectThread(id);await tick();assert.match(one(root,'history-hint').textContent,/不完整/);assert.equal(one(root,'history-more').textContent,'重新读取历史');
+ await view.selectThread('other');await tick();await view.selectThread(id);await tick();assert.equal(one(root,'history-more').textContent,'重新读取历史');
+ one(root,'history-more').click();await tick();assert.deepEqual(calls.filter(c=>c.id===id).map(c=>c.cursor),[null,null]);assert.equal(one(root,'history-more').hidden,true);
+});
+
+test('an empty incomplete reset preserves displayed history and its cached retry without carrying an old cursor',async t=>{
+ const calls=[],id='retain-partial';let posts=0;
+ const {root,view}=mount(t,{getThread:async(host,id)=>thread({host,id,messages:[savedMessage('live','live-current')]}),action:async()=>{posts++;},getThreadHistory:async(_host,chat,{cursor})=>{
+  calls.push({id:chat,cursor});if(chat!==id)return historyPage(chat,[]);
+  const count=calls.filter(c=>c.id===id).length;
+  if(count===1)return historyPage(chat,[savedMessage('old','old-partial-history')],{complete:false,hasMore:true,nextCursor:'old-epoch',issues:['projection_budget']});
+  if(count===2)return historyPage(chat,[],{complete:false,issues:['history_busy']});
+  return historyPage(chat,[savedMessage('fresh','fresh-epoch-history')]);
+ }});
+ await view.selectThread(id);await tick();type(root,'历史重读期间的草稿');one(root,'history-more').click();await tick();
+ assert.equal(root.textContent.includes('old-partial-history'),true);assert.match(one(root,'history-hint').textContent,/不完整/);assert.equal(one(root,'history-more').textContent,'重新读取历史');
+ await view.selectThread('other');await tick();await view.selectThread(id);await tick();assert.equal(root.textContent.includes('old-partial-history'),true);assert.equal(one(root,'history-more').textContent,'重新读取历史');
+ one(root,'history-more').click();await tick();assert.deepEqual(calls.filter(c=>c.id===id).map(c=>c.cursor),[null,null,null]);assert.equal(root.textContent.includes('fresh-epoch-history'),true);assert.equal(root.textContent.includes('old-partial-history'),false);assert.equal(one(root,'history-more').hidden,true);assert.equal(one(root,'message-input').value,'历史重读期间的草稿');assert.equal(posts,0);
+});
+
+for(const fresh of [
+ {name:'a confirmed empty history',messages:[],complete:true},
+ {name:'nonempty incomplete history from a new epoch',messages:[savedMessage('new','new-epoch-history')],complete:false},
+])test(`an explicit reset replaces saved records with ${fresh.name}`,async t=>{
+ const calls=[];
+ const {root,view}=mount(t,{getThread:async()=>thread(),getThreadHistory:async(_host,id,{cursor})=>{calls.push(cursor);return calls.length===1?historyPage(id,[savedMessage('old','old-epoch-history')],{complete:false,issues:['projection_budget']}):historyPage(id,fresh.messages,{complete:fresh.complete});}});
+ await view.selectThread(thread().id);await tick();one(root,'history-more').click();await tick();
+ assert.deepEqual(calls,[null,null]);assert.equal(root.textContent.includes('old-epoch-history'),false);assert.equal(root.textContent.includes('new-epoch-history'),fresh.messages.length>0);assert.equal(one(root,'history-more').hidden,fresh.complete);
+});
+
 test('a delayed periodic GET cannot roll back an accepted SSE update with opaque string revisions',async t=>{
  const timers=fakeClock(),pending=deferred(),streams=[];let reads=0,posts=0;
  const {root,view}=mount(t,{getThread:()=>++reads===1?Promise.resolve(thread({revision:'r1',messages:[savedMessage('live','初始r1')]})):pending.promise,
