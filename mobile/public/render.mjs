@@ -9,6 +9,10 @@ const isRunning = (state) => ['running', 'working', 'inProgress'].includes(statu
 const isHistoryOnly = (state) => state?.source === 'local-history-only';
 const needsLoad = (state) => state?.connectionState === 'needs-load';
 const incompatible = (state) => state?.connectionState === 'incompatible';
+const isRuntimeError = (state) => state?.connectionState === 'runtime-error';
+const failedTurnId = (state) => typeof state?.runtimeError?.failedTurnId === 'string' && state.runtimeError.failedTurnId.trim() ? state.runtimeError.failedTurnId : null;
+// A failed turn does not unload its desktop owner. Read transport and write capabilities remain separate.
+const readableConnection = (state) => state?.connectionState == null || state.connectionState === 'ready' || isRuntimeError(state);
 const scopeOf = (state) => JSON.stringify([state?.host ?? '', state?.id ?? '']);
 const stringify = (value) => { try { return JSON.stringify(value, null, 2); } catch { return '详情无法显示'; } };
 // A compact local lookup key, not an authorization token. The server validates the full owner request.
@@ -33,8 +37,10 @@ export function viewportMetrics(viewport, fallbackHeight) {
 
 export function canAct(state, action, transportConnected = true) {
   if (isHistoryOnly(state) || !transportConnected || state?.connected !== true || state?.ownerConfirmed !== true) return false;
-  if (state.connectionState != null && state.connectionState !== 'ready') return false;
   if (!state.connectionId || !state.ownerId || state.revision == null) return false;
+  // Retrying recovers one failed native turn. It must not unlock ordinary send, approval or interrupt paths.
+  if (isRuntimeError(state)) return action === 'retry' && !!failedTurnId(state) && state.capabilities?.retry === true;
+  if (action === 'retry' || !readableConnection(state)) return false;
   const capability = action === 'approval' ? 'approve' : action === 'send' && isRunning(state) ? 'steer' : action;
   return state.capabilities?.[capability] === true && (action !== 'interrupt' || !!state.activeTurnId);
 }
@@ -46,6 +52,8 @@ export function buildActionPayload(state, input) {
     connectionId: state.connectionId, revision: state.revision, ownerId: state.ownerId,
     activeTurnId: state.activeTurnId ?? null, action: input.action,
   };
+  // Take the failed turn from the confirmed snapshot, never from a draft or a caller-supplied ID.
+  if (input.action === 'retry') return { ...payload, failedTurnId: failedTurnId(state) };
   for (const key of ['text', 'requestId', 'answers', 'choice']) if (Object.hasOwn(input, key)) payload[key] = input[key];
   return payload;
 }
@@ -296,6 +304,12 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const loadButton = button('在电脑上加载原会话', 'load-thread-button', () => loadOriginalThread());
   const loadResult = node('p', 'load-thread-result'); loadResult.setAttribute('role', 'status'); loadResult.setAttribute('aria-live', 'polite'); loadResult.hidden = true;
   loadPanel.append(loadHeading, loadHint, loadButton, loadResult);
+  const runtimeErrorPanel = node('section', 'request-card runtime-error-panel'); runtimeErrorPanel.hidden = true;
+  const runtimeErrorHeading = node('h2', '', '上一轮运行失败');
+  const runtimeErrorMessage = node('p', 'approval-reason runtime-error-message');
+  const retryTurnButton = button('重试上一轮', 'text-button retry-turn-button', () => retryFailedTurn());
+  const retryTurnResult = node('p', 'request-status retry-turn-result'); retryTurnResult.setAttribute('role', 'status'); retryTurnResult.setAttribute('aria-live', 'polite'); retryTurnResult.hidden = true;
+  runtimeErrorPanel.append(runtimeErrorHeading, runtimeErrorMessage, retryTurnButton, retryTurnResult);
   const empty = node('div', 'empty-state', '从对话列表选择一个已有对话。');
   const messages = node('div', 'messages'), requests = node('div', 'request-cards');
   main.append(empty, messages, requests);
@@ -307,7 +321,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const send = node('button', 'send-button', '发送'); send.type = 'submit';
   composeRow.append(input, send);
   const composeFoot = node('div', 'composer-foot'), draftHint = node('span', 'draft-hint', '草稿只保存在本设备'), interrupt = button('停止运行', 'stop-button', () => stopTurn());
-  interrupt.hidden = true; composeFoot.append(draftHint, interrupt); composer.append(loadPanel, composerHint, composeRow, composeFoot);
+  interrupt.hidden = true; composeFoot.append(draftHint, interrupt); composer.append(loadPanel, runtimeErrorPanel, composerHint, composeRow, composeFoot);
   const backdrop = button('关闭对话列表', 'drawer-backdrop', () => setDrawer(false)); backdrop.hidden = true; backdrop.tabIndex = -1;
   const drawer = node('aside', 'thread-drawer'); drawer.id = 'thread-drawer'; drawer.hidden = true; drawer.setAttribute('aria-label', '已有对话列表');
   const drawerHeading = node('div', 'drawer-heading'); drawerHeading.append(node('h2', '', '聊天'), button('新建', 'drawer-new-chat', () => openCreation()), button('刷新', 'text-button drawer-refresh', () => loadThreads()), button('关闭', 'text-button', () => setDrawer(false)));
@@ -610,10 +624,11 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   }
   function writeAllowed(action) { return !loadAttempts.get(currentScope())?.pending && canAct(state, action, connected); }
   function sendKey(text) { return JSON.stringify([currentScope(), 'send', fingerprint(text)]); }
+  function retryKey(snapshot = state) { return JSON.stringify([scopeOf(snapshot), 'retry', failedTurnId(snapshot)]); }
   function renderStatus() {
     title.textContent = state?.title || (selectedId ? '正在读取对话…' : 'Codex 随行');
     subtitle.textContent = state ? (hosts.find((host) => host.id === selectedHost)?.name || selectedHost) + (isHistoryOnly(state) ? ' · 只读历史' : ' · 原桌面会话') : '选择一个已有对话';
-    connectionLabel.textContent = incompatible(state) ? '电脑网关需要更新' : !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
+    connectionLabel.textContent = incompatible(state) ? '电脑网关需要更新' : !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : isRuntimeError(state) ? '上一轮运行失败' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
     const loadAttempt = loadAttempts.get(currentScope());
     loadPanel.hidden = !needsLoad(state) && !incompatible(state);
     loadHeading.textContent = incompatible(state) ? '电脑会话接口已更新' : '原聊天尚未在电脑上加载';
@@ -623,6 +638,12 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     loadButton.textContent = loadAttempt?.pending ? '正在连接原聊天…' : loadAttempt ? '重试连接原聊天' : '在电脑上加载原会话';
     loadResult.textContent = loadAttempt?.message || (needsLoad(state) && state?.canLoad !== true ? '请在电脑上打开这个原聊天，再刷新手机页面。' : '');
     loadResult.hidden = !loadResult.textContent;
+    const retryAttempt = gate.get(retryKey());
+    runtimeErrorPanel.hidden = !isRuntimeError(state);
+    runtimeErrorMessage.textContent = typeof state?.runtimeError?.message === 'string' && state.runtimeError.message ? state.runtimeError.message : '电脑未返回错误详情，请刷新原聊天状态。';
+    retryTurnButton.disabled = !writeAllowed('retry') || typeof api.action !== 'function' || !!retryAttempt && retryAttempt.status !== 'rejected';
+    retryTurnResult.textContent = retryAttempt?.message || (!state?.ownerConfirmed ? '等待确认原会话连接后才能重试。' : !failedTurnId(state) || state?.capabilities?.retry !== true ? '当前失败暂不支持手机重试，请在电脑上核对。' : '');
+    retryTurnResult.hidden = !retryTurnResult.textContent;
     connection.classList.toggle('disconnected', !!selectedId && !connected);
     titleRunning.hidden = !connected || state?.ownerConfirmed !== true || isHistoryOnly(state) || !isRunning(state);
     const selectedRow = threadRowViews.get(selectedId); if (selectedRow) updateRowStatus(selectedRow.item, selectedRow);
@@ -633,7 +654,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     interrupt.hidden = !state?.activeTurnId;
     const stopAttempt = gate.get(JSON.stringify([currentScope(), 'interrupt', state?.activeTurnId]));
     interrupt.disabled = !writeAllowed('interrupt') || !!stopAttempt && stopAttempt.status !== 'rejected';
-    composerHint.textContent = !selectedId ? '先选择对话' : incompatible(state) ? '电脑网关更新后才能发送，草稿会保留' : loadAttempt?.pending ? '正在连接原聊天，草稿会保留' : needsLoad(state) ? '先在电脑上加载原聊天，草稿会保留' : isHistoryOnly(state) ? '只读历史，原会话未连接；草稿会保留' : !connected ? '连接恢复后才能发送，草稿会保留' : !state?.ownerConfirmed ? '等待原会话确认，草稿会保留' : !writeAllowed('send') ? (isRunning(state) ? '运行中，当前连接暂不支持补充方向' : '当前状态只读，不能发送') : isRunning(state) ? '运行中发送会补充当前方向' : '继续这个对话';
+    composerHint.textContent = !selectedId ? '先选择对话' : incompatible(state) ? '电脑网关更新后才能发送，草稿会保留' : loadAttempt?.pending ? '正在连接原聊天，草稿会保留' : needsLoad(state) ? '先在电脑上加载原聊天，草稿会保留' : isHistoryOnly(state) ? '只读历史，原会话未连接；草稿会保留' : !connected ? '连接恢复后才能发送，草稿会保留' : !state?.ownerConfirmed ? '等待原会话确认，草稿会保留' : isRuntimeError(state) ? '重试只恢复上一轮，当前草稿会保留' : !writeAllowed('send') ? (isRunning(state) ? '运行中，当前连接暂不支持补充方向' : '当前状态只读，不能发送') : isRunning(state) ? '运行中发送会补充当前方向' : '继续这个对话';
     draftHint.textContent = attempt?.status === 'unknown' ? '结果未确认，此内容已禁止重复发送' : attempt?.status === 'submitted' ? '已提交，保留草稿并等待确认' : '草稿只保存在本设备';
   }
   function imageCurrent(record) {
@@ -803,7 +824,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (state?.connectionId === next.connectionId && typeof next.revision === 'number' && typeof state.revision === 'number' && next.revision < state.revision) return false;
     const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 100;
     // Disk history can display messages, but it can never establish a live owner or authorize writes.
-    state = next; connected = next.connected === true && next.ownerConfirmed === true && !isHistoryOnly(next) && (next.connectionState == null || next.connectionState === 'ready'); loading = false;
+    state = next; connected = next.connected === true && next.ownerConfirmed === true && !isHistoryOnly(next) && readableConnection(next); loading = false;
     render({ navigation: navigated }); if (atBottom) main.scrollTop = main.scrollHeight; return true;
   }
   async function loadThreads({ append = false } = {}) {
@@ -980,7 +1001,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   async function dispatch(action, key) {
     if (!writeAllowed(action.action)) return;
     const attempt = gate.begin(key); if (!attempt) return;
-    const snapshot = state, scope = currentScope();
+    const snapshot = state, scope = currentScope(), navigation = generation;
     renderStatus(); renderRequests();
     try {
       const response = await api.action(buildActionPayload(snapshot, { ...action, operationId: attempt.operationId }));
@@ -992,11 +1013,18 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
       }
     } catch { gate.settle(key, { status: 'unknown' }); }
     if (destroyed || scope !== currentScope()) return;
+    // A retry receipt belongs to one navigation and one failed turn. It cannot refresh a newer turn or reclaim a returned chat.
+    if (action.action === 'retry' && (navigation !== generation || !isRuntimeError(state) || failedTurnId(state) !== failedTurnId(snapshot))) {
+      // Returning to the same failed turn can refresh its settled guard only. The old receipt must not navigate, announce or read again.
+      if (isRuntimeError(state) && retryKey() === key) renderStatus();
+      return;
+    }
     showNotice(gate.get(key).message); renderStatus(); renderRequests();
     // Refresh only the read path; never retry POST after a timeout or disconnect.
     await recover({ immediate: true });
   }
   function sendMessage(event) { event.preventDefault(); const text = input.value.trim(); if (text) return dispatch({ action: 'send', text }, sendKey(text)); }
+  function retryFailedTurn() { if (isRuntimeError(state) && failedTurnId(state)) return dispatch({ action: 'retry' }, retryKey()); }
   function stopTurn() { if (state?.activeTurnId) return dispatch({ action: 'interrupt' }, JSON.stringify([currentScope(), 'interrupt', state.activeTurnId])); }
   input.addEventListener('input', () => {
     const key = sendKey(input.value.trim());

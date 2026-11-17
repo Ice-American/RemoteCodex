@@ -4,7 +4,8 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { OwnerClient } from '../mobile/owner.mjs';
+import { OwnerClient, ownerSnapshotReady, ownerSnapshotRuntimeError, ownerSnapshotRetryable,
+  retryableFailedTurnId } from '../mobile/owner.mjs';
 import { OWNER_METHODS, OWNER_SUPPORTED_VERSIONS, readOwnerProtocols } from '../mobile/protocols.mjs';
 
 const threadId = '11111111-1111-4111-8111-111111111111';
@@ -15,6 +16,11 @@ versions[OWNER_METHODS.stream] = 11;
 const idle = () => ({ id: threadId, cwd: '/test/workspace', resumeState: 'resumed', threadRuntimeStatus: { type: 'idle' }, turns: [], requests: [] });
 const running = (turnId = 'turn-1') => ({ ...idle(), threadRuntimeStatus: { type: 'active', activeFlags: [] },
   turns: [{ turnId, status: 'inProgress', items: [] }] });
+const failed = (turnId = 'failed-turn') => ({ ...idle(), threadRuntimeStatus: { type: 'systemError' },
+  turns: [{ turnId, status: 'failed', items: [{ type: 'userMessage', text: 'Original user text must not be replayed' }] }],
+  unconfirmedTurnSubmissions: [] });
+const retryOptions = (client, options = {}) => ({ operationId: 'retry-operation', expectedOwner: 'owner-1',
+  expectedGeneration: client.generation, expectedFailedTurnId: 'failed-turn', ...options });
 
 class FakePipe extends EventEmitter {
   constructor() {
@@ -138,6 +144,42 @@ test('readiness retains the first needs_resume snapshot until a delayed resumed 
   ready.state.cwd = '/caller-only';
   assert.equal(client.snapshot(threadId).state.cwd, '/test/workspace');
   assert.equal(pipe.writes.length, 0);
+});
+
+test('a resumed system error is a loaded owner failure and retains the live snapshot', async t => {
+  const { client, pipe, options } = await fixture(t);
+  pipe.state = { ...idle(), threadRuntimeStatus: { type: 'systemError' },
+    turns: [{ turnId: 'failed-turn', status: 'failed', items: [] }] };
+  await assert.rejects(client.waitForReady(threadId), error => {
+    assert.equal(error.code, 'OWNER_RUNTIME_ERROR');
+    assert.equal(error.snapshot.owner, pipe.owner);
+    assert.equal(error.snapshot.state.resumeState, 'resumed');
+    error.snapshot.state.cwd = '/caller-only';
+    return true;
+  });
+  assert.equal(client.snapshot(threadId).state.cwd, '/test/workspace');
+  assert.equal(client.supports(threadId, 'start'), false);
+  assert.equal(client.supports(threadId, 'steer'), false);
+  await assert.rejects(client.sendText(threadId, 'Must not dispatch', options), /not resumed|runtime state/);
+  await assert.rejects(client.requestToOwner(threadId, 'start', { turnStart: { request: { threadId, input: [] } } }, options), /not resumed|runtime state/);
+  assert.equal(pipe.writes.length, 0);
+});
+
+test('retry projection uses the current failed turn from native turn history without treating errors as ready', () => {
+  const snapshot = { activeTurnId: null, status: { type: 'unknown', confirmed: false }, state: failed() };
+  delete snapshot.state.turns;
+  snapshot.state.turnHistory = { history: { entitiesByKey: {
+    newest: { turnId: 'latest-failure', turnStartedAtMs: 200, status: 'failed' },
+    oldest: { turnId: 'old-failure', turnStartedAtMs: 100, status: 'failed' },
+  } } };
+  assert.equal(ownerSnapshotReady(snapshot), false);
+  assert.equal(ownerSnapshotRuntimeError(snapshot), true);
+  assert.equal(ownerSnapshotRetryable(snapshot), true);
+  assert.equal(retryableFailedTurnId(snapshot), 'latest-failure');
+  delete snapshot.state.unconfirmedTurnSubmissions;
+  assert.equal(retryableFailedTurnId(snapshot), 'latest-failure', 'Desktop deletes the empty submissions field');
+  snapshot.state.turnHistory.history.entitiesByKey.newest.status = 'completed';
+  assert.equal(retryableFailedTurnId(snapshot), null, 'an old failed turn must not become the current retry target');
 });
 
 test('a competing fresh read retains a readiness patch base and still requires a later stream observation', async t => {
@@ -458,6 +500,123 @@ test('idle text is sent once to the same native owner without any queue call', a
   assert.equal((await client.sendText(threadId, 'Continue this task', options)).deduplicated, true);
   assert.equal(pipe.writes.length, 1);
   await assert.rejects(client.sendText(threadId, 'Different task', options), /another message/);
+});
+
+test('retry uses the native empty-turn trigger once and never repeats historical user text', async t => {
+  const { client, pipe } = await fixture(t);
+  pipe.state = failed(); await client.freshSnapshot(threadId);
+  const options = retryOptions(client);
+  assert.equal(client.supports(threadId, 'retry'), true);
+  const result = await client.retryFailedTurn(threadId, options);
+  assert.equal(result.status, 'submitted');
+  assert.equal(result.turnId, 'new-turn');
+  assert.equal(result.failedTurnId, 'failed-turn');
+  assert.equal(pipe.writes[0].method, OWNER_METHODS.start);
+  const request = pipe.writes[0].params.turnStart.request;
+  assert.equal(request.threadId, threadId);
+  assert.equal(request.turnTrigger, 'capacity_retry_manual');
+  assert.equal(request.clientUserMessageId, options.operationId);
+  assert.deepEqual(request.input, []);
+  assert.doesNotMatch(JSON.stringify(pipe.writes), /Original user text/);
+  client.close();
+  assert.equal((await client.retryFailedTurn(threadId, options)).deduplicated, true);
+  assert.equal(pipe.writes.length, 1);
+  await assert.rejects(client.retryFailedTurn(threadId, { ...options, expectedFailedTurnId: 'different-turn' }), /another/);
+});
+
+test('retry rejects changed owner, generation, failed turn, and every nonfailed or unconfirmed state', async t => {
+  const cases = [
+    state => { state.resumeState = 'needs_resume'; },
+    state => { state.resumeState = 'resuming'; },
+    state => { state.threadRuntimeStatus = { type: 'unknown' }; },
+    state => { state.threadRuntimeStatus = { type: 'idle' }; },
+    state => { state.threadRuntimeStatus = { type: 'active', activeFlags: [] }; },
+    state => { state.turns.at(-1).status = 'completed'; },
+    state => { state.turns.at(-1).status = 'interrupted'; },
+    state => { state.turns.push({ turnId: 'newer-turn', status: 'completed', items: [] }); },
+    state => { state.turns.unshift({ turnId: 'active-turn', status: 'inProgress', items: [] }); },
+    state => { state.unconfirmedTurnSubmissions = [{ id: 'unknown-submission' }]; },
+    state => { state.unconfirmedTurnSubmissions = {}; },
+  ];
+  for (const mutate of cases) {
+    const { client, pipe } = await fixture(t);
+    pipe.state = failed(); mutate(pipe.state); await client.freshSnapshot(threadId);
+    assert.equal(client.supports(threadId, 'retry'), false);
+    await assert.rejects(client.retryFailedTurn(threadId, retryOptions(client)));
+    assert.equal(pipe.writes.length, 0);
+  }
+  for (const options of [ { expectedOwner: 'old-owner' }, { expectedGeneration: 0 },
+    { expectedFailedTurnId: 'older-turn' }, { expectedGeneration: undefined } ]) {
+    const { client, pipe } = await fixture(t);
+    pipe.state = failed(); await client.freshSnapshot(threadId);
+    await assert.rejects(client.retryFailedTurn(threadId, retryOptions(client, options)), /changed|required/);
+    assert.equal(pipe.writes.length, 0);
+  }
+});
+
+test('retry requires live input permission and the observed start protocol', async t => {
+  for (const unavailable of ['input', 'version', 'subscription']) {
+    const { client, pipe } = await fixture(t);
+    pipe.state = failed();
+    if (unavailable === 'input') pipe.acceptsInput = false;
+    await client.freshSnapshot(threadId);
+    if (unavailable === 'version') client.protocolVersions = { ...versions, [OWNER_METHODS.start]: 3 };
+    if (unavailable === 'subscription') client.unfollow(threadId);
+    assert.equal(client.supports(threadId, 'retry'), false);
+    await assert.rejects(client.retryFailedTurn(threadId, retryOptions(client)));
+    assert.equal(pipe.writes.length, 0);
+  }
+});
+
+test('concurrent retry and unknown acknowledgement retain one persistent dispatch fence', async t => {
+  const persisted = [], { client, pipe } = await fixture(t, { onOperation: value => persisted.push(value) });
+  pipe.state = failed(); await client.freshSnapshot(threadId);
+  let reject;
+  pipe.mutate = () => new Promise((_, fail) => { reject = fail; });
+  const options = retryOptions(client), first = client.retryFailedTurn(threadId, options);
+  assert.equal((await client.retryFailedTurn(threadId, options)).deduplicated, true);
+  assert.equal(pipe.writes.length, 1);
+  assert.equal(persisted[0].status, 'dispatched');
+  assert.equal(persisted[0].failedTurnId, 'failed-turn');
+  reject(Error('Native owner response timed out'));
+  assert.equal((await first).status, 'unknown');
+  client.close();
+  assert.equal((await client.retryFailedTurn(threadId, options)).status, 'unknown');
+  assert.equal(pipe.writes.length, 1);
+});
+
+test('retry validates the native start acknowledgement owner, method, thread and new turn', async t => {
+  const cases = [
+    value => { value.handledByClientId = 'another-owner'; },
+    value => { value.method = OWNER_METHODS.steer; },
+    value => { value.result.result.turn.threadId = otherId; },
+    value => { delete value.result.result.turn.id; },
+    value => { value.result.result.turn.id = 'failed-turn'; },
+  ];
+  for (const damage of cases) {
+    const { client, pipe } = await fixture(t);
+    pipe.state = failed(); await client.freshSnapshot(threadId);
+    pipe.mutate = async () => {
+      const value = { type: 'response', resultType: 'success', method: OWNER_METHODS.start, handledByClientId: pipe.owner,
+        result: { result: { turn: { id: 'new-turn', threadId } } } };
+      damage(value); return value;
+    };
+    assert.equal((await client.retryFailedTurn(threadId, retryOptions(client))).status, 'unknown');
+    assert.equal(pipe.writes.length, 1);
+  }
+});
+
+test('retry checks the exact failed state again after persisting its dispatch fence', async t => {
+  let pipe;
+  const f = await fixture(t, { onOperation: value => {
+    if (value.status === 'dispatched') {
+      pipe.state = failed('newer-failed-turn'); pipe.snapshot();
+    }
+  } });
+  pipe = f.pipe; pipe.state = failed(); await f.client.freshSnapshot(threadId);
+  const result = await f.client.retryFailedTurn(threadId, retryOptions(f.client));
+  assert.equal(result.status, 'unknown');
+  assert.equal(pipe.writes.length, 0);
 });
 
 test('running text requires an explicit steer and binds the acknowledged turn', async t => {

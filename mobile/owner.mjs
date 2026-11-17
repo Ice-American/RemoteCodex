@@ -2,7 +2,7 @@
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { Pipe } from '../src/transport.mjs';
-import { applyPatches, activeTurnId, runtimeStatus } from '../src/state.mjs';
+import { applyPatches, activeTurnId, liveTurns, runtimeStatus } from '../src/state.mjs';
 import { composeQueuedMessage } from '../src/queue.mjs';
 import { OWNER_METHODS, OWNER_SUPPORTED_VERSIONS, OWNER_HANDSHAKE_VERSION } from './protocols.mjs';
 
@@ -23,6 +23,26 @@ const failure = (message, code = 'OWNER_UNAVAILABLE') => Object.assign(Error(mes
 export function ownerSnapshotReady(snapshot) {
   return snapshot?.status?.confirmed === true && snapshot.state?.resumeState === 'resumed' &&
     ['idle', 'active'].includes(snapshot.state?.threadRuntimeStatus?.type);
+}
+
+// A native turn failure is already loaded. It permits only the separate,
+// empty-turn retry path and must never authorize ordinary text or approvals.
+export function ownerSnapshotRuntimeError(snapshot) {
+  return snapshot?.state?.resumeState === 'resumed' &&
+    snapshot.state.threadRuntimeStatus?.type === 'systemError';
+}
+export function retryableFailedTurnId(snapshot) {
+  if (!ownerSnapshotRuntimeError(snapshot) || snapshot.activeTurnId != null) return null;
+  const submissions = snapshot.state.unconfirmedTurnSubmissions;
+  if (submissions != null && (!Array.isArray(submissions) || submissions.length)) return null;
+  const turns = liveTurns(snapshot.state);
+  if (!Array.isArray(turns) || turns.some(turn => turn?.status === 'inProgress')) return null;
+  const latest = turns.at(-1);
+  return latest?.status === 'failed' && typeof latest.turnId === 'string' && latest.turnId
+    ? latest.turnId : null;
+}
+export function ownerSnapshotRetryable(snapshot) {
+  return retryableFailedTurnId(snapshot) != null;
 }
 
 export class OwnerClient extends EventEmitter {
@@ -231,6 +251,15 @@ export class OwnerClient extends EventEmitter {
   }
   supports(threadId, key) {
     if (!this.connected || !this.pipe || this.pipe.socket?.destroyed) return false;
+    if (key === 'retry') {
+      try {
+        this.version('start');
+        const snapshot = this.snapshots.get(threadId);
+        this.#assertRetry(threadId, { expectedOwner: snapshot?.owner, expectedGeneration: snapshot?.generation,
+          expectedFailedTurnId: retryableFailedTurnId(snapshot) });
+        return true;
+      } catch { return false; }
+    }
     try { this.version(key); } catch { return false; }
     if (!WRITES.has(key)) return true;
     const owner = this.owners.get(threadId), snapshot = this.snapshots.get(threadId);
@@ -309,6 +338,10 @@ export class OwnerClient extends EventEmitter {
         if (!snapshot || snapshot.sequence <= minimum || snapshot.generation !== record.generation ||
             snapshot.owner !== owner?.owner || !this.nativeSubscriptions.has(threadId)) return false;
         if (ownerSnapshotReady(snapshot)) { finish(null, snapshot); return true; }
+        if (ownerSnapshotRuntimeError(snapshot)) {
+          finish(Object.assign(failure('Desktop thread is loaded but its runtime reported an error', 'OWNER_RUNTIME_ERROR'),
+            { snapshot: clone(snapshot) })); return true;
+        }
         if (['failed', 'error'].includes(snapshot.state?.resumeState)) {
           finish(failure('Desktop thread failed to resume', 'OWNER_RESUME_FAILED')); return true;
         }
@@ -438,16 +471,33 @@ export class OwnerClient extends EventEmitter {
     if (!ownerSnapshotReady(snapshot)) throw failure('The Desktop thread has not resumed with a confirmed runtime state');
     return snapshot;
   }
+  #assertRetry(threadId, { expectedOwner, expectedGeneration, expectedFailedTurnId } = {}) {
+    this.currentConnection();
+    const owner = this.owners.get(threadId), snapshot = this.snapshots.get(threadId);
+    if (!snapshot || !owner || !this.nativeSubscriptions.has(threadId) ||
+        snapshot.generation !== this.generation || owner.generation !== this.generation || snapshot.owner !== owner.owner)
+      throw failure('A fresh live owner snapshot is required');
+    if (owner.supportsUntrustedAppInput !== true)
+      throw failure('The Desktop owner does not accept input from this client', 'INPUT_NOT_SUPPORTED');
+    if (expectedOwner !== owner.owner || expectedGeneration !== this.generation ||
+        typeof expectedFailedTurnId !== 'string' || !expectedFailedTurnId ||
+        expectedFailedTurnId !== retryableFailedTurnId(snapshot))
+      throw failure('The owner, generation or failed turn changed; review the current state', 'STALE_OWNER_STATE');
+    return snapshot;
+  }
   operation(record) {
     // A caller can persist this receipt before dispatch. Throwing prevents a write.
     this.onOperation(clone(record));
     this.operations.set(record.operationId, record);
     this.publish('operation', { operation: clone(record) });
   }
-  async requestToOwner(threadId, methodKey, params, {
+  async requestToOwner(threadId, methodKey, params, options = {}) {
+    return this.#requestToOwner(threadId, methodKey, params, options);
+  }
+  async #requestToOwner(threadId, methodKey, params, {
     operationId, expectedOwner, expectedTurnId, timeoutMs = this.timeoutMs,
     validateResponse, intentFingerprint,
-  } = {}) {
+  } = {}, retry = null) {
     if (!WRITES.has(methodKey) || !OWNER_METHODS[methodKey]) throw failure('Owner method is not writable', 'UNSUPPORTED_METHOD');
     if (!uuid(threadId) || typeof operationId !== 'string' || !/^[\w-]{8,160}$/.test(operationId))
       throw failure('A valid thread and operation ID are required');
@@ -456,7 +506,8 @@ export class OwnerClient extends EventEmitter {
         params.threadId != null && params.threadId !== threadId)
       throw failure('Owner request thread mismatch');
     const input = { ...clone(params), conversationId: threadId };
-    const fingerprint = digest([threadId, methodKey, input, expectedOwner, expectedTurnId]);
+    const fingerprint = digest([threadId, methodKey, input, expectedOwner, expectedTurnId,
+      ...(retry ? [retry.expectedGeneration, retry.expectedFailedTurnId] : [])]);
     const previous = this.operations.get(operationId);
     if (previous) {
       if (previous.fingerprint !== fingerprint) throw failure('Operation ID was already used for another request');
@@ -464,8 +515,10 @@ export class OwnerClient extends EventEmitter {
     }
     if (this.operations.size >= this.maxOperations) throw failure('Operation receipt limit reached');
     this.version(methodKey);
-    const snapshot = this.assertWrite(threadId, { expectedOwner, expectedTurnId });
-    if (methodKey === 'start' && (snapshot.status.type !== 'idle' || input.turnStart?.request?.threadId !== threadId))
+    const assertSnapshot = () => retry ? this.#assertRetry(threadId, { expectedOwner, ...retry })
+      : this.assertWrite(threadId, { expectedOwner, expectedTurnId });
+    const snapshot = assertSnapshot();
+    if (methodKey === 'start' && (input.turnStart?.request?.threadId !== threadId || (!retry && snapshot.status.type !== 'idle')))
       throw failure('Start requires the same idle Desktop thread');
     if (methodKey === 'steer' && snapshot.status.type !== 'running')
       throw failure('Steer requires the currently running turn');
@@ -473,11 +526,12 @@ export class OwnerClient extends EventEmitter {
       throw failure('Interrupt requires a confirmed active turn');
     const record = { operationId, fingerprint, threadId, methodKey, owner: expectedOwner,
       expectedTurnId, generation: this.generation, status: 'dispatched',
+      ...(retry ? { failedTurnId: retry.expectedFailedTurnId } : {}),
       ...(intentFingerprint ? { intentFingerprint } : {}) };
     this.operation(record);
     // No await occurs between the final state check and sending the one request.
     try {
-      this.assertWrite(threadId, { expectedOwner, expectedTurnId });
+      assertSnapshot();
       const response = await this.#rpc(methodKey, input, { targetClientId: expectedOwner, timeoutMs });
       // Current Desktop puts the method on the response envelope. Some older
       // owners repeat it inside result; if present that copy must also match.
@@ -491,6 +545,7 @@ export class OwnerClient extends EventEmitter {
       const result = response.result?.result;
       const turnId = result?.turn?.id ?? result?.turnId ?? result?.interruptedTurnId ?? null;
       if (methodKey === 'start' && (typeof turnId !== 'string' || !turnId)) throw failure('Start acknowledgement lacks a turn ID');
+      if (retry && turnId === retry.expectedFailedTurnId) throw failure('Retry acknowledgement did not identify a new turn');
       if (methodKey === 'steer' && turnId !== expectedTurnId) throw failure('Steer acknowledgement belongs to another turn');
       if (methodKey !== 'start' && expectedTurnId != null && turnId != null && turnId !== expectedTurnId)
         throw failure('Owner acknowledgement belongs to another turn');
@@ -513,6 +568,22 @@ export class OwnerClient extends EventEmitter {
       try { this.operation(unknown); } catch {}
       return clone(unknown);
     }
+  }
+  async retryFailedTurn(threadId, { operationId, expectedOwner, expectedGeneration, expectedFailedTurnId } = {}) {
+    const intentFingerprint = digest([threadId, 'retry', expectedOwner, expectedGeneration, expectedFailedTurnId]);
+    const prior = this.operations.get(operationId);
+    if (prior) {
+      if (prior.intentFingerprint !== intentFingerprint) throw failure('Operation ID was already used for another request');
+      return { ...clone(prior), deduplicated: true };
+    }
+    this.#assertRetry(threadId, { expectedOwner, expectedGeneration, expectedFailedTurnId });
+    // Desktop's error Retry starts an empty turn. Replaying the failed user
+    // text would create a different request and could duplicate tool effects.
+    // Omitted mode/context keep Desktop's existing resumed thread settings.
+    return this.#requestToOwner(threadId, 'start', { turnStart: { request: {
+      threadId, turnTrigger: 'capacity_retry_manual', input: [], clientUserMessageId: operationId,
+    } } }, { operationId, expectedOwner, expectedTurnId: null, intentFingerprint },
+    { expectedGeneration, expectedFailedTurnId });
   }
   async sendText(threadId, text, { operationId, expectedOwner, expectedTurnId, mode } = {}) {
     if (typeof text !== 'string' || !text.trim() || text.length > 20000) throw failure('Text must contain 1–20000 characters');

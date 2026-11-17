@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { gzipSync } from 'node:zlib';
-import { OwnerClient, ownerSnapshotReady } from './owner.mjs';
+import { OwnerClient, ownerSnapshotReady, ownerSnapshotRuntimeError, retryableFailedTurnId } from './owner.mjs';
+import { liveTurns } from '../src/state.mjs';
 import { fetchPeer } from './peer.mjs';
 import { readOwnerProtocols } from './protocols.mjs';
 import { discoverNativeDesktop, codexHome } from './discovery.mjs';
@@ -124,24 +125,35 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
     } finally { release(); }
   }
   async function view(id, live, error = null, knownMetadata) {
-    const ready = ownerSnapshotReady(live) && client?.connected === true && live.generation === client.generation &&
+    const sameOwner = client?.connected === true && live?.generation === client.generation &&
       client.owners.get(id)?.owner === live.owner;
+    const ready = sameOwner && ownerSnapshotReady(live);
+    // A failed native turn already has an owner. Reopening the window cannot
+    // remove its error; expose only the separately fenced empty-turn retry.
+    const runtimeFailed = sameOwner && ownerSnapshotRuntimeError(live);
+    const connected = ready || runtimeFailed;
+    const failedTurnId = runtimeFailed ? retryableFailedTurnId(live) : null;
+    const failed = runtimeFailed ? liveTurns(live.state).at(-1) : null;
+    const runtimeError = runtimeFailed ? { failedTurnId,
+      message: typeof failed?.error?.message === 'string' && failed.error.message.trim()
+        ? failed.error.message.slice(0, 4000) : '上一轮运行失败，请在原聊天核对原因。' } : null;
     const metadata = knownMetadata === undefined ? ready && live?.state?.title ? null : await catalog.get(id) : knownMetadata;
     const messages = live ? visibleTurns(live.state, 100, { media, threadId: id }) : (await catalog.read(id, 80, { media })).messages;
-    const status = live?.status?.type ?? 'unknown';
+    const status = runtimeFailed ? 'error' : live?.status?.type ?? 'unknown';
     const incompatible = error === 'UNSUPPORTED_METHOD';
-    const canLoad = !ready && !incompatible && client?.connected === true && !client.pipe?.socket?.destroyed && metadata?.id === id &&
+    const canLoad = !connected && !incompatible && client?.connected === true && !client.pipe?.socket?.destroyed && metadata?.id === id &&
       typeof nativeTools.openExistingThread === 'function';
-    return { host: hostId, id, title: live?.state?.title ?? metadata?.title ?? '原聊天', connected: ready,
-      connectionState: ready ? 'ready' : incompatible ? 'incompatible' : canLoad ? 'needs-load' : 'unavailable', canLoad: !!canLoad,
-      ownerConfirmed: ready, revision: ready ? live.revision : null, connectionId: ready ? String(live.generation) + ':' + live.owner : null,
-      ownerId: ready ? live.owner : null, activeTurnId: ready ? live.activeTurnId : null, status, messages,
+    return { host: hostId, id, title: live?.state?.title ?? metadata?.title ?? '原聊天', connected,
+      connectionState: ready ? 'ready' : runtimeFailed ? 'runtime-error' : incompatible ? 'incompatible' : canLoad ? 'needs-load' : 'unavailable', canLoad: !!canLoad,
+      ownerConfirmed: connected, revision: connected ? live.revision : null, connectionId: connected ? String(live.generation) + ':' + live.owner : null,
+      ownerId: connected ? live.owner : null, activeTurnId: ready ? live.activeTurnId : null, status, messages, runtimeError,
       questions: ready ? questionViews(live.state) : [], approvals: ready ? approvalViews(live.state) : [],
       capabilities: { send: ready && status === 'idle' && client.supports(id, 'start'),
         steer: ready && status === 'running' && client.supports(id, 'steer'),
         answer: ready && (client.supports(id, 'userInput') || client.supports(id, status === 'idle' ? 'start' : 'steer')),
         approve: ready && ['commandApproval', 'fileApproval', 'permissions', 'mcpElicitation'].some(k => client.supports(id, k)),
-        interrupt: ready && status === 'running' && client.supports(id, 'interrupt') },
+        interrupt: ready && status === 'running' && client.supports(id, 'interrupt'),
+        retry: runtimeFailed && !!failedTurnId && client.supports(id, 'retry') },
       source: live ? live.source : 'local-history-only', error };
   }
   async function loadExisting(id, signal) {
@@ -172,6 +184,9 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       const current = record;
       record.promise = Promise.resolve().then(async () => {
         if (controller.signal.aborted) throw controller.signal.reason;
+        const known = owner.snapshot(id);
+        if (known?.generation === connection.generation && owner.owners.get(id)?.owner === known.owner && ownerSnapshotRuntimeError(known))
+          throw Object.assign(loadError('原聊天已加载，但上一轮运行失败，请使用重试上一轮。', 'OWNER_RUNTIME_ERROR'), { snapshot: known });
         // Opening is navigation only. Its ACK cannot establish a live owner,
         // and this path never sends a turn, answer, approval or interrupt.
         await cancellable(nativeTools.openExistingThread(id, { signal: controller.signal }), controller.signal);
@@ -185,7 +200,7 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
         return { status: 'confirmed', message: '原聊天已加载，可以继续对话。', state: await view(id, snapshot, null, metadata),
           load: { phase: 'ready', elapsedMs: Date.now() - current.startedAt } };
       }).catch(async error => ({ status: 'rejected', message: error?.message ?? '暂时无法加载原聊天，请稍后重试。',
-        state: await view(id, null, error?.code ?? 'LOAD_UNAVAILABLE', metadata),
+        state: await view(id, error?.snapshot ?? null, error?.code ?? 'LOAD_UNAVAILABLE', metadata),
         load: { phase: current.phase, elapsedMs: Date.now() - current.startedAt, code: error?.code ?? 'LOAD_UNAVAILABLE' } }))
         .finally(() => {
           current.settled = true; clearTimeout(timeout); connection.signal.removeEventListener('abort', lost);
@@ -227,7 +242,8 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
   async function performAction(input, signal) {
     const { threadId: id, operationId } = input;
     const apiFingerprint = requestFingerprint({ host: hostId, id, action: input.action,
-      text: input.text, requestId: input.requestId, answers: input.answers, choice: input.choice });
+      text: input.text, requestId: input.requestId, answers: input.answers, choice: input.choice,
+      ...(input.action === 'retry' ? { failedTurnId: input.failedTurnId } : {}) });
     const previous = journal.records.get(operationId);
     if (previous) {
       if (previous.apiFingerprint && previous.apiFingerprint !== apiFingerprint) throw Object.assign(Error('此发送标识已用于不同内容'), { notDispatched: true });
@@ -246,7 +262,20 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       input.activeTurnId !== snapshot.activeTurnId) throw Error('原会话状态已变化，请查看最新状态后再操作');
     const options = { operationId, expectedOwner: snapshot.owner, expectedTurnId: snapshot.activeTurnId };
     let result, fence = null;
-    if (input.action === 'send') result = await owner.sendText(id, input.text, { ...options, mode: snapshot.status.type === 'idle' ? 'start' : 'steer' });
+    if (input.action === 'retry') {
+      if (Object.keys(input).some(key => !['host', 'threadId', 'operationId', 'action', 'connectionId', 'revision', 'ownerId', 'activeTurnId', 'failedTurnId'].includes(key)))
+        throw Error('重试上一轮不能包含草稿或其他操作');
+      if (!retryableFailedTurnId(snapshot) || input.failedTurnId !== retryableFailedTurnId(snapshot))
+        throw Error('失败轮次已变化或尚未确认，请刷新原聊天后再操作');
+      fence = requestFingerprint([hostId, id, 'retry', input.failedTurnId]);
+      if ([...journal.records.values()].some(r => r.semanticFence === fence && ['dispatched', 'unknown', 'submitted'].includes(r.status)))
+        throw Error('这一失败轮已请求重试，请核对原聊天状态，未重复派发');
+      // Persist this failure identity before dispatch. New operation IDs or a
+      // page reload must not bypass an earlier retry with an unknown outcome.
+      operationContexts.set(operationId, { apiFingerprint, semanticFence: fence });
+      result = await owner.retryFailedTurn(id, { operationId, expectedOwner: snapshot.owner,
+        expectedGeneration: snapshot.generation, expectedFailedTurnId: input.failedTurnId });
+    } else if (input.action === 'send') result = await owner.sendText(id, input.text, { ...options, mode: snapshot.status.type === 'idle' ? 'start' : 'steer' });
     else if (input.action === 'answer' || input.action === 'approval') {
       const reply = input.action === 'answer' ? buildQuestionReply(snapshot.state, input.requestId, input.answers) :
         buildApprovalReply(snapshot.state, input.requestId, input.choice);

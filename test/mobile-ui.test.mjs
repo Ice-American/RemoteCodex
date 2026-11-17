@@ -73,6 +73,9 @@ const thread = (overrides = {}) => ({
   activeTurnId: null, status: 'idle', messages: [{ id: 'a1', role: 'assistant', text: '原会话回复' }],
   questions: [], approvals: [], capabilities: { send: true, steer: true, answer: true, approve: true, interrupt: true }, ...overrides,
 });
+const runtimeErrorThread = (overrides = {}) => thread({ connectionState: 'runtime-error', canLoad: false,
+  status: 'error', runtimeError: { failedTurnId: 'failed-turn-1', message: '模型服务暂时不可用：upstream unavailable' },
+  capabilities: { retry: true, send: false, steer: false, answer: false, approve: false, interrupt: false }, ...overrides });
 function mount(t, api = {}, options = {}) {
   const dom = fixtureDOM(), view = mountMobileUI(dom.root, { ...options, api, storage: dom.storage }); t.after(() => view.destroy()); return { ...dom, view };
 }
@@ -213,6 +216,171 @@ test('writes require the real connection owner and snapshot; running sends use s
   assert.deepEqual(payload, { host: 'mac', threadId: state.id, operationId: 'operation', connectionId: 'connection-1', revision: 1, ownerId: 'desktop-owner', activeTurnId: 'turn-1', action: 'send', text: '补充' });
   for (const patch of [{ ownerConfirmed: false }, { connected: false }, { connectionId: null }, { ownerId: null }, { revision: null }, { capabilities: { send: true, steer: false } }]) assert.equal(canAct({ ...state, ...patch }, 'send'), false);
   assert.equal(canAct(thread(), 'interrupt'), false);
+});
+
+test('runtime retry is an independent owner capability and carries only its failed turn identity', () => {
+  const state = runtimeErrorThread();
+  assert.equal(canAct(state, 'retry'), true);
+  const payload = buildActionPayload(state, { operationId: 'retry-operation', action: 'retry', failedTurnId: 'forged-turn',
+    text: '必须保留的当前草稿', requestId: 'old-request', answers: { q: ['wrong'] }, choice: 'allow', ownerId: 'forged-owner' });
+  assert.deepEqual(payload, { host: 'mac', threadId: state.id, operationId: 'retry-operation', connectionId: 'connection-1',
+    revision: 1, ownerId: 'desktop-owner', activeTurnId: null, action: 'retry', failedTurnId: 'failed-turn-1' });
+  for (const patch of [{ ownerConfirmed: false }, { connected: false }, { connectionId: null }, { ownerId: null },
+    { revision: null }, { runtimeError: null }, { runtimeError: { failedTurnId: '', message: 'error' } },
+    { capabilities: { retry: false } }, { connectionState: 'ready' }]) assert.equal(canAct({ ...state, ...patch }, 'retry'), false);
+  for (const action of ['send', 'steer', 'approval', 'answer', 'interrupt']) {
+    assert.equal(canAct(runtimeErrorThread({ activeTurnId: 'obsolete-turn', capabilities: { retry: true, send: true,
+      steer: true, approve: true, answer: true, interrupt: true } }), action), false, action);
+  }
+});
+
+test('a loaded runtime error shows the real failure and never offers to load the original chat', t => {
+  const { root, view } = mount(t, { action: async () => ({ status: 'submitted' }) });
+  view.update(runtimeErrorThread()); type(root, '发生错误后仍要保留的草稿');
+  assert.equal(one(root, 'connection-label').textContent, '上一轮运行失败');
+  assert.equal(one(root, 'runtime-error-panel').hidden, false);
+  assert.equal(one(root, 'runtime-error-message').textContent, '模型服务暂时不可用：upstream unavailable');
+  assert.equal(one(root, 'load-thread-panel').hidden, true);
+  assert.equal(one(root, 'retry-turn-button').textContent, '重试上一轮');
+  assert.equal(one(root, 'retry-turn-button').disabled, false);
+  assert.equal(one(root, 'send-button').disabled, true);
+  assert.equal(one(root, 'message-input').value, '发生错误后仍要保留的草稿');
+});
+
+test('explicit runtime retry sends one retry POST without sending, clearing or copying the draft', async t => {
+  const pending = deferred(), calls = [], state = runtimeErrorThread();
+  const { root, view } = mount(t, { action: body => { calls.push(body); return pending.promise; }, getThread: async () => state });
+  view.update(state); type(root, '这条草稿不是重试内容');
+  one(root, 'retry-turn-button').click(); one(root, 'retry-turn-button').click(); one(root, 'composer').fire('submit');
+  assert.equal(calls.length, 1); assert.equal(calls[0].action, 'retry'); assert.equal(calls[0].failedTurnId, 'failed-turn-1');
+  assert.equal(calls[0].host, 'mac'); assert.equal(calls[0].threadId, state.id);
+  for (const field of ['text', 'requestId', 'answers', 'choice']) assert.equal(Object.hasOwn(calls[0], field), false, field);
+  assert.equal(one(root, 'message-input').value, '这条草稿不是重试内容'); assert.equal(byClass(root, 'message-user').length, 0);
+  pending.resolve({ status: 'confirmed', state: thread({ revision: 2, title: '回执不能替代真实快照' }) }); await tick(); await tick();
+  assert.equal(calls.length, 1); assert.equal(one(root, 'message-input').value, '这条草稿不是重试内容');
+  assert.equal(one(root, 'thread-title').textContent, state.title); assert.equal(byClass(root, 'message-user').length, 0);
+});
+
+for (const receiptStatus of ['unknown', 'submitted']) test(`runtime retry ${receiptStatus} survives refresh and page rebuild without a new POST or operation ID`, async t => {
+  const calls = [], state = runtimeErrorThread(), api = { action: async body => { calls.push(body); return { status: receiptStatus }; }, getThread: async () => state };
+  const { root, storage, view } = mount(t, api);
+  view.update(state); type(root, '刷新后也保留的草稿'); one(root, 'retry-turn-button').click(); await tick(); await tick();
+  const operationId = calls[0].operationId;
+  await view.refresh(); one(root, 'retry-turn-button').click(); assert.equal(calls.length, 1); view.destroy();
+  const reopened = mountMobileUI(root, { api, storage }); t.after(() => reopened.destroy()); reopened.update(state);
+  assert.equal(one(root, 'message-input').value, '刷新后也保留的草稿'); assert.equal(one(root, 'retry-turn-button').disabled, true);
+  one(root, 'retry-turn-button').click(); await reopened.refresh(); await tick();
+  assert.equal(calls.length, 1); assert.equal(calls[0].operationId, operationId);
+  const records = JSON.parse(storage.getItem('codex-mobile-operation-guards'));
+  assert.ok(records.some(([, attempt]) => attempt.operationId === operationId && attempt.status === receiptStatus));
+  assert.ok(!storage.getItem('codex-mobile-operation-guards').includes('刷新后也保留的草稿'));
+});
+
+test('a page rebuild fences a pending runtime retry before its original receipt arrives', async t => {
+  const pending = deferred(), calls = [], state = runtimeErrorThread();
+  const api = { action: body => { calls.push(body); return pending.promise; }, getThread: async () => state };
+  const { root, storage, view } = mount(t, api);
+  view.update(state); type(root, '请求未完成时的草稿'); one(root, 'retry-turn-button').click(); view.destroy();
+  const reopened = mountMobileUI(root, { api, storage }); t.after(() => reopened.destroy()); reopened.update(state);
+  assert.equal(one(root, 'retry-turn-button').disabled, true); one(root, 'retry-turn-button').click(); await reopened.refresh();
+  pending.resolve({ status: 'submitted' }); await tick(); await tick();
+  one(root, 'retry-turn-button').click(); assert.equal(calls.length, 1);
+  assert.equal(one(root, 'message-input').value, '请求未完成时的草稿'); assert.equal(one(root, 'retry-turn-button').disabled, true);
+});
+
+test('a runtime retry guard cannot block an explicitly sent draft after a fresh ready snapshot', async t => {
+  const calls = []; let state = runtimeErrorThread();
+  const { root, view } = mount(t, { getThread: async () => state,
+    action: async body => { calls.push(body); return { status: body.action === 'retry' ? 'unknown' : 'confirmed' }; } });
+  view.update(state); type(root, '恢复正常后才发送'); one(root, 'retry-turn-button').click(); await tick(); await tick();
+  assert.equal(one(root, 'message-input').value, '恢复正常后才发送');
+  state = thread({ connectionState: 'ready', revision: 2 }); view.update(state);
+  assert.equal(one(root, 'send-button').disabled, false); one(root, 'composer').fire('submit'); await tick(); await tick();
+  assert.deepEqual(calls.map(call => call.action), ['retry', 'send']); assert.equal(calls[1].text, '恢复正常后才发送');
+  assert.equal(one(root, 'message-input').value, '');
+});
+
+test('runtime retry waits for an explicitly confirmed owner and a fresh retry capability', t => {
+  let writes = 0;
+  const { root, view } = mount(t, { action: async () => { writes++; } });
+  for (const patch of [{ ownerConfirmed: false }, { connected: false }, { capabilities: { retry: false } }, { runtimeError: null }]) {
+    view.update(runtimeErrorThread(patch)); one(root, 'retry-turn-button').click(); assert.equal(writes, 0);
+    assert.equal(one(root, 'retry-turn-button').disabled, true);
+  }
+});
+
+test('runtime retry intent is scoped to host, chat and failed turn instead of the retained draft', async t => {
+  const calls = []; let state = runtimeErrorThread();
+  const { root, view } = mount(t, { getThreads: async () => ({ threads: [] }),
+    getThread: async (host, id) => ({ ...state, host, id }), action: async body => { calls.push(body); return { status: 'unknown' }; } });
+  view.update(state); type(root, '同一草稿'); one(root, 'retry-turn-button').click(); await tick(); await tick();
+  type(root, '修改草稿不能创建重试意图'); one(root, 'retry-turn-button').click(); assert.equal(calls.length, 1);
+  state = runtimeErrorThread({ revision: 2, runtimeError: { failedTurnId: 'failed-turn-2', message: '第二轮错误' } });
+  view.update(state); one(root, 'retry-turn-button').click(); await tick(); await tick(); assert.equal(calls.length, 2);
+  await view.selectThread('another-mac-chat'); one(root, 'retry-turn-button').click(); await tick(); await tick();
+  await view.selectHost('windows'); await view.selectThread('another-mac-chat'); one(root, 'retry-turn-button').click(); await tick(); await tick();
+  assert.equal(calls.length, 4); assert.equal(new Set(calls.map(call => call.operationId)).size, 4);
+  assert.deepEqual(calls.map(call => [call.host, call.threadId, call.failedTurnId]), [
+    ['mac', thread().id, 'failed-turn-1'], ['mac', thread().id, 'failed-turn-2'],
+    ['mac', 'another-mac-chat', 'failed-turn-2'], ['windows', 'another-mac-chat', 'failed-turn-2'],
+  ]);
+});
+
+test('runtime errors keep their read connection and SSE can restore active and idle actions', async t => {
+  const timers = fakeClock(), streams = []; let reads = 0, writes = 0;
+  const { root, view } = mount(t, { getThread: async () => { reads++; return runtimeErrorThread(); },
+    subscribe: (_host, _id, callbacks) => { const stream = { callbacks, closed: 0 }; streams.push(stream); return () => stream.closed++; },
+    action: async () => { writes++; } }, { timers });
+  await view.selectThread(thread().id); type(root, '连接保留期间的草稿');
+  assert.equal(streams.length, 1); assert.equal(reads, 1); assert.equal(one(root, 'connection-label').textContent, '上一轮运行失败');
+  for (let index = 0; index < 4; index++) { await timers.advance(15000); streams[0].callbacks.onHeartbeat(); }
+  assert.equal(reads, 1); assert.equal(streams.length, 1); assert.equal(streams[0].closed, 0);
+  streams[0].callbacks.onState(runtimeErrorThread({ revision: 2, runtimeError: { failedTurnId: 'failed-turn-2', message: '新的真实错误' } }));
+  await tick(); assert.equal(reads, 1); assert.equal(streams[0].closed, 0);
+  assert.equal(one(root, 'runtime-error-message').textContent, '新的真实错误');
+  streams[0].callbacks.onState(thread({ connectionState: 'ready', revision: 3, status: 'running', activeTurnId: 'active-turn' }));
+  assert.equal(one(root, 'runtime-error-panel').hidden, true); assert.equal(one(root, 'send-button').disabled, false);
+  assert.equal(one(root, 'send-button').textContent, '补充方向'); assert.equal(one(root, 'stop-button').disabled, false);
+  streams[0].callbacks.onState(thread({ connectionState: 'ready', revision: 4, status: 'idle' }));
+  assert.equal(one(root, 'send-button').disabled, false); assert.equal(one(root, 'send-button').textContent, '发送');
+  assert.equal(one(root, 'message-input').value, '连接保留期间的草稿'); assert.equal(reads, 1); assert.equal(writes, 0);
+});
+
+test('a late failed-turn retry receipt cannot navigate or refresh a different current chat', async t => {
+  const pending = deferred(), calls = [], reads = [];
+  const { root, view } = mount(t, { getThread: async (host, id) => { reads.push([host, id]); return id === thread().id ? runtimeErrorThread() : thread({ host, id, title: '当前聊天' }); },
+    action: body => { calls.push(body); return pending.promise; } });
+  view.update(runtimeErrorThread()); type(root, '失败聊天草稿'); one(root, 'retry-turn-button').click();
+  await view.selectThread('current-chat'); type(root, '当前聊天草稿');
+  pending.resolve({ status: 'submitted', message: '旧失败轮已提交', state: thread({ title: '迟到的旧失败轮', revision: 99 }) }); await tick(); await tick();
+  assert.equal(one(root, 'thread-title').textContent, '当前聊天'); assert.equal(one(root, 'message-input').value, '当前聊天草稿');
+  assert.equal(one(root, 'runtime-error-panel').hidden, true); assert.ok(!one(root, 'notice').textContent.includes('旧失败轮'));
+  assert.deepEqual(reads, [['mac', 'current-chat']]); assert.equal(calls.length, 1);
+});
+
+test('a retry receipt for an older failed turn cannot refresh or lock the newly failed turn', async t => {
+  const pending = deferred(); let reads = 0;
+  const { root, view } = mount(t, { getThread: async () => { reads++; return runtimeErrorThread(); }, action: () => pending.promise });
+  view.update(runtimeErrorThread()); type(root, '仍未发送的下一条'); one(root, 'retry-turn-button').click();
+  view.update(runtimeErrorThread({ revision: 2, runtimeError: { failedTurnId: 'failed-turn-2', message: '新失败轮必须保留' } }));
+  pending.resolve({ status: 'unknown', message: '旧失败轮回执' }); await tick(); await tick();
+  assert.equal(one(root, 'runtime-error-message').textContent, '新失败轮必须保留');
+  assert.equal(one(root, 'retry-turn-button').disabled, false); assert.equal(one(root, 'message-input').value, '仍未发送的下一条');
+  assert.ok(!one(root, 'notice').textContent.includes('旧失败轮回执')); assert.equal(reads, 0);
+});
+
+for (const receiptStatus of ['unknown', 'rejected']) test(`returning to the failed chat renders its old ${receiptStatus} retry guard without another read`, async t => {
+  const pending = deferred(), reads = [], writes = [];
+  const { root, view } = mount(t, { getThread: async (host, id) => { reads.push([host, id]); return runtimeErrorThread({ host, id }); }, action: body => { writes.push(body); return pending.promise; } });
+  view.update(runtimeErrorThread()); type(root, '返回后保留的草稿'); one(root, 'retry-turn-button').click();
+  await view.selectThread('other-chat'); await view.selectThread(thread().id);
+  assert.equal(one(root, 'retry-turn-button').disabled, true); assert.equal(one(root, 'retry-turn-result').textContent, '正在提交…');
+  pending.resolve({ status: receiptStatus, message: '旧导航的回执' }); await tick(); await tick();
+  assert.equal(reads.length, 2); assert.equal(one(root, 'message-input').value, '返回后保留的草稿');
+  assert.equal(one(root, 'retry-turn-button').disabled, receiptStatus !== 'rejected');
+  assert.equal(one(root, 'retry-turn-result').textContent, '旧导航的回执');
+  assert.equal(writes.length, 1);
+  assert.ok(!one(root, 'notice').textContent.includes('旧导航的回执'));
 });
 
 test('relative API paths carry cookies and exact action JSON, with no write retry', async () => {

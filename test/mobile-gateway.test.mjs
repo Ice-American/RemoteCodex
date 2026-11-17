@@ -200,11 +200,13 @@ async function ownerRig(t, options = {}) {
     control.readStarted?.resolve(); if (control.readGate) await control.readGate.promise;
     if (!control.ready || !this.connected) throw Object.assign(Error('No live Desktop owner was found'), { code: 'OWNER_UNAVAILABLE' });
     const state = { id, title: 'Existing fixture', resumeState: control.resumeState ?? 'resumed',
-      threadRuntimeStatus: { type: control.runtimeType ?? 'idle' }, turns: control.turns ?? [], requests: [] };
+      threadRuntimeStatus: { type: control.runtimeType ?? 'idle' }, turns: control.turns ?? [], requests: [],
+      unconfirmedTurnSubmissions: control.unconfirmedTurnSubmissions ?? [] };
     if (control.omitResumeState) delete state.resumeState;
     const snapshot = { threadId: id, owner: 'fixture-owner', generation: this.generation, revision: 1, sequence: control.reads,
       activeTurnId: null, status: runtimeStatus(state), source: 'official-desktop-owner-IPC-live', state };
     this.snapshots.set(id, snapshot); this.owners.set(id, { owner: snapshot.owner, generation: this.generation, supportsUntrustedAppInput: true });
+    this.nativeSubscriptions.set(id, { generation: this.generation });
     return structuredClone(snapshot);
   });
   // This rig isolates HTTP lifetime and cancellation. The wire integration
@@ -220,6 +222,17 @@ async function ownerRig(t, options = {}) {
   const unfollow = OwnerClient.prototype.unfollow;
   t.mock.method(OwnerClient.prototype, 'unfollow', function (id) { if (this === control.owner) control.unfollows++; return unfollow.call(this, id); });
   for (const name of ['sendText', 'requestToOwner']) t.mock.method(OwnerClient.prototype, name, async () => { control.mutations++; throw Error('Task writes forbidden'); });
+  t.mock.method(OwnerClient.prototype, 'retryFailedTurn', async function (id, options) {
+    control.mutations++;
+    if (!control.retryOutcome) throw Error('Task retries forbidden');
+    (control.retries ??= []).push({ id, options });
+    const record = { operationId: options.operationId, fingerprint: hash(options.operationId), threadId: id,
+      methodKey: 'start', owner: options.expectedOwner, expectedTurnId: null, generation: this.generation, status: 'dispatched' };
+    this.operation(record); control.retryStarted?.resolve();
+    if (control.retryGate) await control.retryGate.promise;
+    const result = { ...record, status: control.retryOutcome, turnId: 'native-new-turn' };
+    this.operation(result); return result;
+  });
   const nativeTools = { capability: async () => ({ supported: false }), statuses: async () => [],
     openExistingThread: async (id, { signal } = {}) => {
       control.openAttempts++; control.openSignal = signal; control.openStarted?.resolve();
@@ -708,6 +721,91 @@ test('history GET identifies a known unloaded chat without navigating or enablin
   control.exists = true; control.ready = true;
   const live = await gateway.state(threadId, { refresh: true });
   assert.equal(live.connectionState, 'ready'); assert.equal(live.canLoad, false); assert.equal(live.capabilities.send, true);
+});
+
+const failedTurnId = '22222222-2222-4222-8222-222222222222';
+function failedRuntime(control) {
+  control.ready = true; control.runtimeType = 'systemError';
+  control.turns = [{ turnId: failedTurnId, status: 'failed', turnStartedAtMs: 1000,
+    error: { message: 'You have hit your usage limit. Try again later.' }, items: [] }];
+}
+
+test('a resumed system error stays connected and exposes retry instead of asking to load again', async t => {
+  const { gateway, control } = await ownerRig(t); failedRuntime(control);
+  const view = await gateway.state(threadId, { refresh: true });
+  assert.equal(view.connectionState, 'runtime-error');
+  assert.equal(view.connected, true); assert.equal(view.ownerConfirmed, true);
+  assert.equal(view.canLoad, false); assert.equal(view.status, 'error');
+  assert.equal(view.runtimeError.failedTurnId, failedTurnId);
+  assert.match(view.runtimeError.message, /usage limit/);
+  assert.equal(view.capabilities.retry, true);
+  for (const capability of ['send', 'steer', 'answer', 'approve', 'interrupt']) assert.equal(view.capabilities[capability], false);
+  assert.equal(control.opens.length, 0); assert.equal(control.mutations, 0);
+});
+
+test('a resumed system error with an unconfirmed submission keeps reads but cannot retry', async t => {
+  const { gateway, control } = await ownerRig(t); failedRuntime(control);
+  control.unconfirmedTurnSubmissions = [{ id: 'unconfirmed-existing-submission' }];
+  const view = await gateway.state(threadId, { refresh: true });
+  assert.equal(view.connectionState, 'runtime-error'); assert.equal(view.canLoad, false);
+  assert.equal(view.capabilities.retry, false); assert.equal(view.connected, true);
+});
+
+test('a stale load button cannot navigate a resumed system-error chat again', async t => {
+  const { gateway, control } = await ownerRig(t, { loadTimeoutMs: 30 }); failedRuntime(control);
+  await gateway.state(threadId, { refresh: true });
+  const result = await gateway.action({ threadId, operationId: 'stale-system-error-load', action: 'load' });
+  assert.equal(result.status, 'rejected');
+  assert.equal(result.state.connectionState, 'runtime-error');
+  assert.equal(result.state.canLoad, false); assert.equal(control.opens.length, 0);
+});
+
+async function retryPayload(gateway, operationId) {
+  const view = await gateway.state(threadId, { refresh: true });
+  return { threadId, host: 'mac', operationId, action: 'retry', connectionId: view.connectionId,
+    ownerId: view.ownerId, revision: view.revision, activeTurnId: null, failedTurnId };
+}
+
+test('failed-turn retry is explicit, carries its exact identity and does not consume a draft', async t => {
+  const { gateway, control } = await ownerRig(t); failedRuntime(control); control.retryOutcome = 'submitted';
+  const payload = await retryPayload(gateway, 'explicit-failed-turn-retry');
+  const result = await gateway.action(payload);
+  assert.equal(result.status, 'confirmed'); assert.equal(control.retries.length, 1);
+  assert.deepEqual(control.retries[0].options, { operationId: payload.operationId, expectedOwner: payload.ownerId,
+    expectedGeneration: control.owner.generation, expectedFailedTurnId: failedTurnId });
+  const repeated = await gateway.action(payload); assert.equal(repeated.deduplicated, true);
+  assert.equal(control.retries.length, 1);
+  await assert.rejects(gateway.action({ ...payload, failedTurnId: '33333333-3333-4333-8333-333333333333' }), /不同内容/);
+  assert.equal(control.retries.length, 1);
+});
+
+test('failed-turn retry rejects stale failure, ordinary draft fields and unresolved native submissions before dispatch', async t => {
+  const { gateway, control } = await ownerRig(t); failedRuntime(control); control.retryOutcome = 'submitted';
+  const payload = await retryPayload(gateway, 'rejected-failed-turn-retry');
+  await assert.rejects(gateway.action({ ...payload, text: 'unsent local draft' }), /草稿/);
+  await assert.rejects(gateway.action({ ...payload, failedTurnId: 'stale-failed-turn' }), /轮次/);
+  control.unconfirmedTurnSubmissions = [{}];
+  await assert.rejects(gateway.action(payload), /轮次/);
+  assert.equal(control.mutations, 0);
+});
+
+test('failed-turn retry fences concurrent new operation IDs and retains unknown after gateway restart', async t => {
+  const f = await ownerRig(t); const { gateway, control } = f; failedRuntime(control); control.retryOutcome = 'unknown';
+  control.retryGate = deferred(); control.retryStarted = deferred();
+  const payload = await retryPayload(gateway, 'unknown-failed-turn-retry');
+  const first = gateway.action(payload); await control.retryStarted.promise;
+  await assert.rejects(gateway.action({ ...payload, operationId: 'concurrent-failed-turn-retry' }), /已请求重试/);
+  assert.equal(control.retries.length, 1);
+  control.retryGate.resolve(); assert.equal((await first).status, 'unknown');
+  const restarted = await f.start({ discover: async () => syntheticIdentity(f.dir) });
+  // The persisted failure fence blocks even a new client operation ID. No
+  // re-dispatch is permitted just because the HTTP server was restarted.
+  await assert.rejects(restarted.action({ ...payload, operationId: 'after-restart-failed-turn-retry' }), /已请求重试/);
+  assert.equal(control.retries.length, 1);
+  control.turns = [{ turnId: '44444444-4444-4444-8444-444444444444', status: 'failed', turnStartedAtMs: 2000, items: [] }];
+  const next = await gateway.state(threadId, { refresh: true });
+  const nextResult = await gateway.action({ ...payload, operationId: 'new-failure-explicit-retry', failedTurnId: next.runtimeError.failedTurnId });
+  assert.equal(nextResult.status, 'unknown'); assert.equal(control.retries.length, 2);
 });
 
 test('offline or unverified desktop cannot offer loading even when its local catalog contains the chat', async t => {
