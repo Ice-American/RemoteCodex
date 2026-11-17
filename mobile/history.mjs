@@ -34,12 +34,13 @@ export function visibleItem(item, {media, threadId} = {}) {
   const role = ['agentMessage', 'imageGeneration'].includes(item.type) ? 'assistant' : 'user';
   const original = itemVisibleText(item), hasImages = itemHasImages(item);
   const display = media ? media.decorateItem(threadId,item) : {text:original,images:[]};
-  const text = display.text, images = display.images ?? [];
-  if (!text.trim() && !hasImages && !images.length) return null;
+  const text = display.text, images = display.images ?? [], visualizations = display.visualizations ?? [];
+  if (!text.trim() && !hasImages && !images.length && !visualizations.length) return null;
   // Media is registered on the target computer before projection. Neither
   // local paths nor inline image bytes become part of a phone snapshot.
   return { id: item.id ?? digest(role + original + (hasImages ? JSON.stringify(item.content ?? item.input ?? [item.savedPath ?? item.result]) : '')),
     role, text, phase: item.phase ?? null, ...(hasImages || images.length ? {images} : {}),
+    ...(visualizations.length ? {visualizations} : {}),
     ...(hasImages && !images.length ? {imageUnavailable:true} : {}) };
 }
 

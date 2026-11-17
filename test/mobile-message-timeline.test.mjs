@@ -25,6 +25,14 @@ test('source arrays remain immutable and missing IDs cannot collide across sourc
  const saved=[{role:'user',text:'same'}],live=[{role:'user',text:'same'}],copy=structuredClone({saved,live});const result=messageTimeline(saved,live);assert.equal(result.rows.length,2);assert.notEqual(result.rows[0].key,result.rows[1].key);assert.deepEqual({saved,live},copy);
 });
 
+test('visualization-only saved and live messages retain identity and source order',()=>{
+ const visual={id:'visual',role:'assistant',visualizations:[{id:'ref',contentKey:'key',name:'清单'}]};
+ const result=messageTimeline([m('before'),visual],[visual,m('after')]);
+ assert.deepEqual(ids(result),['before','visual','after']);
+ assert.deepEqual(result.rows[1].message.visualizations,visual.visualizations);
+ assert.equal(result.rows[1].message.text,'');
+});
+
 test('a unique text-only saved copy between two anchors stays in its original slot as an expandable record',()=>{
  const h=[m('a'),{id:'saved-user',role:'user',text:'same'},m('b')],l=[m('a'),{id:'live-user',role:'user',text:'same'},m('b')];
  const result=messageTimeline(h,l);assert.deepEqual(ids(result),['a','saved-user','live-user','b']);assert.equal(result.rows[1].sameTextSaved,true);assert.equal(result.rows[2].sameTextSaved,undefined);

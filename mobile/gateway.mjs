@@ -328,10 +328,10 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
       // the phone. The native-fetch fallback has already decoded its body.
       const encoding = peer.address && upstream.headers.get('content-encoding');
       const imageHeaders = {};
-      if (url.pathname === '/api/image') {
+      if (['/api/image','/api/visualization'].includes(url.pathname)) {
         // Keep paired image bytes on the same pinned peer path as chat data.
         // No Range support is advertised: each bounded image is read in full.
-        for (const header of ['content-length', 'content-disposition', 'etag', 'x-content-type-options', 'content-security-policy']) {
+        for (const header of ['content-length', 'content-disposition', 'etag', 'x-content-type-options', 'content-security-policy', 'referrer-policy']) {
           const value = upstream.headers.get(header); if (value) imageHeaders[header] = value;
         }
       }
@@ -431,6 +431,21 @@ export async function createGateway({ port = 43128, hostId = process.platform ==
             error: '电脑尚未允许读取原图，请在电脑上确认文件访问授权后重试。' });
           return sendJson(res, 404, { error: '原图暂时不可用，文件可能已移动或删除，请刷新后重试。' });
         }
+      }
+      if (url.pathname === '/api/visualization') {
+        if (req.method !== 'GET') return sendJson(res,405,{error:'内嵌内容仅支持只读请求'});
+        const params=url.searchParams,allowed=new Set(['host','threadId','id','key']);
+        if ([...params.keys()].some(key=>!allowed.has(key)||params.getAll(key).length!==1))
+          return sendJson(res,400,{error:'内嵌内容参数无效'});
+        let entry;
+        // The phone supplies only a thread-bound opaque handle, never a path.
+        try { entry=media.visualizations.registered(params.get('threadId'),params.get('id'),params.get('key')); }
+        catch { return sendJson(res,404,{error:'内嵌内容未出现在此聊天中，请刷新后重试'}); }
+        let result,status=200;
+        try { result=await media.visualizations.read(params.get('threadId'),params.get('id'),params.get('key')); }
+        catch(cause) { result=media.visualizations.failure(entry,cause);status=result.status; }
+        res.writeHead(status,{...result.headers,'Content-Length':result.bytes.length});
+        return res.end(result.bytes);
       }
       if (url.pathname === '/api/thread' && req.method === 'GET') {
         if (url.searchParams.get('view') === 'history') {

@@ -16,6 +16,7 @@ import { ThreadCatalog, visibleItem } from '../mobile/history.mjs';
 import { OwnerClient, ownerSnapshotReady } from '../mobile/owner.mjs';
 import { OWNER_METHODS, OWNER_SUPPORTED_VERSIONS } from '../mobile/protocols.mjs';
 import { runtimeStatus } from '../src/state.mjs';
+import { MobileVisualizations, visualizationDocument } from '../mobile/visualizations.mjs';
 
 const threadId = '11111111-1111-4111-8111-111111111111';
 const selfKey = 'synthetic-self-pairing-key-for-isolated-tests';
@@ -93,6 +94,35 @@ test('phone image GET uses pairing and exact thread-scoped opaque references wit
   assert.equal(other.status, 404); assert.ok(!other.text.includes('/private/'));
   assert.equal((await request(gateway, { route: route.replace(contentKey, 'c'.repeat(64)), headers: auth })).status, 404);
   assert.equal(f.calls.discover, 0);
+});
+
+test('visual fragments require pairing and the exact message-backed chat handle', async t => {
+  const f=await rig(t),root=path.join(f.dir,'visualizations'),folder=path.join(root,'2026','11','17',threadId),file=path.join(folder,'list.html');
+  fs.mkdirSync(folder,{recursive:true});fs.writeFileSync(file,'<div>需求清单</div>');
+  const visualizations=new MobileVisualizations({root});t.after(()=>visualizations.close());
+  const ref=visualizations.decorateItem(threadId,{type:'agentMessage',text:'visualize'+JSON.stringify({path:file})+''}).visualizations[0];
+  const gateway=await f.start({media:{visualizations}}),route='/api/visualization?threadId='+threadId+'&id='+ref.id+'&key='+ref.contentKey;
+  assert.equal((await request(gateway,{route})).status,401);
+  const paired=await pair(gateway),result=await request(gateway,{route,headers:{Cookie:paired.cookie}});
+  assert.equal(result.status,200);assert.match(result.headers['content-type'],/^text\/html/);assert.match(result.text,/需求清单/);
+  assert.match(result.headers['content-security-policy'],/script-src 'nonce-/);assert.match(result.headers['content-security-policy'],/sandbox allow-scripts/);
+  assert.equal(result.headers['cache-control'],'no-store');assert.equal(result.headers['referrer-policy'],'no-referrer');assert.ok(!result.text.includes(file));
+  for(const bad of [route+'&path=/etc/passwd',route+'&url=https://example.com',route+'&id='+ref.id])
+    assert.equal((await request(gateway,{route:bad,headers:auth})).status,400);
+  assert.equal((await request(gateway,{route:route.replace(threadId,'22222222-2222-4222-8222-222222222222'),headers:auth})).status,404);
+  assert.equal((await request(gateway,{route,method:'POST',headers:auth,body:{}})).status,405);
+  assert.equal((await request(gateway,{route,headers:{...auth,Origin:'https://foreign.example'}})).status,403);
+  assert.equal(f.calls.discover,0);
+});
+
+test('authorized fragment failures keep a sandboxed visible error rather than a blank frame',async t=>{
+  const f=await rig(t),visualizations=new MobileVisualizations({root:path.join(f.dir,'visualizations')});t.after(()=>visualizations.close());
+  const file=path.join(f.dir,'visualizations','2026','11','17',threadId,'missing.html');
+  const ref=visualizations.decorateItem(threadId,{type:'agentMessage',text:'visualize'+JSON.stringify({path:file})+''}).visualizations[0];
+  const gateway=await f.start({media:{visualizations}}),route='/api/visualization?threadId='+threadId+'&id='+ref.id+'&key='+ref.contentKey;
+  const response=await request(gateway,{route,headers:auth});
+  assert.equal(response.status,404);assert.match(response.text,/cmc-visualization-state/);assert.match(response.text,/"status":"error"/);
+  assert.match(response.headers['content-security-policy'],/script-src 'nonce-/);assert.ok(!response.text.includes(file));
 });
 
 test('phone image route rejects paths, arbitrary URLs, ambiguous keys and non-GET requests', async t => {
@@ -239,6 +269,18 @@ test('phone image peer forwarding preserves image headers and uses only the pair
   assert.equal(calls.length, 1); assert.equal(calls[0].options.method, 'GET');
   assert.equal(calls[0].options.headers.Authorization, 'Bearer ' + peerKey); assert.equal(calls[0].options.headers.Cookie, undefined);
   assert.equal(f.calls.discover, 0);
+});
+
+test('visualization forwarding preserves nonce CSP and never forwards phone cookies',async t=>{
+  const ref={id:'a'.repeat(64),contentKey:'b'.repeat(64),name:'清单'},document=visualizationDocument('<p>content</p>',ref),calls=[];
+  t.mock.method(globalThis,'fetch',async(url,options)=>{calls.push(options);return new Response(document.bytes,{headers:{...document.headers,'content-length':String(document.bytes.length)}});});
+  const f=await rig(t,{peers:[{id:'windows',url:'https://windows-fixture.tailfixture.ts.net'}]}),gateway=await f.start(),paired=await pair(gateway);
+  const response=await request(gateway,{route:'/api/visualization?host=windows&threadId='+threadId+'&id='+ref.id+'&key='+ref.contentKey,headers:{Cookie:paired.cookie}});
+  assert.equal(response.status,200);assert.deepEqual(response.bytes,document.bytes);
+  assert.equal(response.headers['content-security-policy'],document.headers['Content-Security-Policy']);
+  assert.equal(response.headers['referrer-policy'],'no-referrer');assert.equal(response.headers['x-content-type-options'],'nosniff');
+  assert.equal(response.headers['cache-control'],'no-store');assert.equal(calls.length,1);
+  assert.equal(calls[0].headers.Cookie,undefined);assert.equal(calls[0].headers.Authorization,'Bearer '+peerKey);
 });
 
 test('waiting for image permission leaves health responsive and bounded image failures do not disclose paths', async t => {

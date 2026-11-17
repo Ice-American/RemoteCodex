@@ -3,6 +3,7 @@ import { applyStateDelta } from './thread-updates.mjs';
 import { messageTimeline } from './message-timeline.mjs';
 import {createCodeBlock} from './code-copy.mjs';
 import {ThreadPreviewCache} from './thread-cache.mjs';
+import { createVisualizationUI } from './visualizations.mjs';
 const statusLabels = {
   idle: '可继续对话', running: '正在运行', working: '正在运行', inProgress: '正在运行',
   waiting: '等待回答', waitingForInput: '等待回答', waiting_for_input: '等待回答',
@@ -25,7 +26,7 @@ const fingerprint = (text) => { let hash = 14695981039346656037n; for (let i = 0
 export function dedupeMessages(messages = []) {
   const result = [], positions = new Map();
   for (const message of messages) {
-    if (!message || typeof message.text !== 'string' && !Array.isArray(message.images)) continue;
+    if (!message || typeof message.text !== 'string' && !Array.isArray(message.images) && !Array.isArray(message.visualizations)) continue;
     const row = typeof message.text === 'string' ? message : { ...message, text: '' };
     const key = row.id == null ? null : JSON.stringify([row.role, row.id]);
     if (key != null && positions.has(key)) result[positions.get(key)] = row;
@@ -310,6 +311,9 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const galleryRecords = new Map();
   const node = (tag, cls, text) => element(doc, tag, cls, text);
   const button = (text, cls, fn) => { const b = node('button', cls, text); b.type = 'button'; if (fn) b.addEventListener('click', fn); return b; };
+  const visualizationUI = createVisualizationUI({ doc, win,
+    isCurrent: record => !destroyed && record.scope === currentScope() && state && record.scope === scopeOf(state) && messageNodes.get(record.messageKey)?.visualizations?.get(record.key) === record,
+    later, cancel, timeoutMs: readTimeoutMs });
   const app = node('div', 'mobile-app'); app.setAttribute('lang', 'zh-CN');
   const header = node('header', 'app-header');
   const menu = button('对话列表', 'icon-button menu-button', () => setDrawer(!drawerOpen)); menu.setAttribute('aria-expanded', 'false'); menu.setAttribute('aria-controls', 'thread-drawer');
@@ -919,8 +923,8 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function renderMessages() {
     const timeline = messageTimeline(history.messages, state?.messages ?? []);
     renderHistory(timeline);
-    if (!state) { closePreview({ restoreFocus: false }); messageNodes.clear(); messages.replaceChildren(); requests.replaceChildren(); empty.hidden = false; return; }
-    const scope = scopeOf(state); if (scope !== messageScope) { closePreview({ restoreFocus: false }); messageNodes.clear(); messageScope = scope; }
+    if (!state) { closePreview({ restoreFocus: false }); visualizationUI.clear(); messageNodes.clear(); messages.replaceChildren(); requests.replaceChildren(); empty.hidden = false; return; }
+    const scope = scopeOf(state); if (scope !== messageScope) { closePreview({ restoreFocus: false }); visualizationUI.clear(); messageNodes.clear(); messageScope = scope; }
     const rows = timeline.rows, children = [];
     rows.forEach(({message,key,sameTextSaved}, index) => {
       if(timeline.separated && index===0)children.push(savedSourceHeading);
@@ -929,6 +933,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
       if(sameTextSaved) {
         if(!item?.savedRecord) {
           if(item && [...item.images.values()].includes(previewRecord))closePreview({restoreFocus:false});
+          if(item)visualizationUI.disposeItem(item);
           const el=node('details','same-text-saved-record'),summary=node('summary','','同文的已保存记录'),body=node('div','same-text-saved-body');
           el.append(summary,body);item={el,textBody:body,text:null,images:new Map(),savedRecord:true};messageNodes.set(key,item);
         }
@@ -936,17 +941,19 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
         children.push(item.el);return;
       }
       if (!item || item.savedRecord) {
+        if (item) visualizationUI.disposeItem(item);
         const el = node('article', 'message ' + (message.role === 'user' ? 'message-user' : 'message-assistant'));
         const who = node('p', 'message-role', message.role === 'user' ? '你' : message.role === 'assistant' ? 'Codex' : '系统');
-        const body = node('div', 'message-body'), text = node('div', 'message-text'), media = node('div', 'message-images');
-        body.append(text, media); el.append(who, body); item = { el, body, textBody: text, media, images: new Map(), text: null }; messageNodes.set(key, item);
+        const body = node('div', 'message-body'), text = node('div', 'message-text'), media = node('div', 'message-images'), visualMedia = node('div', 'message-visualizations');
+        body.append(text, media, visualMedia); el.append(who, body); item = { el, body, textBody: text, media, visualMedia, images: new Map(), visualizations: new Map(), text: null }; messageNodes.set(key, item);
       }
       if (item.text !== message.text) { renderSafeText(item.textBody, message.text, { markdown: message.role === 'assistant' }); item.text = message.text; item.textBody.hidden = !message.text; }
       renderImages(item, message.images, key, scope, message.imageUnavailable);
+      visualizationUI.render(item, message.visualizations, { host: state.host, threadId: state.id, messageKey: key, scope });
       children.push(item.el);
     });
     for (const [key, item] of messageNodes) if (!children.includes(item.el)) {
-      if ([...item.images.values()].includes(previewRecord)) closePreview({ restoreFocus: false }); messageNodes.delete(key);
+      if ([...item.images.values()].includes(previewRecord)) closePreview({ restoreFocus: false }); visualizationUI.disposeItem(item); messageNodes.delete(key);
     }
     reconcile(messages, children);
     empty.hidden = !!rows.length || !!state.questions?.length || !!state.approvals?.length;
@@ -1328,7 +1335,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
   } else if (api.getHosts) void loadHosts();
   return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts, openCreation,
-    destroy() { destroyed = true; closeTodayImages({ restoreFocus: false }); closePreview({ restoreFocus: false }); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses();stopPrefetch();cancelHistory();creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
+    destroy() { destroyed = true; closeTodayImages({ restoreFocus: false }); closePreview({ restoreFocus: false }); visualizationUI.destroy(); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses();stopPrefetch();cancelHistory();creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
   };
 }
 

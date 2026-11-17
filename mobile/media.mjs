@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { MessageMedia, imageType } from '../src/message-media.mjs';
+import { MobileVisualizations } from './visualizations.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const threadIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
@@ -48,9 +49,10 @@ export function itemHasImages(item) {
 }
 
 export class MobileMedia {
-  constructor({ platform = process.platform, openFile = (...args) => fs.promises.open(...args), readTimeoutMs = 8000, maxReads = 2 } = {}) {
+  constructor({ platform = process.platform, openFile = (...args) => fs.promises.open(...args), readTimeoutMs = 8000, maxReads = 2, visualizations } = {}) {
     this.platform = platform;
     this.media = new MessageMedia();
+    this.visualizations = visualizations ?? new MobileVisualizations({platform});
     this.references = new Map();
     this.openFile = openFile; this.readTimeoutMs = readTimeoutMs;
     this.maxReads = Math.min(2,Math.max(1,Math.trunc(maxReads) || 2));
@@ -58,7 +60,8 @@ export class MobileMedia {
   }
   decorateItem(threadId, item) {
     if (!threadIdPattern.test(threadId ?? '')) throw Error('图片聊天标识无效');
-    const text = itemVisibleText(item);
+    const visual = this.visualizations.decorateItem(threadId,{...item,text:itemVisibleText(item)});
+    const text = visual.text;
     const content = [{ type: 'text', text }, ...contents(item).flatMap(value => {
       let source = itemImageSource(value);
       if (!source) return [];
@@ -112,7 +115,7 @@ export class MobileMedia {
       while (this.references.size > 4096) this.references.delete(this.references.keys().next().value);
       images.push(ref);
     }
-    return {text:typeof decorated.text === 'string' ? decorated.text : text,images};
+    return {text:typeof decorated.text === 'string' ? decorated.text : text,images,visualizations:visual.visualizations};
   }
   async read(threadId, id, contentKey) {
     if (this.closed) throw mediaError('图片服务已关闭，请刷新后重试','MEDIA_CLOSED');
@@ -176,5 +179,6 @@ export class MobileMedia {
     this.closed = true;
     for (const record of this.inflight.values()) record.cancel();
     this.references.clear(); this.media = new MessageMedia();
+    this.visualizations.close();
   }
 }

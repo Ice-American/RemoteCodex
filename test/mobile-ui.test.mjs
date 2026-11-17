@@ -15,6 +15,9 @@ class FixtureNode {
     this.className = ''; this.dataset = {}; this.attributes = new Map(); this.listeners = new Map();
     this.value = ''; this.hidden = false; this.disabled = false; this._text = ''; this.scrollTop = 0;
     this.scrollHeight = 400; this.clientHeight = 500;
+    // Every iframe has a distinct WindowProxy. Resize messages must prove this
+    // identity instead of trusting a copied reference ID or opaque origin alone.
+    if (this.tagName === 'IFRAME') { this.contentWindow = {}; this.navigationRequests = []; }
     this.style = { setProperty(key, value) { this[key] = value; } };
     this.classList = {
       contains: (token) => this.className.split(/\s+/).includes(token),
@@ -34,7 +37,7 @@ class FixtureNode {
   replaceChildren(...nodes) { for (const child of this.childNodes) child.parentNode = null; this.childNodes = []; this.append(...nodes); }
   insertBefore(node, sibling) { node.remove(); const index = sibling ? this.childNodes.indexOf(sibling) : this.childNodes.length; node.parentNode = this; this.childNodes.splice(index, 0, node); }
   remove() { if (!this.parentNode) return; const siblings = this.parentNode.childNodes; siblings.splice(siblings.indexOf(this), 1); this.parentNode = null; }
-  setAttribute(key, value) { this.attributes.set(key, String(value)); }
+  setAttribute(key, value) { this.attributes.set(key, String(value)); if (this.tagName === 'IFRAME' && key === 'src') this.navigationRequests.push(String(value)); }
   getAttribute(key) { return this.attributes.get(key) ?? null; }
   addEventListener(type, callback) { if (!this.listeners.has(type)) this.listeners.set(type, new Set()); this.listeners.get(type).add(callback); }
   removeEventListener(type, callback) { this.listeners.get(type)?.delete(callback); }
@@ -100,6 +103,160 @@ function chooseCreationProject(root, projectId) {
 }
 
 const phoneImage = (values = {}) => ({ id: 'a'.repeat(64), contentKey: 'b'.repeat(64), name: '页面截图.png', ...values });
+const phoneVisualization = (values = {}) => ({ id: 'c'.repeat(64), contentKey: 'd'.repeat(64), name: '方案对比', ...values });
+const visualizationMessage = (values = {}) => ({ id: 'visual-1', role: 'assistant', text: '说明', visualizations: [phoneVisualization()], ...values });
+
+const sendVisualizationMessage = (doc, frame, values = {}, event = {}) => doc.defaultView.fire('message', {
+  origin: 'null', source: frame.contentWindow,
+  data: { type: 'cmc-visualization-state', id: phoneVisualization().id, key: phoneVisualization().contentKey, status: 'ready', ...values }, ...event,
+});
+
+test('visualization expansion uses only registered same-origin GET handles and an opaque sandbox', t => {
+  const { root, view, doc } = mount(t);
+  view.update(thread({ messages: [visualizationMessage({ visualizations: [phoneVisualization({ name: '<img src=x onerror=steal()>', url: 'https://evil.invalid/private.html', path: '/secret' })] })] }));
+  type(root, '查看期间的草稿');
+  assert.equal(byClass(root, 'message-visualization-frame').length, 0);
+  const open = one(root, 'message-visualization-open'); assert.equal(open.textContent, '查看：<img src=x onerror=steal()>');
+  open.click(); const frame = one(root, 'message-visualization-frame'), url = new URL(frame.getAttribute('src'), 'https://paired.example');
+  assert.equal(url.origin, 'https://paired.example'); assert.equal(url.pathname, '/api/visualization');
+  assert.deepEqual([...url.searchParams], [['host', 'mac'], ['threadId', thread().id], ['id', 'c'.repeat(64)], ['key', 'd'.repeat(64)]]);
+  assert.equal(frame.getAttribute('sandbox'), 'allow-scripts allow-popups allow-popups-to-escape-sandbox');
+  assert.equal(frame.getAttribute('referrerpolicy'), 'no-referrer'); assert.equal(frame.getAttribute('scrolling'), 'no'); assert.equal(frame.getAttribute('srcdoc'), null);
+  frame.fire('load'); assert.equal(one(root, 'message-visualization-status').hidden, false);
+  sendVisualizationMessage(doc, frame); assert.equal(one(root, 'message-visualization-status').hidden, true);
+  assert.equal(one(root, 'message-input').value, '查看期间的草稿');
+});
+
+test('streaming text and collapse keep a visualization frame connected without another GET or a lost draft', t => {
+  const { root, view } = mount(t);
+  view.update(thread({ messages: [visualizationMessage()] })); type(root, '流式更新期间的草稿');
+  const open = one(root, 'message-visualization-open'); open.click(); const frame = one(root, 'message-visualization-frame'), url = frame.getAttribute('src');
+  view.update(thread({ revision: 2, messages: [visualizationMessage({ text: '正文持续增加' })] }));
+  assert.equal(one(root, 'message-visualization-frame'), frame); assert.equal(frame.getAttribute('src'), url); assert.equal(frame.navigationRequests.length, 1);
+  open.click(); assert.equal(one(root, 'message-visualization-panel').hidden, true);
+  open.click(); assert.equal(one(root, 'message-visualization-frame'), frame); assert.equal(frame.navigationRequests.length, 1);
+  assert.equal(one(root, 'message-input').value, '流式更新期间的草稿');
+});
+
+test('raw visualization markers and invalid references stay inert without creating local or remote navigations', t => {
+  const { root, view } = mount(t);
+  const marker = '<codex-visualization src="/Users/zhang/private.html">[open](file:///secret)</codex-visualization>';
+  view.update(thread({ messages: [visualizationMessage({ text: marker, visualizations: [phoneVisualization({ id: '../../private' }), phoneVisualization({ contentKey: 'javascript:steal()' }), { url: 'https://evil.invalid' }, phoneVisualization({ contentKey: 'd'.repeat(64) + '\n' })] })] }));
+  assert.equal(one(root, 'message-text').textContent, marker);
+  assert.match(one(root, 'message-visualization-unavailable').textContent, /内嵌内容.*不可用/);
+  assert.equal(byClass(root, 'message-visualization-open').length, 0); assert.equal(byClass(root, 'message-visualization-frame').length, 0);
+});
+
+test('visualization URLs reject invalid hosts and chat IDs as well as invalid reference handles', t => {
+  for (const state of [thread({ host: 'evil', messages: [visualizationMessage()] }), thread({ id: '../../private', messages: [visualizationMessage()] }), thread({ id: thread().id + '\n', messages: [visualizationMessage()] })]) {
+    const { root, view } = mount(t); view.update(state);
+    assert.equal(byClass(root, 'message-visualization-open').length, 0); assert.equal(byClass(root, 'message-visualization-frame').length, 0);
+    assert.match(one(root, 'message-visualization-unavailable').textContent, /不可用/);
+  }
+});
+
+test('visualization height accepts only this current opaque frame and bounded finite numeric heights', t => {
+  const { root, view, doc } = mount(t);
+  view.update(thread({ messages: [visualizationMessage()] })); one(root, 'message-visualization-open').click();
+  const frame = one(root, 'message-visualization-frame'), data = { type: 'cmc-visualization-height', height: 721.2 };
+  const send = (values = {}, event = {}) => sendVisualizationMessage(doc, frame, { ...data, ...values }, event);
+  send({}, { source: {} }); send({}, { source: null }); send({}, { origin: 'https://paired.example' }); send({ id: 'e'.repeat(64) }); send({ key: 'f'.repeat(64) });
+  for (const height of [119, 40001, NaN, Infinity, '721', null]) send({ height });
+  assert.equal(frame.getAttribute('height'), '240'); send(); assert.equal(frame.getAttribute('height'), '722'); assert.equal(frame.style.height, '722px');
+  send({ height: 40000 }); assert.equal(frame.getAttribute('height'), '40000');
+});
+
+test('equal visualization handles in separate messages keep independent frames and cannot resize each other', t => {
+  const { root, view, doc } = mount(t);
+  view.update(thread({ messages: [visualizationMessage(), visualizationMessage({ id: 'visual-2' })] }));
+  for (const open of byClass(root, 'message-visualization-open')) open.click();
+  const [first, second] = byClass(root, 'message-visualization-frame'); assert.notEqual(first.contentWindow, second.contentWindow);
+  sendVisualizationMessage(doc, second, { type: 'cmc-visualization-height', height: 888 });
+  assert.equal(first.getAttribute('height'), '240'); assert.equal(second.getAttribute('height'), '888');
+  sendVisualizationMessage(doc, first, { status: 'error', message: '第一条读取失败' });
+  assert.equal(first.hidden, true); assert.equal(second.hidden, false);
+});
+
+test('visualization ready and error messages require source, opaque origin, handle and version matches', t => {
+  const { root, view, doc } = mount(t); view.update(thread({ messages: [visualizationMessage()] })); one(root, 'message-visualization-open').click();
+  const frame = one(root, 'message-visualization-frame');
+  sendVisualizationMessage(doc, frame, {}, { source: {} }); sendVisualizationMessage(doc, frame, {}, { origin: 'https://paired.example' });
+  sendVisualizationMessage(doc, frame, { key: 'e'.repeat(64) }); sendVisualizationMessage(doc, frame, { id: 'e'.repeat(64) }); sendVisualizationMessage(doc, frame, { status: 'unknown' });
+  assert.equal(one(root, 'message-visualization-status').hidden, false);
+  sendVisualizationMessage(doc, frame); assert.equal(one(root, 'message-visualization-status').hidden, true);
+  sendVisualizationMessage(doc, frame, { status: 'error', message: '<img onerror=steal()>\u0000' + 'x'.repeat(600) });
+  const status = one(root, 'message-visualization-status'); assert.equal(status.hidden, false); assert.equal(status.textContent.length, 512);
+  assert.ok(status.textContent.startsWith('<img onerror=steal()>')); assert.equal(status.childNodes.length, 0);
+  assert.equal(frame.hidden, true); assert.equal(one(root, 'message-visualization-retry').hidden, false);
+});
+
+test('visualization error states offer explicit same-URL GET retries without business writes or draft changes', t => {
+  let writes = 0; const { root, view, doc } = mount(t, { action: async () => { writes++; } });
+  view.update(thread({ messages: [visualizationMessage()] })); type(root, '不发送'); one(root, 'message-visualization-open').click();
+  let frame = one(root, 'message-visualization-frame'); const url = frame.getAttribute('src');
+  for (const message of ['此内容暂时无法读取。电脑可能正在等待文件访问授权。', '读取内嵌内容超时，请重试。', '此内容已移动、删除或尚未保存。']) {
+    sendVisualizationMessage(doc, frame, { status: 'error', message }); assert.equal(one(root, 'message-visualization-status').textContent, message);
+    const old = frame; one(root, 'message-visualization-retry').click(); frame = one(root, 'message-visualization-frame');
+    assert.notEqual(frame, old); assert.equal(old.parentNode, null); assert.equal(frame.getAttribute('src'), url); assert.equal(frame.navigationRequests.length, 1);
+    sendVisualizationMessage(doc, old, { status: 'error', message: '迟到的错误' }); assert.equal(one(root, 'message-visualization-retry').hidden, true);
+  }
+  sendVisualizationMessage(doc, frame); assert.equal(one(root, 'message-visualization-status').hidden, true);
+  assert.equal(writes, 0); assert.equal(one(root, 'message-input').value, '不发送');
+});
+
+test('navigation releases visualization frames and rejects old windows even when the next chat has equal handles', async t => {
+  const timers = fakeClock();
+  const { root, view, doc } = mount(t, { getThreads: async () => ({ threads: [] }) }, { timers });
+  view.update(thread({ messages: [visualizationMessage()] })); type(root, 'Mac草稿'); one(root, 'message-visualization-open').click();
+  const old = one(root, 'message-visualization-frame'); assert.equal(timers.size, 1);
+  await view.selectHost('windows'); assert.equal(old.parentNode, null); assert.equal(timers.size, 0);
+  view.update(thread({ host: 'windows', messages: [visualizationMessage()] })); type(root, 'Windows草稿'); one(root, 'message-visualization-open').click();
+  const next = one(root, 'message-visualization-frame'); assert.ok(next.getAttribute('src').includes('host=windows'));
+  sendVisualizationMessage(doc, old, { type: 'cmc-visualization-height', height: 900 });
+  sendVisualizationMessage(doc, old, { status: 'error', message: '迟到的错误' });
+  assert.equal(next.getAttribute('height'), '240'); assert.equal(next.hidden, false); assert.match(one(root, 'message-visualization-status').textContent, /正在读取/);
+  assert.equal(one(root, 'message-input').value, 'Windows草稿');
+});
+
+test('visualization content version changes release the old frame and load the new reference only after expansion', t => {
+  const { root, view, doc } = mount(t);
+  view.update(thread({ messages: [visualizationMessage()] })); one(root, 'message-visualization-open').click(); const old = one(root, 'message-visualization-frame');
+  view.update(thread({ revision: 2, messages: [visualizationMessage({ visualizations: [phoneVisualization({ contentKey: 'e'.repeat(64) })] })] }));
+  assert.equal(old.parentNode, null); assert.equal(byClass(root, 'message-visualization-frame').length, 0);
+  one(root, 'message-visualization-open').click(); const next = one(root, 'message-visualization-frame');
+  sendVisualizationMessage(doc, old, { type: 'cmc-visualization-height', height: 900 });
+  assert.equal(next.getAttribute('height'), '240'); assert.ok(next.getAttribute('src').includes('key=' + 'e'.repeat(64)));
+});
+
+test('missing runtime confirmation times out visibly without automatic retries and onload is insufficient', async t => {
+  const timers = fakeClock(), { root, view, doc } = mount(t, {}, { timers, readTimeoutMs: 1000 });
+  view.update(thread({ messages: [visualizationMessage()] })); type(root, '超时仍保留'); one(root, 'message-visualization-open').click();
+  const frame = one(root, 'message-visualization-frame'); frame.fire('load'); await timers.advance(1000);
+  assert.equal(frame.hidden, true); assert.match(one(root, 'message-visualization-status').textContent, /读取失败.*连接.*配对/);
+  assert.equal(one(root, 'message-visualization-retry').hidden, false); assert.equal(frame.navigationRequests.length, 1);
+  one(root, 'message-visualization-retry').click(); const next = one(root, 'message-visualization-frame');
+  sendVisualizationMessage(doc, frame); assert.equal(one(root, 'message-visualization-status').hidden, false);
+  sendVisualizationMessage(doc, next); await timers.advance(1000); assert.equal(next.hidden, false); assert.equal(one(root, 'message-visualization-status').hidden, true);
+  assert.equal(one(root, 'message-input').value, '超时仍保留');
+});
+
+test('removed visualization messages and destroyed views retire frames and their timers', async t => {
+  const timers = fakeClock(), { root, view, doc } = mount(t, {}, { timers });
+  view.update(thread({ messages: [visualizationMessage()] })); one(root, 'message-visualization-open').click(); const old = one(root, 'message-visualization-frame');
+  view.update(thread({ revision: 2, messages: [] })); assert.equal(old.parentNode, null); assert.equal(timers.size, 0);
+  view.update(thread({ revision: 3, messages: [visualizationMessage()] })); one(root, 'message-visualization-open').click(); const next = one(root, 'message-visualization-frame');
+  view.destroy(); assert.equal(next.parentNode, null); assert.equal(timers.size, 0);
+  sendVisualizationMessage(doc, next, { type: 'cmc-visualization-height', height: 999 }); assert.equal(next.getAttribute('height'), '240');
+  await timers.advance(15000); assert.equal(root.childNodes.length, 0);
+});
+
+test('messages without references remain readable and visualization-only messages survive dedupe and rendering', t => {
+  const { root, view } = mount(t); view.update(thread({ messages: [{ id: 'old', role: 'assistant', text: '旧消息仍可阅读' },
+    { id: 'visual-only', role: 'assistant', visualizations: [phoneVisualization(), phoneVisualization()] }] }));
+  assert.ok(root.textContent.includes('旧消息仍可阅读')); assert.equal(byClass(root, 'message-assistant').length, 2);
+  assert.equal(byClass(root, 'message-visualization-open').length, 1); assert.equal(one(root, 'empty-state').hidden, true);
+  assert.equal(dedupeMessages([{ id: 'visual-only', role: 'assistant', visualizations: [phoneVisualization()] }])[0].text, '');
+});
 
 test('image-only messages use lazy same-origin opaque image references without accepting supplied URLs', t => {
   const { root, view } = mount(t);

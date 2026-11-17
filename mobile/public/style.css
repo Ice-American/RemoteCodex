@@ -70,6 +70,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .message-image-error, .message-image-unavailable { margin: 8px 0 0; padding: 10px; border-radius: 9px; background: #fff3db; color: #805c20; font-size: 13px; line-height: 1.7; }
 .message-image-error p { margin: 0; }
 .message-image-retry { min-height: 44px; margin-top: 5px; padding: 8px 12px; border: 1px solid #dcc79f; border-radius: 8px; background: #fffdf6; color: #715221; font-size: 13px; }
+.message-visualizations { display: flex; flex-direction: column; gap: 12px; width: 100%; min-width: 0; max-width: 100%; margin-top: 12px; }
+.message-visualization { width: 100%; min-width: 0; max-width: 100%; overflow: hidden; border: 1px solid #dce5d8; border-radius: 12px; background: #fff; }
+.message-visualization-open { display: block; width: 100%; min-height: 48px; padding: 11px 13px; border: 0; background: #edf5ee; color: #345e4c; font-size: 14px; line-height: 1.7; text-align: left; overflow-wrap: anywhere; }
+.message-visualization-open::before { content: '▸'; display: inline-block; width: 18px; }
+.message-visualization-open[aria-expanded='true']::before { content: '▾'; }
+.message-visualization-panel { min-width: 0; width: 100%; max-width: 100%; overflow: hidden; }
+/* The trusted resize runtime sizes the opaque document to its content. The
+   conversation remains the only scrolling surface on narrow phone screens. */
+.message-visualization-frame { display: block; width: 100%; min-width: 0; max-width: 100%; border: 0; overflow: hidden; background: #fff; }
+.message-visualization-status, .message-visualization-unavailable { margin: 0; padding: 12px; color: #805c20; background: #fff8e9; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.message-visualization-retry { min-height: 44px; max-width: calc(100% - 24px); margin: 6px 12px 12px; padding: 8px 12px; border: 1px solid #dcc79f; border-radius: 8px; background: #fffdf6; color: #715221; font-size: 13px; }
 .image-preview { position: absolute; inset: 0; z-index: 10; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; background: #122119; color: #f4f8f2; padding: max(10px, env(safe-area-inset-top, 0px)) 12px max(12px, env(safe-area-inset-bottom, 0px)); }
 .image-preview-heading { grid-row: 1; display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
 .image-preview-title { margin: 0; font-size: 15px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
