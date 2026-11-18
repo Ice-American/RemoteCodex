@@ -309,6 +309,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const now = () => typeof timers.now === 'function' ? timers.now() : Date.now();
   let attemptGeneration = 0, readAttempt = null, retryTimer = null, heartbeatTimer = null, recoveryTimer = null;
   let failureSince = null, retryStep = 0, recoveryNotice = false, lastWakeAt = -Infinity, wakeTimer = null;
+  let currentStream = null, foregroundNeedsValidation = false, hiddenAt = null;
   let cardsSignature = '', messageScope = '', hostSignature = '', threadSignature = '', noticeText = '',noticeSendKey=null;
   const drafts = new Map(), draftRevisions=new Map(), answers = new Map(), gate = new ActionGate({ storage: draftStorage }), messageNodes = new Map();
   const requestPresentation=new Map();
@@ -848,20 +849,20 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (hostError || listError) threadList.append(node('p', 'list-empty', [hostError, listError].filter(Boolean).join('；')));
     else if (!filtered.length) threadList.append(node('p', 'list-empty', listLoading ? '正在读取对话…' : query ? '当前范围没有匹配对话，可切换全部历史' : selectedRange === 'week' ? '最近7天没有对话，可切换全部历史' : '这台电脑暂未返回已有对话'));
   }
-  function writeAllowed(action) { return !loadAttempts.get(currentScope())?.pending && canAct(state, action, connected); }
+  function writeAllowed(action) { return doc.visibilityState !== 'hidden' && !foregroundNeedsValidation && !loadAttempts.get(currentScope())?.pending && canAct(state, action, connected); }
   function sendKey(text) { return JSON.stringify([currentScope(), 'send', fingerprint(text)]); }
   function retryKey(snapshot = state) { return JSON.stringify([scopeOf(snapshot), 'retry', failedTurnId(snapshot)]); }
   function renderStatus() {
     todayImagesButton.disabled = !selectedId;
     title.textContent = state?.title || (selectedId ? '正在读取对话…' : 'Codex 随行');
     subtitle.textContent = state ? (hosts.find((host) => host.id === selectedHost)?.name || selectedHost) + (isHistoryOnly(state) ? ' · 只读历史' : ' · 原桌面会话') : '选择一个已有对话';
-    connectionLabel.textContent = incompatible(state) ? '电脑网关需要更新' : !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : state?.preloaded ? '已预加载 · 正在同步（只读）' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : isRuntimeError(state) ? '上一轮运行失败' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
+    connectionLabel.textContent = incompatible(state) ? '电脑网关需要更新' : foregroundNeedsValidation && connected ? '正在核对原会话（只读）' : !connected && failureSince != null ? (now() - failureSince >= 15000 ? '暂时无法连接' : '正在恢复连接') : needsLoad(state) ? '原聊天尚未在电脑上加载' : state?.preloaded ? '已预加载 · 正在同步（只读）' : isHistoryOnly(state) ? '只读历史 · 原会话未连接' : loading ? '正在读取会话…' : !selectedId ? '选择电脑和已有对话' : !connected ? '连接中断 · 状态待核实' : !state?.ownerConfirmed ? '等待确认原会话连接' : isRuntimeError(state) ? '上一轮运行失败' : state?.questions?.length ? '已连接 · 等待回答' : state?.approvals?.length ? '已连接 · 等待审批' : '已连接 · ' + (statusLabels[statusType(state)] || '状态待同步');
     const loadAttempt = loadAttempts.get(currentScope());
     loadPanel.hidden = !needsLoad(state) && !incompatible(state);
     loadHeading.textContent = incompatible(state) ? '电脑会话接口已更新' : '原聊天尚未在电脑上加载';
     loadHint.textContent = incompatible(state) ? '需要更新这台电脑上的手机网关。反复加载原聊天不能解决这个问题。消息未发送，草稿会保留。' : '此操作会在电脑上打开原聊天，可能切换电脑前台。草稿会保留，连接确认后才能发送。';
     loadButton.hidden = state?.canLoad !== true || typeof api.action !== 'function';
-    loadButton.disabled = !!loadAttempt?.pending;
+    loadButton.disabled = doc.visibilityState === 'hidden' || foregroundNeedsValidation || !!loadAttempt?.pending;
     loadButton.textContent = loadAttempt?.pending ? '正在连接原聊天…' : loadAttempt ? '重试连接原聊天' : '在电脑上加载原会话';
     loadResult.textContent = loadAttempt?.message || (needsLoad(state) && state?.canLoad !== true ? '请在电脑上打开这个原聊天，再刷新手机页面。' : '');
     loadResult.hidden = !loadResult.textContent;
@@ -1203,14 +1204,17 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   function clearRecovery() {
     cancel(retryTimer); cancel(recoveryTimer); retryTimer = recoveryTimer = null; failureSince = null; retryStep = 0;
   }
+  function cancelCurrentRead() {
+    if (!readAttempt) return;
+    const attempt = readAttempt; readAttempt = null; attempt.cancelled = true;
+    cancel(attempt.timeout); attempt.controller.abort(); attempt.reject?.(Error('读取已取消。'));
+  }
   function stopReadAndStream() {
     // Navigation and each recovery retire the entire attempt, including callbacks
     // for the same host/id. A late response may belong to an obsolete owner.
     attemptGeneration++; stopSelectedSync();cancel(wakeTimer); wakeTimer = null; cancel(retryTimer); retryTimer = null; cancel(heartbeatTimer); heartbeatTimer = null;
-    closeEvents(); closeEvents = () => {};
-    if (readAttempt) {
-      cancel(readAttempt.timeout); readAttempt.controller.abort(); readAttempt.reject?.(Error('读取已取消。')); readAttempt = null;
-    }
+    closeEvents(); closeEvents = () => {}; currentStream = null;
+    cancelCurrentRead();
   }
   function markRecovering(error = '') {
     stopSelectedSync();
@@ -1242,58 +1246,122 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   }
   function watchHeartbeat(current) {
     cancel(heartbeatTimer);
-    heartbeatTimer = later(() => { heartbeatTimer = null; if (current()) void recover(); }, heartbeatTimeoutMs);
+    heartbeatTimer = null;
+    if (doc.visibilityState === 'hidden') return;
+    const remaining = currentStream ? Math.max(0, heartbeatTimeoutMs - (now() - currentStream.lastActivity)) : heartbeatTimeoutMs;
+    heartbeatTimer = later(() => {
+      heartbeatTimer = null; if (!current()) return;
+      // Resume must not extend a silent stream's existing heartbeat deadline,
+      // and a parallel GET must not swallow expiration by joining recovery.
+      stopReadAndStream(); foregroundNeedsValidation = true; markRecovering(); scheduleRead();
+    }, remaining);
   }
-  function readCurrent() {
+  function subscribeCurrent(host, id, owner, connectionId, current, { provisional = false } = {}) {
+    const stream = { owner, connectionId, lastActivity: now(), hasActivity: false, provisional, discardFirstState: provisional, started: now() };
+    currentStream = stream;
+    const active = () => current() && currentStream === stream;
+    const alive = () => {
+      if (!active()) return;
+      stream.lastActivity = now(); stream.hasActivity = true;
+      if (doc.visibilityState === 'hidden') return;
+      // A successful GET followed by a failing SSE must keep its backoff.
+      // The initial cached state/open is not proof of a stable stream.
+      if (!stream.provisional && now() - stream.started >= 15000) clearRecovery();
+      watchHeartbeat(active);
+    };
+    const failed = () => {
+      if (!active()) return;
+      // Browsers may discard a background socket. Retire its callbacks now,
+      // but do not start reads, retries or timers until the page is visible.
+      stopReadAndStream(); foregroundNeedsValidation = true; connected = false; loading = false;
+      if (doc.visibilityState === 'hidden') { render(); return; }
+      markRecovering(); scheduleRead();
+    };
+    watchHeartbeat(active);
+    const close = api.subscribe(host, id, {
+      onHeartbeat: alive,
+      onState: next => {
+        if (!active()) return;
+        if (next?.host !== host || next?.id !== id || next?.ownerId !== owner || next?.connectionId !== connectionId) { failed(); return; }
+        alive();
+        // A resumed replacement can first replay the gateway's cached snapshot,
+        // even after the fresh GET has completed. Never apply that first frame.
+        if (stream.discardFirstState) { stream.discardFirstState = false; return; }
+        // Only the fresh GET establishes the baseline and write authority.
+        if (stream.provisional) return;
+        update(next);
+        if (!connected) failed();
+      },
+      // open/ping never grant authority, including during foreground validation.
+      onStatus: status => { if (!active()) return; if (status === 'connecting') watchHeartbeat(active); else failed(); },
+    });
+    if (active()) closeEvents = typeof close === 'function' ? close : () => {}; else close?.();
+  }
+  function readCurrent({ resume = false } = {}) {
     if (destroyed || !selectedId || doc.visibilityState==='hidden' || !api.getThread) return Promise.resolve();
     if (readAttempt) return readAttempt.promise;
     cancel(retryTimer); retryTimer = null;
-    const host = selectedHost, id = selectedId, navigation = generation, attemptId = ++attemptGeneration;
+    const previousState = state;
+    const keepStream = resume && currentStream?.hasActivity && !currentStream.provisional && connected && currentStream.owner === state?.ownerId && currentStream.connectionId === state?.connectionId &&
+      hiddenAt != null && now() - hiddenAt < heartbeatTimeoutMs && now() - currentStream.lastActivity < heartbeatTimeoutMs;
+    if (resume && !keepStream) { foregroundNeedsValidation = true; stopReadAndStream(); render(); }
+    if (keepStream) {
+      // Visibility alone does not end a validated, uninterrupted subscription.
+      // Its bounded hot resume keeps authority while GET checks in parallel;
+      // the gateway still fresh-checks owner/connection/turn before each action.
+      foregroundNeedsValidation = false; render();
+    }
+    const host = selectedHost, id = selectedId, navigation = generation, attemptId = keepStream ? attemptGeneration : ++attemptGeneration, updateStamp = acceptedUpdates;
     const current = () => !destroyed && navigation === generation && attemptId === attemptGeneration && selectedHost === host && selectedId === id;
-    const attempt = { controller: new AbortController(), timeout: null, promise: null, reject: null }; readAttempt = attempt;
+    const attempt = { controller: new AbortController(), timeout: null, promise: null, reject: null, cancelled: false }; readAttempt = attempt;
     attempt.promise = (async () => {
+      let responseReceived = false;
       try {
+        // A frozen/closed stream recovers beside the owner GET, not after a slow
+        // request or retry delay. The provisional stream is strictly read-only.
+        if (resume && !keepStream && api.subscribe && previousState?.ownerId && previousState?.connectionId && !needsLoad(previousState) && !incompatible(previousState)) {
+          subscribeCurrent(host, id, previousState.ownerId, previousState.connectionId, current, { provisional: true });
+        } else if (keepStream) watchHeartbeat(current);
+        if (!current() || attempt.cancelled) return;
         const timeout = new Promise((_, reject) => { attempt.timeout = later(() => { attempt.controller.abort(); reject(Error('读取超时。')); }, readTimeoutMs); });
         const cancelled = new Promise((_, reject) => { attempt.reject = reject; });
         const result = await Promise.race([api.getThread(host, id, { signal: attempt.controller.signal }), timeout, cancelled]);
-        if (!current()) return;
-        if (!update(result)) throw Error('返回的会话与当前电脑不匹配，请重新读取。');
+        if (!current() || attempt.cancelled) return;
+        responseReceived = true;
+        if (result?.host !== host || result?.id !== id) throw Error('返回的会话与当前电脑不匹配，请重新读取。');
+        const sameStream = currentStream && currentStream.owner === result.ownerId && currentStream.connectionId === result.connectionId;
+        // A fresh owner change retires the old stream before any action unlocks.
+        if (currentStream && !sameStream) { closeEvents(); closeEvents = () => {}; currentStream = null; cancel(heartbeatTimer); heartbeatTimer = null; }
+        const freshConnected = result.connected === true && result.ownerConfirmed === true && !isHistoryOnly(result) && readableConnection(result);
+        const keepNewerState = resume && sameStream && !currentStream.provisional && freshConnected && state?.ownerId === result.ownerId && state?.connectionId === result.connectionId &&
+          (updateStamp !== acceptedUpdates || typeof state.revision === 'number' && typeof result.revision === 'number' && state.revision > result.revision);
+        // Only this fresh read may clear a cold foreground gate. An unloaded result
+        // enables its explicit load button, while ordinary owner actions stay off.
+        if (freshConnected || needsLoad(result) || incompatible(result)) foregroundNeedsValidation = false;
+        if (!keepNewerState && !update(result)) throw Error('返回的会话与当前电脑不匹配，请重新读取。');
+        if (keepNewerState) render();
         // A known unloaded chat needs user intent to open its desktop window.
         // Repeating network reads cannot load it, and must never trigger a POST.
         if (needsLoad(result) || incompatible(result)) {
+          if (currentStream) { closeEvents(); closeEvents = () => {}; currentStream = null; cancel(heartbeatTimer); heartbeatTimer = null; }
           clearRecovery(); if (recoveryNotice) showNotice(''); renderStatus(); return;
         }
-        if (!connected) throw Error('原桌面会话尚未连接。');
+        if (!freshConnected || !connected) throw Error('原桌面会话尚未连接。');
         // subscribe() may report an unavailable EventSource synchronously. The
         // GET is complete, so that failure must start recovery rather than join it.
         cancel(attempt.timeout); if (readAttempt === attempt) readAttempt = null;
         if (recoveryNotice) showNotice(''); renderStatus();
         if (api.subscribe) {
-          const owner = result.ownerId, connectionId = result.connectionId, streamStarted = now();
-          const alive = () => {
-            if (!current()) return;
-            // A successful GET followed by a failing SSE must keep its backoff.
-            // The initial cached state/open is not proof of a stable stream.
-            if (now() - streamStarted >= 15000) clearRecovery();
-            watchHeartbeat(current);
-          };
-          watchHeartbeat(current);
-          const close = api.subscribe(host, id, {
-            onHeartbeat: alive,
-            onState: next => {
-              if (!current()) return;
-              if (next?.host !== host || next?.id !== id || next?.ownerId !== owner || next?.connectionId !== connectionId) { void recover(); return; }
-              alive(); update(next);
-              if (!connected) void recover();
-            },
-            // open/ping never grant authority. This subscription was opened only
-            // after this attempt's fresh GET; errors retire it before retrying.
-            onStatus: status => { if (!current()) return; if (status === 'connecting') watchHeartbeat(current); else void recover(); },
-          });
-          if (current()) closeEvents = typeof close === 'function' ? close : () => {}; else close?.();
+          if (sameStream) currentStream.provisional = false;
+          else subscribeCurrent(host, id, result.ownerId, result.connectionId, current);
         } else clearRecovery();
       } catch (error) {
-        if (current()) { markRecovering(error.message); scheduleRead(); }
+        if (current() && !attempt.cancelled) {
+          // A slow parallel GET is not a stream failure. Preserve an existing
+          // continuously healthy stream; cold/provisional reads stay fenced.
+          if (keepStream && !responseReceived && currentStream && !currentStream.provisional && connected && now() - currentStream.lastActivity < heartbeatTimeoutMs) return;
+          stopReadAndStream(); foregroundNeedsValidation = true; markRecovering(error.message); scheduleRead();
+        }
       } finally { cancel(attempt.timeout); if (readAttempt === attempt) readAttempt = null; }
     })();
     return attempt.promise;
@@ -1304,7 +1372,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   }
   async function loadOriginalThread() {
     const scope = currentScope();
-    if (destroyed || !selectedId || !needsLoad(state) || state?.canLoad !== true || typeof api.action !== 'function' || loadAttempts.get(scope)?.pending) return;
+    if (destroyed || doc.visibilityState === 'hidden' || foregroundNeedsValidation || !selectedId || !needsLoad(state) || state?.canLoad !== true || typeof api.action !== 'function' || loadAttempts.get(scope)?.pending) return;
     const host = selectedHost, threadId = selectedId, navigation = generation;
     const current = () => !destroyed && navigation === generation && scope === currentScope();
     const attempt = { pending: true, operationId: operationId(), message: '正在电脑上打开原聊天，首次加载可能需要约一分钟，草稿会保留。' };
@@ -1385,20 +1453,41 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   rangeSelect.addEventListener('change', () => { selectedRange = rangeSelect.value === 'all' ? 'all' : 'week'; changeCatalog(); });
   main.addEventListener('scroll', () => { latest.hidden = main.scrollHeight - main.scrollTop - main.clientHeight < 160; });
   const escape = (event) => { if (event.key === 'Escape') { if (previewRecord) closePreview(); else if (galleryOpen) closeTodayImages(); else if (creationOpen && creationProjectsOpen) { creationProjectsOpen = false; renderCreation(); createProject.focus(); } else if (creationOpen) closeCreation(); else if (drawerOpen) setDrawer(false); } };
-  const wake = () => {
+  const wake = ({ resume = false } = {}) => {
     if (destroyed || !selectedId || doc.visibilityState === 'hidden' || readAttempt) return;
     const delay = 500 - (now() - lastWakeAt);
-    if (delay > 0) {
+    if (!resume && delay > 0) {
       // Keep the final online hint after a rapid handover. Dropping it could
       // leave a restored network waiting behind the full retry backoff.
       if (!connected && wakeTimer == null) wakeTimer = later(() => { wakeTimer = null; wake(); }, delay);
       return;
     }
-    cancel(wakeTimer); wakeTimer = null; lastWakeAt = now(); void recover({ immediate: true });
+    cancel(wakeTimer); wakeTimer = null; lastWakeAt = now();
+    if (resume) { void readCurrent({ resume: true }); return; }
+    void recover({ immediate: true });
   };
-  const visibility = () => { if (doc.visibilityState !== 'hidden') { wake();clearStatusConfirmations();renderThreads();void pollStatuses();scheduleSelectedSync();if(!history.loaded)void loadHistory();startPrefetch();if(!threads.length&&!listLoading)void loadThreads();if(!hosts.length&&api.getHosts)void loadHosts({background:!!selectedId,loadList:false}); } else {stopStatuses();stopReadAndStream();clearRecovery();connected=false;cancelHistory();stopPrefetch();render();} };
-  const offline = () => { if (!destroyed && selectedId) { stopReadAndStream();cancelHistory();stopPrefetch();if(doc.visibilityState==='hidden'){connected=false;loading=false;render();return;}markRecovering(); scheduleRead(); } };
-  doc.addEventListener('keydown', escape); doc.addEventListener('visibilitychange', visibility); win?.addEventListener('online', wake); win?.addEventListener('offline', offline);
+  const visibility = () => {
+    if (doc.visibilityState !== 'hidden') {
+      wake({ resume: true }); hiddenAt = null; clearStatusConfirmations(); renderThreads(); void pollStatuses(); scheduleSelectedSync();
+      if (!history.loaded) void loadHistory();
+      startPrefetch(); if (!threads.length && !listLoading) void loadThreads();
+      if (!hosts.length && api.getHosts) void loadHosts({ background: !!selectedId, loadList: false });
+      return;
+    }
+    hiddenAt ??= now(); foregroundNeedsValidation = true;
+    stopStatuses(); stopSelectedSync(); cancel(wakeTimer); wakeTimer = null; cancel(heartbeatTimer); heartbeatTimer = null; cancel(retryTimer); retryTimer = null;
+    // Stop optional reads, not a healthy SSE. Cancelling a parallel hot GET
+    // must not make frequent app switches repeatedly dismantle that stream.
+    if (currentStream && !currentStream.provisional) cancelCurrentRead(); else if (readAttempt) stopReadAndStream();
+    clearRecovery(); cancelHistory(); stopPrefetch(); render();
+  };
+  const freeze = () => {
+    // An explicit browser freeze breaks continuity even during a short absence.
+    foregroundNeedsValidation = true; stopReadAndStream(); stopStatuses(); cancelHistory(); stopPrefetch(); clearRecovery(); connected = false; loading = false; render();
+  };
+  const resume = () => wake({ resume: true });
+  const offline = () => { if (!destroyed && selectedId) { foregroundNeedsValidation = true; stopReadAndStream();cancelHistory();stopPrefetch();if(doc.visibilityState==='hidden'){connected=false;loading=false;render();return;}markRecovering(); scheduleRead(); } };
+  doc.addEventListener('keydown', escape); doc.addEventListener('visibilitychange', visibility); doc.addEventListener('freeze', freeze); doc.addEventListener('resume', resume); win?.addEventListener('online', wake); win?.addEventListener('offline', offline);
   win?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('resize', resize); win?.visualViewport?.addEventListener('scroll', resize);
   resize(); render({ navigation: true });
   async function loadHosts({ background = !!selectedId, loadList = true } = {}) {
@@ -1424,7 +1513,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (api.getHosts) void loadHosts({ background: true, loadList: false });
   } else if (api.getHosts) void loadHosts();
   return { update, selectHost, selectThread, refresh: refreshCurrent, loadHosts, openCreation,
-    destroy() { destroyed = true; closeTodayImages({ restoreFocus: false }); closePreview({ restoreFocus: false }); visualizationUI.destroy(); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses();stopPrefetch();cancelHistory();creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
+    destroy() { destroyed = true; closeTodayImages({ restoreFocus: false }); closePreview({ restoreFocus: false }); visualizationUI.destroy(); messageNodes.clear(); generation++; cancel(searchTimer); searchTimer = null; stopStatuses();stopPrefetch();cancelHistory();creationGeneration++; cancelCreationRead(); stopReadAndStream(); clearRecovery(); doc.removeEventListener('keydown', escape); doc.removeEventListener('visibilitychange', visibility); doc.removeEventListener('freeze', freeze); doc.removeEventListener('resume', resume); win?.removeEventListener('online', wake); win?.removeEventListener('offline', offline); win?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('resize', resize); win?.visualViewport?.removeEventListener('scroll', resize); root.replaceChildren(); },
   };
 }
 

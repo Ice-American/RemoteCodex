@@ -77,7 +77,7 @@ const deferred = () => { let resolve; const promise = new Promise((done) => { re
 function fakeClock() {
   let now = 0, nextId = 0; const jobs = new Map();
   return { now: () => now, setTimeout(fn, delay) { const id = ++nextId; jobs.set(id, { fn, at: now + delay }); return id; }, clearTimeout(id) { jobs.delete(id); },
-    get size() { return jobs.size; }, async advance(ms) { const end = now + ms; let count = 0;
+    get size() { return jobs.size; }, jump(ms) { now += ms; }, async advance(ms) { const end = now + ms; let count = 0;
       for (;;) { const next = [...jobs].sort((a, b) => a[1].at - b[1].at)[0]; if (!next || next[1].at > end) break;
         assert.ok(++count < 200, 'timer loop'); now = next[1].at; jobs.delete(next[0]); next[1].fn(); await tick(); }
       now = end; await tick();
@@ -1023,6 +1023,161 @@ test('foreground revalidation joins online recovery and destroy aborts and clear
   assert.equal(reads, 2); assert.equal(closed, 1); assert.equal(one(root, 'send-button').disabled, true);
   view.destroy(); await refreshing; assert.equal(signal.aborted, true); assert.equal(timers.size, 0);
   pending.resolve(thread({ title: '销毁后迟到' })); await timers.advance(100000); assert.equal(root.childNodes.length, 0); assert.equal(reads, 2);
+});
+
+test('a short background resumes its uninterrupted trusted stream immediately while a fresh owner GET runs beside it', async t => {
+  const timers = fakeClock(), fresh = deferred(), streams = []; let reads = 0, posts = 0;
+  const { root, doc, view } = mount(t, { getThread: () => ++reads === 1 ? Promise.resolve(thread()) : fresh.promise,
+    subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; },
+    action: async () => { posts++; } }, { timers });
+  await view.selectThread(thread().id); streams[0].callbacks.onHeartbeat(); type(root, '短后台草稿');
+  doc.visibilityState = 'hidden'; doc.fire('visibilitychange');
+  assert.equal(streams[0].closed, 0); assert.equal(timers.size, 0); assert.equal(one(root, 'send-button').disabled, true);
+  streams[0].callbacks.onState(thread({ revision: 'hidden', title: '后台仍在更新' }));
+  one(root, 'composer').fire('submit'); assert.equal(posts, 0); assert.equal(one(root, 'send-button').disabled, true);
+  timers.jump(1000); doc.visibilityState = 'visible'; doc.fire('visibilitychange');
+  assert.equal(reads, 2); assert.equal(streams.length, 1); assert.equal(streams[0].closed, 0);
+  assert.equal(one(root, 'send-button').disabled, false); assert.match(one(root, 'connection-label').textContent, /^已连接/);
+  streams[0].callbacks.onHeartbeat(); streams[0].callbacks.onState(thread({ revision: 'newer', title: '最新回复' }));
+  assert.equal(one(root, 'send-button').disabled, false);
+  fresh.resolve(thread({ revision: 'old-get', title: '迟到读取' })); await tick();
+  assert.equal(one(root, 'send-button').disabled, false); assert.equal(one(root, 'thread-title').textContent, '最新回复');
+  assert.equal(streams.length, 1); assert.equal(one(root, 'message-input').value, '短后台草稿'); assert.equal(posts, 0);
+});
+
+test('repeated short backgrounds cancel only their parallel GET and never dismantle the continuous stream', async t => {
+  const timers = fakeClock(), pending = [], streams = []; let reads = 0;
+  const { root, doc, view } = mount(t, { getThread: (_host, _id, { signal }) => {
+    if (++reads === 1) return Promise.resolve(thread()); const read = { ...deferred(), signal }; pending.push(read); return read.promise;
+  }, subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; } }, { timers });
+  await view.selectThread(thread().id); streams[0].callbacks.onHeartbeat(); type(root, '连续切换草稿');
+  for (let i = 0; i < 2; i++) {
+    doc.visibilityState = 'hidden'; doc.fire('visibilitychange'); timers.jump(1000);
+    doc.visibilityState = 'visible'; doc.fire('visibilitychange'); await tick();
+    assert.equal(one(root, 'send-button').disabled, false); assert.equal(streams.length, 1); assert.equal(streams[0].closed, 0);
+  }
+  assert.equal(reads, 3); assert.equal(pending[0].signal.aborted, true);
+  pending[0].resolve(thread({ ownerId: 'obsolete', title: '已取消的读取' })); await tick();
+  assert.equal(streams.length, 1); assert.equal(one(root, 'thread-title').textContent, '手机适配');
+  pending[1].resolve(thread()); await tick(); assert.equal(one(root, 'message-input').value, '连续切换草稿');
+});
+
+test('a slow hot-resume GET cannot close a continuously healthy stream or restore an obsolete response', async t => {
+  const timers = fakeClock(), pending = deferred(), streams = []; let reads = 0, signal;
+  const { root, doc, view } = mount(t, { getThread: (_host, _id, options) => {
+    signal = options.signal; return ++reads === 1 ? Promise.resolve(thread()) : pending.promise;
+  }, subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; } }, { timers, readTimeoutMs: 1000 });
+  await view.selectThread(thread().id); streams[0].callbacks.onHeartbeat(); type(root, '慢读取不拆流'); doc.visibilityState = 'hidden'; doc.fire('visibilitychange');
+  timers.jump(100); doc.visibilityState = 'visible'; doc.fire('visibilitychange');
+  streams[0].callbacks.onHeartbeat(); await timers.advance(1000);
+  assert.equal(signal.aborted, true); assert.equal(streams[0].closed, 0); assert.equal(streams.length, 1); assert.equal(one(root, 'send-button').disabled, false);
+  pending.resolve(thread({ title: '超时后旧响应' })); await tick(); assert.equal(one(root, 'thread-title').textContent, '手机适配');
+});
+
+test('a frozen background stream is replaced beside the fresh GET without waiting for a timer or read', async t => {
+  const timers = fakeClock(), fresh = deferred(), streams = []; let reads = 0, posts = 0;
+  const { root, doc, view } = mount(t, { getThread: () => ++reads === 1 ? Promise.resolve(thread()) : fresh.promise,
+    subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; },
+    action: async () => { posts++; } }, { timers });
+  await view.selectThread(thread().id); type(root, '冻结后保留'); doc.visibilityState = 'hidden'; doc.fire('visibilitychange');
+  timers.jump(60000); streams[0].callbacks.onHeartbeat(); doc.visibilityState = 'visible'; doc.fire('visibilitychange');
+  assert.equal(reads, 2); assert.equal(streams.length, 2); assert.equal(streams[0].closed, 1);
+  streams[0].callbacks.onState(thread({ revision: 999, title: '旧流不得回来' }));
+  streams[1].callbacks.onHeartbeat(); streams[1].callbacks.onState(thread({ revision: 1, title: '不得采信的缓存首帧' }));
+  one(root, 'composer').fire('submit'); assert.equal(posts, 0); assert.equal(one(root, 'send-button').disabled, true);
+  fresh.resolve(thread({ revision: 2, title: '鲜活读取' })); await tick();
+  assert.equal(one(root, 'thread-title').textContent, '鲜活读取'); assert.equal(one(root, 'send-button').disabled, false);
+  streams[1].callbacks.onState(thread({ revision: 3, title: '并行恢复后的更新' })); assert.equal(one(root, 'thread-title').textContent, '并行恢复后的更新');
+  assert.equal(one(root, 'message-input').value, '冻结后保留'); assert.equal(streams.length, 2);
+});
+
+test('a provisional first cached state arriving after the fresh GET cannot roll back opaque state or capabilities', async t => {
+  const timers = fakeClock(), pending = deferred(), streams = []; let reads = 0;
+  const { root, doc, view } = mount(t, { getThread: () => ++reads === 1 ? Promise.resolve(thread()) : pending.promise,
+    subscribe: (_host, _id, callbacks) => { streams.push(callbacks); return () => {}; } }, { timers });
+  await view.selectThread(thread().id); streams[0].onHeartbeat(); type(root, '迟到缓存也不能授权');
+  doc.visibilityState = 'hidden'; doc.fire('visibilitychange'); timers.jump(60000); doc.visibilityState = 'visible'; doc.fire('visibilitychange');
+  pending.resolve(thread({ revision: 'fresh-get', title: '鲜活基准', capabilities: { send: false } })); await tick();
+  assert.equal(one(root, 'send-button').disabled, true);
+  streams[1].onState(thread({ revision: 'opaque-old-cache', title: '迟到缓存首帧' }));
+  assert.equal(one(root, 'thread-title').textContent, '鲜活基准'); assert.equal(one(root, 'send-button').disabled, true);
+  streams[1].onState(thread({ revision: 'live-following-frame', title: '基准后的更新' }));
+  assert.equal(one(root, 'thread-title').textContent, '基准后的更新'); assert.equal(one(root, 'send-button').disabled, false);
+});
+
+test('a hidden stream failure starts no recovery until visible and then bypasses prior backoff', async t => {
+  const timers = fakeClock(), streams = []; let reads = 0;
+  const { root, doc, view } = mount(t, { getThread: async () => { reads++; return thread(); },
+    subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; } }, { timers });
+  await view.selectThread(thread().id); type(root, '后台断开草稿'); doc.visibilityState = 'hidden'; doc.fire('visibilitychange');
+  streams[0].callbacks.onStatus('disconnected'); streams[0].callbacks.onStatus('connecting');
+  await timers.advance(120000); assert.equal(reads, 1); assert.equal(streams.length, 1); assert.equal(timers.size, 0);
+  doc.visibilityState = 'visible'; doc.fire('visibilitychange'); assert.equal(reads, 2); assert.equal(streams.length, 2);
+  await tick(); assert.equal(one(root, 'send-button').disabled, false); assert.equal(one(root, 'message-input').value, '后台断开草稿');
+});
+
+for (const absence of [1000, 60000]) test(`an SSE failure during a ${absence < 45000 ? 'hot' : 'cold'} foreground GET retires that attempt before a fresh retry`, async t => {
+  const timers = fakeClock(), pending = deferred(), streams = []; let reads = 0, signal, posts = 0;
+  const { root, doc, view } = mount(t, { getThread: (_host, _id, options) => {
+    if (++reads === 2) { signal = options.signal; return pending.promise; } return Promise.resolve(thread({ revision: reads }));
+  }, subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; },
+  action: async () => { posts++; } }, { timers });
+  await view.selectThread(thread().id); streams[0].callbacks.onHeartbeat(); type(root, '不能吞掉断流');
+  doc.visibilityState = 'hidden'; doc.fire('visibilitychange'); timers.jump(absence); doc.visibilityState = 'visible'; doc.fire('visibilitychange');
+  const failed = streams.at(-1); failed.callbacks.onStatus('disconnected');
+  assert.equal(failed.closed, 1); assert.equal(signal.aborted, true); assert.equal(one(root, 'send-button').disabled, true);
+  failed.callbacks.onHeartbeat(); failed.callbacks.onState(thread({ revision: 999, title: '坏流不得复活' }));
+  pending.resolve(thread({ revision: 999, title: '断流前开始的读取' })); await tick();
+  assert.notEqual(one(root, 'thread-title').textContent, '断流前开始的读取'); assert.equal(one(root, 'send-button').disabled, true);
+  await timers.advance(1000); assert.equal(reads, 3); assert.equal(one(root, 'send-button').disabled, false);
+  assert.equal(streams.length, absence < 45000 ? 2 : 3); assert.equal(posts, 0); assert.equal(one(root, 'message-input').value, '不能吞掉断流');
+});
+
+test('hot resume keeps only the remaining heartbeat window even while its parallel owner GET is pending', async t => {
+  const timers = fakeClock(), pending = deferred(), streams = []; let reads = 0;
+  const { root, doc, view } = mount(t, { getThread: () => ++reads === 1 ? Promise.resolve(thread()) : pending.promise,
+    subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; } }, { timers, readTimeoutMs: 60000 });
+  await view.selectThread(thread().id); streams[0].callbacks.onHeartbeat(); type(root, '剩余心跳期限');
+  doc.visibilityState = 'hidden'; doc.fire('visibilitychange'); timers.jump(44000); doc.visibilityState = 'visible'; doc.fire('visibilitychange');
+  assert.equal(one(root, 'send-button').disabled, false); await timers.advance(1000);
+  assert.equal(streams[0].closed, 1); assert.equal(one(root, 'send-button').disabled, true); assert.equal(reads, 2);
+});
+
+test('an explicit browser freeze breaks continuity even during a short background', async t => {
+  const timers = fakeClock(), pending = deferred(), streams = []; let reads = 0;
+  const { root, doc, view } = mount(t, { getThread: () => ++reads === 1 ? Promise.resolve(thread()) : pending.promise,
+    subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; } }, { timers });
+  await view.selectThread(thread().id); streams[0].callbacks.onHeartbeat(); type(root, '短冻结也只读');
+  doc.visibilityState = 'hidden'; doc.fire('visibilitychange'); doc.fire('freeze'); timers.jump(100); doc.fire('resume');
+  assert.equal(reads, 1); assert.equal(streams[0].closed, 1); assert.equal(timers.size, 0);
+  doc.visibilityState = 'visible'; doc.fire('visibilitychange'); assert.equal(reads, 2); assert.equal(streams.length, 2);
+  streams[1].callbacks.onHeartbeat(); streams[1].callbacks.onState(thread({ revision: 999 })); assert.equal(one(root, 'send-button').disabled, true);
+  pending.resolve(thread({ revision: 2 })); await tick(); assert.equal(one(root, 'send-button').disabled, false);
+});
+
+test('fresh foreground owner changes retire the old trusted stream before enabling the new owner', async t => {
+  const timers = fakeClock(), pending = deferred(), streams = []; let reads = 0;
+  const { root, doc, view } = mount(t, { getThread: () => ++reads === 1 ? Promise.resolve(thread()) : pending.promise,
+    subscribe: (_host, _id, callbacks) => { const row = { callbacks, closed: 0 }; streams.push(row); return () => row.closed++; } }, { timers });
+  await view.selectThread(thread().id); streams[0].callbacks.onHeartbeat(); type(root, 'owner变化仍保留');
+  doc.visibilityState = 'hidden'; doc.fire('visibilitychange'); timers.jump(100); doc.visibilityState = 'visible'; doc.fire('visibilitychange');
+  pending.resolve(thread({ ownerId: 'new-owner', connectionId: 'new-connection', revision: 1, title: '新owner鲜活读取' })); await tick();
+  assert.equal(streams[0].closed, 1); assert.equal(streams.length, 2); assert.equal(one(root, 'send-button').disabled, false);
+  streams[0].callbacks.onState(thread({ revision: 999, title: '旧owner迟到' })); assert.equal(one(root, 'thread-title').textContent, '新owner鲜活读取');
+  assert.equal(one(root, 'message-input').value, 'owner变化仍保留');
+});
+
+test('cold foreground verification fences explicit load and preserves an unknown send without replaying either POST', async t => {
+  const timers = fakeClock(), pending = deferred(), streams = []; let reads = 0, posts = 0;
+  const { root, doc, view } = mount(t, { getThread: () => ++reads === 1 ? Promise.resolve(thread()) : pending.promise,
+    subscribe: (_host, _id, callbacks) => { streams.push(callbacks); return () => {}; }, action: async () => { posts++; return { status: 'unknown' }; } }, { timers });
+  await view.selectThread(thread().id); streams[0].onHeartbeat(); type(root, '未知发送不能重发'); one(root, 'composer').fire('submit'); await tick(); await tick();
+  assert.equal(posts, 1); doc.visibilityState = 'hidden'; doc.fire('visibilitychange');
+  view.update(unloadedThread()); one(root, 'load-thread-button').click(); assert.equal(posts, 1);
+  timers.jump(60000); doc.visibilityState = 'visible'; doc.fire('visibilitychange');
+  assert.equal(one(root, 'load-thread-button').disabled, true); one(root, 'load-thread-button').click(); assert.equal(posts, 1);
+  pending.resolve(thread()); await tick(); one(root, 'composer').fire('submit'); assert.equal(posts, 1);
+  assert.equal(one(root, 'send-button').disabled, true); assert.equal(one(root, 'message-input').value, '未知发送不能重发');
 });
 
 test('an uncertain POST remains single through stream failure, online recovery and fresh snapshots', async (t) => {
