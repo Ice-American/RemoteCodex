@@ -9,6 +9,8 @@ const endpoint = { path: '\\\\.\\pipe\\codex-browser-use-native-test', pid: 123,
 const owner = { platform: 'win32', pid: 123, image, fingerprint: 'native-test', home: '/synthetic' };
 const macOwner = { platform: 'darwin', pid: 123, image: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
   asarPath: '/Applications/ChatGPT.app/Contents/Resources/app.asar', fingerprint: 'mac-native-test', home: '/synthetic' };
+const userMacOwner = { ...macOwner, image: '/Users/synthetic/Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+  asarPath: '/Users/synthetic/Applications/ChatGPT.app/Contents/Resources/app.asar', fingerprint: 'user-mac-native-test' };
 const catalog = ['create_thread', 'list_projects', 'list_threads', 'wait_threads'].map(name => ({ namespace: 'codex_app', name,
   inputSchema: { properties: name === 'create_thread' ? { target: {}, prompt: {} } : {} } }));
 const navigation = { namespace: 'codex_app', name: 'navigate_to_codex_page',
@@ -215,6 +217,20 @@ test('Mac opens only the exact existing-chat URL in the verified app without a p
   assert.deepEqual(f.calls, []); assert.deepEqual(f.events, []);
 });
 
+test('Mac navigation follows the verified running user Applications bundle without falling back to the system copy', async () => {
+  const checks = [], launches = [];
+  const f = rig({ native: { platform: 'darwin',
+    discover: async options => { checks.push(options); return userMacOwner; },
+    openRunner: async (...args) => { launches.push(args); return { stdout: '', stderr: '' }; } } });
+  assert.deepEqual(await f.native.openExistingThread(context),
+    { threadId: context, opened: true, source: 'official-desktop-navigation' });
+  assert.equal(checks.length, 2);
+  assert.ok(checks.every(options => options.platform === 'darwin' && options.verifySignature === true));
+  assert.deepEqual(launches.map(([file, args]) => [file, args]),
+    [['/usr/bin/open', ['-g', '-a', '/Users/synthetic/Applications/ChatGPT.app', 'codex://threads/' + context]]]);
+  assert.deepEqual(f.calls, []); assert.deepEqual(f.events, []);
+});
+
 test('existing-chat navigation rejects input injection and unsupported or closed hosts before discovery', async () => {
   const inputs = ['new', 'codex://threads/' + context, context + '?prompt=send', context + '/new', context + '\n',
     { threadId: context, prompt: 'must not send' }, null, undefined];
@@ -231,8 +247,12 @@ test('existing-chat navigation rejects input injection and unsupported or closed
   assert.deepEqual(unsupportedHost.events, []);
 });
 
-test('Mac navigation refuses another bundle, missing identity or failed signature and never retries a launch', async () => {
+test('Mac navigation refuses mismatched or invalid bundle paths, missing identity or failed signature and never retries a launch', async () => {
   for (const identity of [{ ...macOwner, image: '/Users/synthetic/ChatGPT.app/Contents/MacOS/ChatGPT' },
+    { ...macOwner, image: 'Applications/ChatGPT.app/Contents/MacOS/ChatGPT', asarPath: 'Applications/ChatGPT.app/Contents/Resources/app.asar' },
+    { ...macOwner, image: '/Applications/Other.app/Contents/MacOS/ChatGPT', asarPath: '/Applications/Other.app/Contents/Resources/app.asar' },
+    { ...macOwner, image: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT-helper' },
+    { ...macOwner, image: null },
     { ...macOwner, asarPath: '/another/app.asar' }, { ...macOwner, pid: 0 }, { ...macOwner, fingerprint: '' }]) {
     const f = rig({ native: { platform: 'darwin', discover: async () => identity,
       openRunner: async () => { assert.fail('must not launch'); } } });
@@ -250,7 +270,8 @@ test('Mac navigation refuses another bundle, missing identity or failed signatur
 });
 
 test('Mac post-navigation identity drift is not reported as opened or owner ready', async () => {
-  for (const change of [{ pid: 456 }, { fingerprint: 'replaced' }, { image: '/another/ChatGPT' }]) {
+  for (const change of [{ pid: 456 }, { fingerprint: 'replaced' }, { image: '/another/ChatGPT' },
+    { image: userMacOwner.image, asarPath: userMacOwner.asarPath }]) {
     let checks = 0, launches = 0;
     const f = rig({ native: { platform: 'darwin', discover: async () => ++checks === 1 ? macOwner : { ...macOwner, ...change },
       openRunner: async () => { launches++; } } });

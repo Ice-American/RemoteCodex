@@ -12,7 +12,6 @@ import { readOwnerProtocols } from './protocols.mjs';
 
 const exec = promisify(execFile);
 const officialImage = /\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$/i;
-const macApp = '/Applications/ChatGPT.app';
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
 const toolPipe = value => /^(?:codex-browser-use-|codex-app-tools-)/.test(path.win32.basename(value ?? ''));
 const localProject = project => (project.projectKind ?? project.kind) === 'local' && (!project.hostId || project.hostId === 'local');
@@ -197,17 +196,21 @@ export class NativeTools {
         const identity = await this.discover({ platform: this.platform, home: this.home, verifySignature: true });
         check();
         if (identity.platform !== 'darwin' || !Number.isSafeInteger(identity.pid) || identity.pid <= 0 ||
-            identity.image !== macApp + '/Contents/MacOS/ChatGPT' ||
-            identity.asarPath !== macApp + '/Contents/Resources/app.asar' ||
+            typeof identity.image !== 'string' || !path.posix.isAbsolute(identity.image) ||
+            !identity.image.endsWith('/ChatGPT.app/Contents/MacOS/ChatGPT') ||
+            identity.asarPath !== identity.image.slice(0, -'/Contents/MacOS/ChatGPT'.length) + '/Contents/Resources/app.asar' ||
             typeof identity.fingerprint !== 'string' || !identity.fingerprint)
           throw Error('官方 Mac 桌面身份未确认或已变化');
         return identity;
       };
       const before = await verify();
+      // Follow the signed running bundle, including a user's Applications copy.
+      // A fixed fallback could open a different Desktop account and owner.
+      const app = before.image.slice(0, -'/Contents/MacOS/ChatGPT'.length);
       // A fixed executable and argument array prevent prompt/query injection.
       // -g avoids requesting foreground activation; Desktop may still navigate
       // its own window. A process exit is only a navigation acknowledgement.
-      await this.openRunner('/usr/bin/open', ['-g', '-a', macApp, 'codex://threads/' + threadId],
+      await this.openRunner('/usr/bin/open', ['-g', '-a', app, 'codex://threads/' + threadId],
         { timeout: this.timeoutMs, maxBuffer: 65536, ...(signal ? { signal } : {}) });
       check();
       const after = await verify();
