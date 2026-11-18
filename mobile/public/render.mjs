@@ -81,7 +81,7 @@ export class ActionGate {
       const records = JSON.parse(this.storage?.getItem(this.storageKey) || '[]');
       if (Array.isArray(records)) for (const [key, value] of records) {
         if (typeof key !== 'string' || !value || !['pending', 'unknown', 'confirmed', 'submitted'].includes(value.status) || typeof value.operationId !== 'string') continue;
-        result.set(key, value);
+        result.set(key, {operationId:value.operationId,status:value.status,...(value.status==='confirmed'&&value.acknowledged===true?{acknowledged:true}:{})});
       }
     } catch {}
     return result;
@@ -89,9 +89,14 @@ export class ActionGate {
   restore() {
     for (const [key, saved] of this.stored()) {
       const local = this.attempts.get(key);
+      // Only an ACK captured for this exact operation may outrank another
+      // tab's timeout. A same-text operation with a different ID stays fenced.
+      if(local?.operationId===saved.operationId&&(local.acknowledged||saved.acknowledged)) {
+        this.attempts.set(key,{...local,...saved,status:'confirmed',acknowledged:true,message:'操作已确认，等待会话同步。'});continue;
+      }
       if (local?.status === 'unknown' || local?.operationId === saved.operationId && local.status === saved.status) continue;
       const status = saved.status === 'pending' ? 'unknown' : saved.status;
-      this.attempts.set(key, { operationId: saved.operationId, status, message: status === 'unknown' ? '上次操作的结果未确认。请先核对原会话，本次操作不会自动重发。' : '上次操作已提交，等待原会话状态同步。' });
+      this.attempts.set(key, { ...saved, status, message: status === 'unknown' ? '上次操作的结果未确认。请先核对原会话，本次操作不会自动重发。' : '上次操作已提交，等待原会话状态同步。' });
     }
   }
   persist(removedKey = null) {
@@ -100,13 +105,16 @@ export class ActionGate {
     for (const [key, saved] of this.stored()) {
       const local = this.attempts.get(key);
       if (key === removedKey && saved.status === 'confirmed') continue;
+      if(local?.operationId===saved.operationId&&(local.acknowledged||saved.acknowledged)) {
+        this.attempts.set(key,{...local,status:'confirmed',acknowledged:true,message:'操作已确认，等待会话同步。'});continue;
+      }
       if (!local || saved.status === 'unknown' && local.status !== 'unknown' ||
           saved.operationId !== local.operationId && ['pending', 'submitted'].includes(saved.status) && local.status !== 'unknown') {
         this.attempts.set(key, { ...saved, status: saved.status === 'pending' ? 'unknown' : saved.status,
           message: '上次操作的结果未确认，请先核对原会话，不会自动重发。' });
       }
     }
-    try { this.storage?.setItem(this.storageKey, JSON.stringify([...this.attempts].filter(([, attempt]) => attempt.status !== 'rejected').map(([key, attempt]) => [key, { operationId: attempt.operationId, status: attempt.status }]))); } catch {}
+    try { this.storage?.setItem(this.storageKey, JSON.stringify([...this.attempts].filter(([, attempt]) => attempt.status !== 'rejected').map(([key, attempt]) => [key, { operationId: attempt.operationId, status: attempt.status,...(attempt.status==='confirmed'&&attempt.acknowledged?{acknowledged:true}:{}) }]))); } catch {}
   }
   forgetConfirmed(key) { this.restore(); if (this.get(key)?.status === 'confirmed') { this.attempts.delete(key); this.persist(key); } }
   begin(key) {
@@ -118,12 +126,15 @@ export class ActionGate {
     this.persist();
     return this.attempts.get(key) === attempt && attempt.status === 'pending' ? attempt : null;
   }
-  settle(key, response) {
+  settle(key, response, expectedOperationId) {
     const attempt = this.attempts.get(key);
-    if (!attempt) return;
+    if (!attempt || expectedOperationId!=null&&attempt.operationId!==expectedOperationId) return false;
     attempt.status = ['confirmed', 'submitted', 'rejected'].includes(response?.status) ? response.status : 'unknown';
+    if(expectedOperationId===attempt.operationId&&attempt.status==='confirmed')attempt.acknowledged=true;
+    else delete attempt.acknowledged;
     attempt.message = response?.message || ({ confirmed: '操作已确认，等待会话同步。', submitted: '已提交，等待官方状态确认。', rejected: '未提交，请刷新会话后重试。', unknown: '结果未确认。请在原会话核对，本次操作不会自动重发。' })[attempt.status];
     this.persist();
+    return this.attempts.get(key)?.operationId===attempt.operationId;
   }
   get(key) { return this.attempts.get(key); }
 }
@@ -298,9 +309,10 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const now = () => typeof timers.now === 'function' ? timers.now() : Date.now();
   let attemptGeneration = 0, readAttempt = null, retryTimer = null, heartbeatTimer = null, recoveryTimer = null;
   let failureSince = null, retryStep = 0, recoveryNotice = false, lastWakeAt = -Infinity, wakeTimer = null;
-  let cardsSignature = '', messageScope = '', hostSignature = '', threadSignature = '', noticeText = '';
-  const drafts = new Map(), answers = new Map(), gate = new ActionGate({ storage: draftStorage }), messageNodes = new Map();
+  let cardsSignature = '', messageScope = '', hostSignature = '', threadSignature = '', noticeText = '',noticeSendKey=null;
+  const drafts = new Map(), draftRevisions=new Map(), answers = new Map(), gate = new ActionGate({ storage: draftStorage }), messageNodes = new Map();
   const requestPresentation=new Map();
+  const savedSendViews=new Map();let savedSendsScope='',sendRecoveryError='',sendRecoveryChecking=false;
   let previewRecord = null;
   let galleryOpen = false, galleryGeneration = 0, galleryRead = null;
   let history = {messages:[],loaded:false,hasMore:true,nextCursor:null,complete:true,issues:[],error:'',reset:false}, historyRead=null;
@@ -357,7 +369,13 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   const send = node('button', 'send-button', '发送'); send.type = 'submit';
   composeRow.append(input, send);
   const composeFoot = node('div', 'composer-foot'), draftHint = node('span', 'draft-hint', '草稿只保存在本设备'), interrupt = button('停止运行', 'stop-button', () => stopTurn());
-  interrupt.hidden = true; composeFoot.append(draftHint, interrupt); composer.append(loadPanel, runtimeErrorPanel, composerHint, composeRow, composeFoot);
+  const sendRecovery=node('section','send-recovery');sendRecovery.hidden=true;
+  const sendRecoveryStatus=node('p','send-recovery-status');sendRecoveryStatus.setAttribute('role','status');
+  const sendRecoveryCheck=button('核对原会话','text-button send-recovery-check',()=>checkUncertainSend());
+  const sendRecoveryStage=button('暂存这条，写新消息','text-button send-recovery-stage',()=>stageUncertainSend());
+  sendRecovery.append(sendRecoveryStatus,sendRecoveryCheck,sendRecoveryStage);
+  const savedSendRecords=node('details','saved-send-records'),savedSendHeading=node('summary','saved-send-heading'),savedSendList=node('div','saved-send-list');savedSendRecords.hidden=true;savedSendRecords.append(savedSendHeading,savedSendList);
+  interrupt.hidden = true; composeFoot.append(draftHint, interrupt); composer.append(loadPanel, runtimeErrorPanel, sendRecovery, savedSendRecords, composerHint, composeRow, composeFoot);
   const backdrop = button('关闭对话列表', 'drawer-backdrop', () => setDrawer(false)); backdrop.hidden = true; backdrop.tabIndex = -1;
   const drawer = node('aside', 'thread-drawer'); drawer.id = 'thread-drawer'; drawer.hidden = true; drawer.tabIndex = -1; drawer.setAttribute('aria-label', '已有对话列表');
   const drawerHeading = node('div', 'drawer-heading'); drawerHeading.append(node('h2', '', '聊天'), button('新建', 'drawer-new-chat', () => openCreation()), button('刷新', 'text-button drawer-refresh', () => loadThreads()), button('关闭', 'text-button', () => setDrawer(false)));
@@ -431,9 +449,67 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     if (!drafts.has(scope)) { let text = ''; try { text = draftStorage?.getItem(storageKey(scope)) ?? ''; } catch {} drafts.set(scope, text); }
     return drafts.get(scope);
   }
-  function saveDraft(scope, text) { drafts.set(scope, text); try { if (text) draftStorage?.setItem(storageKey(scope), text); else draftStorage?.removeItem(storageKey(scope)); } catch {} }
+  function saveDraft(scope, text) { drafts.set(scope, text);draftRevisions.set(scope,(draftRevisions.get(scope)??0)+1); try { if (text) draftStorage?.setItem(storageKey(scope), text); else draftStorage?.removeItem(storageKey(scope)); } catch {} }
   function currentScope() { return JSON.stringify([selectedHost, selectedId]); }
-  function showNotice(text, fromRecovery = false) { noticeText = text; recoveryNotice = fromRecovery; notice.textContent = text; notice.hidden = !text; }
+  function showNotice(text, fromRecovery = false, sendKey=null) { noticeText = text;noticeSendKey=sendKey; recoveryNotice = fromRecovery; notice.textContent = text; notice.hidden = !text; }
+  function savedSendsKey(scope){return 'codex-mobile-saved-sends:'+scope;}
+  function durableSendGuard(record){
+    const saved=gate.stored().get(record.key);
+    return saved?.operationId===record.operationId&&(['unknown','submitted'].includes(saved.status)||saved.status==='confirmed'&&saved.acknowledged===true);
+  }
+  function readSavedSends(scope){
+    const raw=draftStorage?.getItem(savedSendsKey(scope));if(raw==null)return[];
+    const rows=JSON.parse(raw);if(!Array.isArray(rows)||rows.length>20)throw Error('暂存记录不可读');
+    return rows.filter(row=>row&&typeof row.operationId==='string'&&typeof row.key==='string'&&typeof row.text==='string'&&row.text.trim()&&row.key===JSON.stringify([scope,'send',fingerprint(row.text.trim())]));
+  }
+  function renderSendRecovery(attempt){
+    const scope=currentScope();if(savedSendsScope!==scope){savedSendsScope=scope;savedSendViews.clear();sendRecoveryError='';sendRecoveryChecking=false;}
+    const uncertain=['unknown','submitted'].includes(attempt?.status);
+    sendRecovery.hidden=!uncertain;sendRecoveryCheck.disabled=sendRecoveryChecking||typeof api.getThread!=='function';sendRecoveryStage.disabled=sendRecoveryChecking;
+    sendRecoveryStatus.textContent=sendRecoveryError||(sendRecoveryChecking?'正在只读核对原会话，不会重发。':'这条发送结果未确认。可核对原会话，或暂存后另写新内容；原操作不会重发。');
+    let saved=[];try{saved=readSavedSends(scope);}catch{if(uncertain)sendRecoveryStatus.textContent='暂存记录无法读取；当前草稿已保留，请勿重复发送。';}
+    const children=[];
+    for(const record of saved){
+      let item=savedSendViews.get(record.operationId);if(!item){
+        const el=node('details','saved-send-record'),heading=node('summary','','已暂存的发送'),text=node('p','saved-send-text',record.text),id=node('p','saved-send-id',record.operationId),status=node('p','saved-send-status');
+        const restore=button('恢复到输入框','text-button saved-send-restore',()=>{
+          if(scope!==currentScope()||input.value.trim())return;
+          if(!durableSendGuard(record)){status.textContent='原操作防重复记录缺失或不一致，暂不能恢复；暂存原文仍可查看。';restore.disabled=true;return;}
+          gate.restore();input.value=record.text;saveDraft(scope,record.text);sendRecoveryError='';autoSize();renderStatus();
+        });
+        el.append(heading,status,text,id,restore);item={el,restore,status};savedSendViews.set(record.operationId,item);
+      }
+      const protectedRecord=durableSendGuard(record);item.restore.disabled=!!input.value.trim()||!protectedRecord;const guard=gate.get(record.key);
+      item.status.textContent=!protectedRecord?'原操作防重复记录缺失或不一致，暂不能恢复；暂存原文仍可查看。':guard?.operationId===record.operationId&&guard.status==='confirmed'?'该操作已有确认回执。':'发送结果仍待核实；保存记录不会解除防重复限制。';children.push(item.el);
+    }
+    savedSendHeading.textContent='已暂存发送（'+saved.length+'）';savedSendRecords.hidden=!saved.length;reconcile(savedSendList,children);
+  }
+  function stageUncertainSend(){
+    const scope=currentScope(),text=input.value,key=sendKey(text.trim()),attempt=gate.get(key);
+    if(!['unknown','submitted'].includes(attempt?.status)||!text.trim())return;
+    try{
+      if(!draftStorage?.setItem||!draftStorage?.getItem)throw Error('Storage unavailable');
+      const saved=readSavedSends(scope),record={operationId:attempt.operationId,key,text},existing=saved.find(row=>row.operationId===record.operationId);
+      // Draft storage alone is insufficient: after reload the matching guard
+      // must still fence this exact operation before its text can be restored.
+      gate.persist();if(!durableSendGuard(record))throw Error('Operation guard was not persisted');
+      if(!existing)saved.push(record);
+      if(saved.length>20)throw Error('Too many saved drafts');const value=JSON.stringify(saved);if(value.length*2>256*1024)throw Error('Draft storage limit');
+      // Clear the composer only after the exact saved copy can be read back.
+      // A quota/error must never turn this recovery action into draft loss.
+      draftStorage.setItem(savedSendsKey(scope),value);if(draftStorage.getItem(savedSendsKey(scope))!==value||!durableSendGuard(record))throw Error('Draft verification failed');
+      input.value='';saveDraft(scope,'');sendRecoveryError='';showNotice('');autoSize();renderStatus();
+    }catch{sendRecoveryError='暂存保存失败，当前草稿已保留；请勿重复发送。';renderStatus();}
+  }
+  async function checkUncertainSend(){
+    const scope=currentScope(),navigation=generation,key=sendKey(input.value.trim()),attempt=gate.get(key);
+    if(!['unknown','submitted'].includes(attempt?.status)||sendRecoveryChecking||typeof api.getThread!=='function')return;
+    sendRecoveryChecking=true;sendRecoveryError='';renderStatus();
+    await refreshCurrent();
+    if(destroyed||scope!==currentScope()||navigation!==generation)return;
+    if(key!==sendKey(input.value.trim())){sendRecoveryChecking=false;return;}
+    sendRecoveryChecking=false;sendRecoveryError='本次只读取原会话；尚未确认旧操作是否送达，旧内容仍不会重发。';renderStatus();
+  }
   function autoSize() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight || 44, 168) + 'px'; }
   function resize() { const metrics = viewportMetrics(win?.visualViewport, win?.innerHeight); app.style.setProperty('--app-height', metrics.height + 'px'); app.style.setProperty('--app-top', metrics.top + 'px'); autoSize(); }
   function setDrawer(open) {
@@ -574,8 +650,8 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     const intent = { host, operationId: attempt.operationId, projectId: creationSelectedProjectId || null, prompt: createPrompt.value.trim(), ...(createTitle.value.trim() ? { title: createTitle.value.trim() } : {}) };
     const openedGeneration = creationGeneration; creationBusy = true; creationResult = null; renderCreation();
     let result;
-    try { result = await api.createThread(intent); if (result?.status === 'confirmed' && !validCreatedId(result.threadId)) result = { status: 'unknown', message: '创建结果缺少有效聊天 ID，请返回列表核对；不会自动重发。' }; gate.settle(key, result); }
-    catch { result = { status: 'unknown', message: '创建结果未确认，请返回列表核对；不会自动重发。' }; gate.settle(key, result); }
+    try { result = await api.createThread(intent); if (result?.status === 'confirmed' && !validCreatedId(result.threadId)) result = { status: 'unknown', message: '创建结果缺少有效聊天 ID，请返回列表核对；不会自动重发。' }; gate.settle(key, result,attempt.operationId); }
+    catch { result = { status: 'unknown', message: '创建结果未确认，请返回列表核对；不会自动重发。' }; gate.settle(key, result,attempt.operationId); }
     creationBusy = false;
     if (destroyed) return;
     // The receipt belongs to the submitted intent even if its window was closed.
@@ -807,6 +883,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     interrupt.disabled = !writeAllowed('interrupt') || !!stopAttempt && stopAttempt.status !== 'rejected';
     composerHint.textContent = !selectedId ? '先选择对话' : incompatible(state) ? '电脑网关更新后才能发送，草稿会保留' : loadAttempt?.pending ? '正在连接原聊天，草稿会保留' : needsLoad(state) ? '先在电脑上加载原聊天，草稿会保留' : isHistoryOnly(state) ? '只读历史，原会话未连接；草稿会保留' : !connected ? '连接恢复后才能发送，草稿会保留' : !state?.ownerConfirmed ? '等待原会话确认，草稿会保留' : isRuntimeError(state) ? '重试只恢复上一轮，当前草稿会保留' : !writeAllowed('send') ? (isRunning(state) ? '运行中，当前连接暂不支持补充方向' : '当前状态只读，不能发送') : isRunning(state) ? '运行中发送会补充当前方向' : '继续这个对话';
     draftHint.textContent = attempt?.status === 'unknown' ? '结果未确认，此内容已禁止重复发送' : attempt?.status === 'submitted' ? '已提交，保留草稿并等待确认' : '草稿只保存在本设备';
+    renderSendRecovery(attempt);
   }
   function imageCurrent(record) {
     if (destroyed || record.scope !== currentScope()) return false;
@@ -1261,17 +1338,17 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
   async function dispatch(action, key) {
     if (!writeAllowed(action.action)) return;
     const attempt = gate.begin(key); if (!attempt) return;
-    const snapshot = state, scope = currentScope(), navigation = generation;
+    const snapshot = state, scope = currentScope(), navigation = generation,draftRevision=draftRevisions.get(scope)??0;
     renderStatus(); renderRequests();
     try {
       const response = await api.action(buildActionPayload(snapshot, { ...action, operationId: attempt.operationId }));
-      gate.settle(key, response);
+      const accepted=gate.settle(key, response,attempt.operationId);
       // A transport ACK is not a new user message or a completed question/approval.
-      if (action.action === 'send' && response?.status === 'confirmed') {
+      if (!destroyed&&navigation===generation&&accepted&&action.action === 'send' && response?.status === 'confirmed'&&gate.get(key)?.status==='confirmed'&&(draftRevisions.get(scope)??0)===draftRevision) {
         if (draft(scope).trim() === action.text) saveDraft(scope, '');
         if (scope === currentScope() && input.value.trim() === action.text) { input.value = ''; autoSize(); }
       }
-    } catch { gate.settle(key, { status: 'unknown' }); }
+    } catch { gate.settle(key, { status: 'unknown' },attempt.operationId); }
     if (destroyed || scope !== currentScope()) return;
     // A retry receipt belongs to one navigation and one failed turn. It cannot refresh a newer turn or reclaim a returned chat.
     if (action.action === 'retry' && (navigation !== generation || !isRuntimeError(state) || failedTurnId(state) !== failedTurnId(snapshot))) {
@@ -1279,7 +1356,8 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
       if (isRuntimeError(state) && retryKey() === key) renderStatus();
       return;
     }
-    showNotice(gate.get(key).message); renderStatus(); renderRequests();
+    if(action.action!=='send'||sendKey(input.value.trim())===key||!input.value.trim())showNotice(gate.get(key).message,false,action.action==='send'?key:null);
+    renderStatus(); renderRequests();
     // Refresh only the read path; never retry POST after a timeout or disconnect.
     await recover({ immediate: true });
   }
@@ -1290,6 +1368,7 @@ export function mountMobileUI(root, { api, onNavigate = () => {}, initialHost = 
     const key = sendKey(input.value.trim());
     // Retyping a confirmed message is a new user intent; unknown/submitted attempts stay blocked.
     gate.forgetConfirmed(key);
+    sendRecoveryError='';if(noticeSendKey&&noticeSendKey!==key)showNotice('');
     saveDraft(currentScope(), input.value); autoSize(); renderStatus();
   });
   input.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && !event.isComposing) sendMessage(event); });

@@ -1732,3 +1732,69 @@ test('same-text saved records are expandable without deleting either original id
  const {root,view}=mount(t,{getThread:async()=>thread({messages:[savedMessage('anchor-a'),liveUser,savedMessage('anchor-b')]}),getThreadHistory:async(_host,id)=>historyPage(id,[savedMessage('anchor-a'),savedUser,savedMessage('anchor-b')])});
  await view.selectThread(thread().id);await tick();assert.equal(byClass(root,'message-user').length,1);const record=one(root,'same-text-saved-record');assert.match(record.textContent,/同文的已保存记录/);assert.match(record.textContent,/a real repeated-looking prompt/);assert.equal(record.tagName,'DETAILS');assert.equal(record.open,undefined);
 });
+
+test('the exact captured ACK resolves the same operation across tabs without letting stale receipts erase other unknowns',()=>{
+ const {storage}=fixtureDOM(),a=new ActionGate({storage}),operation=a.begin('same');
+ const b=new ActionGate({storage});assert.equal(b.get('same').status,'unknown');b.begin('unrelated');
+ a.settle('same',{status:'confirmed'},operation.operationId);assert.equal(a.get('same').status,'confirmed');
+ b.begin('another');const restored=new ActionGate({storage});assert.equal(restored.get('same').status,'confirmed');assert.equal(restored.get('same').operationId,operation.operationId);
+ const known=new ActionGate({storage}),other='different-operation';storage.setItem('codex-mobile-operation-guards',JSON.stringify([['same',{operationId:other,status:'unknown'}]]));
+ known.settle('same',{status:'confirmed'},operation.operationId);assert.equal(known.get('same').operationId,other);assert.equal(known.get('same').status,'unknown');
+ known.settle('same',{status:'confirmed'},operation.operationId);assert.equal(known.get('same').status,'unknown');
+});
+
+test('an uncertain draft can be saved aside, restored locked, and survives reload without sending',async t=>{
+ const state=thread(),calls=[];const first=mount(t,{getThread:async()=>state,action:async body=>{calls.push(body);return{status:'unknown'};}});first.view.update(state);type(first.root,'  old uncertain text  ');one(first.root,'composer').fire('submit');await tick();await tick();
+ assert.equal(one(first.root,'send-recovery').hidden,false);assert.equal(one(first.root,'send-button').disabled,true);one(first.root,'send-recovery-stage').click();
+ assert.equal(one(first.root,'message-input').value,'');assert.equal(one(first.root,'saved-send-text').textContent,'  old uncertain text  ');assert.equal(one(first.root,'saved-send-id').textContent,calls[0].operationId);assert.equal(calls.length,1);
+ type(first.root,'new distinct draft');assert.equal(one(first.root,'send-button').disabled,false);assert.equal(one(first.root,'saved-send-restore').disabled,true);assert.equal(one(first.root,'notice').hidden,true);
+ type(first.root,'');one(first.root,'saved-send-restore').click();assert.equal(one(first.root,'message-input').value,'  old uncertain text  ');assert.equal(one(first.root,'send-button').disabled,true);one(first.root,'composer').fire('submit');assert.equal(calls.length,1);
+ first.view.destroy();const reopened=mountMobileUI(first.root,{api:{},storage:first.storage});t.after(()=>reopened.destroy());reopened.update(state);assert.equal(one(first.root,'saved-send-text').textContent,'  old uncertain text  ');assert.equal(one(first.root,'message-input').value,'  old uncertain text  ');assert.equal(one(first.root,'send-button').disabled,true);
+});
+
+test('uncertain draft checks are read-only and never claim delivery from same text or a new owner',async t=>{
+ const state=thread(),calls=[];let reads=0;const {root,view}=mount(t,{getThread:async()=>{reads++;return thread({ownerId:'new-owner',connectionId:'new-connection',messages:[{id:'different-id',role:'user',text:'same draft'}]});},action:async body=>{calls.push(body);return{status:'unknown'};}});
+ view.update(state);type(root,'same draft');one(root,'composer').fire('submit');await tick();await tick();const before=reads;one(root,'send-recovery-check').click();await tick();await tick();assert.ok(reads>before);assert.match(one(root,'send-recovery-status').textContent,/不能确认|未确认|未能确认/);assert.equal(one(root,'send-button').disabled,true);assert.equal(calls.length,1);
+ type(root,'new message');assert.equal(one(root,'send-button').disabled,false);assert.equal(one(root,'notice').hidden,true);
+ view.update(thread({connected:false,ownerConfirmed:false}));assert.equal(one(root,'send-button').disabled,true);assert.equal(one(root,'message-input').disabled,false);
+});
+
+test('saved uncertain sends are scoped to host and chat and never grant owner authority',async t=>{
+ const {root,view}=mount(t,{getThread:async(host,id)=>thread({host,id}),action:async()=>({status:'submitted'})});view.update(thread());type(root,'scoped old draft');one(root,'composer').fire('submit');await tick();await tick();one(root,'send-recovery-stage').click();
+ assert.equal(byClass(root,'saved-send-record').length,1);await view.selectThread('22222222-2222-4222-8222-222222222222');assert.equal(byClass(root,'saved-send-record').length,0);await view.selectThread(thread().id);assert.equal(byClass(root,'saved-send-record').length,1);await view.selectHost('windows');await view.selectThread(thread().id);assert.equal(byClass(root,'saved-send-record').length,0);
+});
+
+test('failed saved-draft persistence never clears the blocked composer or its operation guard',async t=>{
+ const {root,view,storage}=mount(t,{getThread:async()=>thread(),action:async()=>({status:'unknown'})});view.update(thread());type(root,'must keep draft');one(root,'composer').fire('submit');await tick();await tick();const original=storage.setItem;storage.setItem=(key,value)=>{if(key.startsWith('codex-mobile-saved-sends:'))throw Error('quota');return original.call(storage,key,value);};one(root,'send-recovery-stage').click();assert.equal(one(root,'message-input').value,'must keep draft');assert.equal(one(root,'send-button').disabled,true);assert.match(one(root,'send-recovery-status').textContent,/保存失败|无法保存/);assert.equal(byClass(root,'saved-send-record').length,0);
+});
+
+test('a late confirmed send cannot clear a different new draft and old uncertainty cannot announce over it',async t=>{
+ const wait=deferred(),{root,view}=mount(t,{getThread:async()=>thread(),action:()=>wait.promise});view.update(thread());type(root,'old pending');one(root,'composer').fire('submit');type(root,'new untouched draft');wait.resolve({status:'unknown',message:'old unknown notice'});await tick();await tick();assert.equal(one(root,'message-input').value,'new untouched draft');assert.equal(one(root,'send-button').disabled,false);assert.equal(one(root,'notice').hidden,true);
+});
+
+test('a confirmed ACK is bound to its dispatch and cannot erase a newly retyped identical draft',async t=>{
+ const wait=deferred(),{root,view}=mount(t,{getThread:async()=>thread(),action:()=>wait.promise});view.update(thread());type(root,'same words');one(root,'composer').fire('submit');type(root,'');type(root,'same words');wait.resolve({status:'confirmed'});await tick();await tick();assert.equal(one(root,'message-input').value,'same words');
+});
+
+test('settle rejects an older operation ID even when the same key has a newer pending operation',()=>{
+ const gate=new ActionGate(),first=gate.begin('key');gate.settle('key',{status:'rejected'},first.operationId);const second=gate.begin('key');assert.notEqual(first.operationId,second.operationId);assert.equal(gate.settle('key',{status:'confirmed'},first.operationId),false);assert.equal(gate.get('key').operationId,second.operationId);assert.equal(gate.get('key').status,'pending');
+});
+
+test('staging refuses to clear the composer when its operation guard cannot be persisted, even if saved drafts can',async t=>{
+ const dom=fixtureDOM(),original=dom.storage.setItem;let failGuards=true;
+ dom.storage.setItem=(key,value)=>{if(failGuards&&key==='codex-mobile-operation-guards')throw Error('guard quota');return original.call(dom.storage,key,value);};
+ let view=mountMobileUI(dom.root,{api:{getThread:async()=>thread(),action:async()=>({status:'unknown'})},storage:dom.storage});t.after(()=>view.destroy());view.update(thread());type(dom.root,'unknown needs durable guard');one(dom.root,'composer').fire('submit');await tick();await tick();one(dom.root,'send-recovery-stage').click();assert.equal(one(dom.root,'message-input').value,'unknown needs durable guard');assert.equal(one(dom.root,'send-button').disabled,true);assert.match(one(dom.root,'send-recovery-status').textContent,/保存失败|无法保存/);
+ failGuards=false;one(dom.root,'send-recovery-stage').click();assert.equal(one(dom.root,'message-input').value,'');const key='codex-mobile-saved-sends:'+JSON.stringify(['mac',thread().id]);assert.equal(JSON.parse(dom.storage.getItem(key)).length,1);
+ view.destroy();view=mountMobileUI(dom.root,{api:{},storage:dom.storage});view.update(thread());one(dom.root,'saved-send-restore').click();assert.equal(one(dom.root,'message-input').value,'unknown needs durable guard');assert.equal(one(dom.root,'send-button').disabled,true);
+});
+
+test('a saved unknown cannot restore into a sendable draft after a missing or different durable guard',async t=>{
+ const {root,view,storage}=mount(t,{getThread:async()=>thread(),action:async()=>({status:'unknown'})});view.update(thread());type(root,'saved protected');one(root,'composer').fire('submit');await tick();await tick();one(root,'send-recovery-stage').click();const restore=one(root,'saved-send-restore');
+ storage.removeItem('codex-mobile-operation-guards');restore.fire('click');assert.equal(one(root,'message-input').value,'');assert.match(one(root,'saved-send-status').textContent,/防重复.*缺失|防重复.*不一致/);
+ view.update(thread({revision:2}));assert.equal(one(root,'saved-send-restore').disabled,true);
+});
+
+test('a destroyed instance late ACK cannot erase an identically retyped draft owned by the next page',async t=>{
+ const dom=fixtureDOM(),wait=deferred();const first=mountMobileUI(dom.root,{api:{getThread:async()=>thread(),action:()=>wait.promise},storage:dom.storage});first.update(thread());type(dom.root,'shared same words');one(dom.root,'composer').fire('submit');first.destroy();
+ const next=mountMobileUI(dom.root,{api:{},storage:dom.storage});t.after(()=>next.destroy());next.update(thread());type(dom.root,'shared same words');wait.resolve({status:'confirmed'});await tick();await tick();assert.equal(one(dom.root,'message-input').value,'shared same words');assert.equal(dom.storage.getItem('codex-mobile-draft:'+JSON.stringify(['mac',thread().id])),'shared same words');
+});

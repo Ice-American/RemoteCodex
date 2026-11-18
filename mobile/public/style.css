@@ -200,3 +200,12 @@ pre { margin: 10px 0; padding: 13px; white-space: pre-wrap; word-break: break-wo
 .same-text-saved-record { margin:6px 0; padding:0 10px; border-left:2px solid #d4e3d9; color:#69776e; font-size:12px; }
 .same-text-saved-record > summary { min-height:40px; display:list-item; align-content:center; cursor:pointer; }
 .same-text-saved-body { padding:4px 0 12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.send-recovery { padding:8px 10px; border:1px solid #d4e3d9; border-radius:10px; background:#f4f7f2; font-size:12px; }
+.send-recovery-status { margin:0 0 4px; line-height:1.6; overflow-wrap:anywhere; }
+.send-recovery .text-button { min-height:40px; font-size:13px; }
+.saved-send-records { font-size:12px; color:#526157; }
+.saved-send-heading, .saved-send-record > summary { min-height:36px; padding:8px 0; cursor:pointer; }
+.saved-send-list { max-height:180px; overflow:auto; overscroll-behavior:contain; }
+.saved-send-record { border-top:1px solid #d4e3d9; }
+.saved-send-text { white-space:pre-wrap; overflow-wrap:anywhere; }
+.saved-send-id { overflow-wrap:anywhere; font-family:monospace; }
